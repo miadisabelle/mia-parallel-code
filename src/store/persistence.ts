@@ -215,8 +215,10 @@ export async function saveState(): Promise<void> {
     coordinatorModeEnabled: store.coordinatorModeEnabled || undefined,
     coordinatorControlHintDismissed: store.coordinatorControlHintDismissed || undefined,
     defaultStepsEnabled: store.defaultStepsEnabled || undefined,
-    defaultSkipPermissions: store.defaultSkipPermissions || undefined,
-    defaultPropagateSkipPermissions: store.defaultPropagateSkipPermissions || undefined,
+    // Fork direction: these default ON, so an explicit `false` (opt-out) must be
+    // written, not collapsed to `undefined` — load reads an absent value as the default.
+    defaultSkipPermissions: store.defaultSkipPermissions,
+    defaultPropagateSkipPermissions: store.defaultPropagateSkipPermissions,
     autoStartRemoteAccess: store.autoStartRemoteAccess || undefined,
   };
 
@@ -586,8 +588,14 @@ export async function loadState(): Promise<void> {
           : 'defaultStepsEnabled' in (raw as object)
             ? false
             : raw.showSteps === true;
-      s.defaultSkipPermissions = raw.defaultSkipPermissions === true;
-      s.defaultPropagateSkipPermissions = raw.defaultPropagateSkipPermissions === true;
+      // Fork direction: skip-permissions defaults ON. A legacy/absent or invalid value
+      // adopts the fork default; an explicit boolean (including a `false` opt-out) is honored.
+      s.defaultSkipPermissions =
+        typeof raw.defaultSkipPermissions === 'boolean' ? raw.defaultSkipPermissions : true;
+      s.defaultPropagateSkipPermissions =
+        typeof raw.defaultPropagateSkipPermissions === 'boolean'
+          ? raw.defaultPropagateSkipPermissions
+          : true;
 
       s.autoStartRemoteAccess = raw.autoStartRemoteAccess === true;
 

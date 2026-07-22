@@ -646,10 +646,12 @@ describe('new task defaults persistence', () => {
 
   // --- defaultSkipPermissions ---
 
-  it('defaults defaultSkipPermissions to false when absent from saved state', async () => {
+  // Fork direction: skip-permissions defaults ON. Legacy profiles (key absent) adopt
+  // the fork default; an explicit `false` opt-out is honored and persisted.
+  it('defaults defaultSkipPermissions to true when absent from saved state (fork default)', async () => {
     mockInvoke.mockResolvedValueOnce(basePayload());
     await loadState();
-    expect(store.defaultSkipPermissions).toBe(false);
+    expect(store.defaultSkipPermissions).toBe(true);
   });
 
   it('restores defaultSkipPermissions=true from saved state', async () => {
@@ -658,12 +660,19 @@ describe('new task defaults persistence', () => {
     expect(store.defaultSkipPermissions).toBe(true);
   });
 
-  it('does not persist defaultSkipPermissions=false', async () => {
+  it('restores an explicit defaultSkipPermissions=false opt-out', async () => {
+    setStore('defaultSkipPermissions', true);
+    mockInvoke.mockResolvedValueOnce(basePayload({ defaultSkipPermissions: false }));
+    await loadState();
+    expect(store.defaultSkipPermissions).toBe(false);
+  });
+
+  it('persists an explicit defaultSkipPermissions=false (opt-out survives)', async () => {
     setStore('defaultSkipPermissions', false);
     mockInvoke.mockResolvedValueOnce(undefined);
     await saveState();
     const saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
-    expect(saved.defaultSkipPermissions).toBeUndefined();
+    expect(saved.defaultSkipPermissions).toBe(false);
   });
 
   it('persists defaultSkipPermissions=true', async () => {
@@ -678,19 +687,24 @@ describe('new task defaults persistence', () => {
     ['string', 'yes'],
     ['number', 1],
     ['null', null],
-  ])('ignores non-boolean defaultSkipPermissions (%s)', async (_label, value) => {
-    setStore('defaultSkipPermissions', true);
-    mockInvoke.mockResolvedValueOnce(basePayload({ defaultSkipPermissions: value }));
-    await loadState();
-    expect(store.defaultSkipPermissions).toBe(false);
-  });
+  ])(
+    'falls back to the fork default (true) for non-boolean defaultSkipPermissions (%s)',
+    async (_label, value) => {
+      setStore('defaultSkipPermissions', false);
+      mockInvoke.mockResolvedValueOnce(basePayload({ defaultSkipPermissions: value }));
+      await loadState();
+      expect(store.defaultSkipPermissions).toBe(true);
+    },
+  );
 
   // --- defaultPropagateSkipPermissions ---
 
-  it('defaults defaultPropagateSkipPermissions to false when absent from saved state', async () => {
+  // Fork direction: propagation to coordinator sub-agents defaults ON, mirroring
+  // defaultSkipPermissions. Absent/invalid → fork default; explicit `false` honored.
+  it('defaults defaultPropagateSkipPermissions to true when absent from saved state (fork default)', async () => {
     mockInvoke.mockResolvedValueOnce(basePayload());
     await loadState();
-    expect(store.defaultPropagateSkipPermissions).toBe(false);
+    expect(store.defaultPropagateSkipPermissions).toBe(true);
   });
 
   it('restores defaultPropagateSkipPermissions=true from saved state', async () => {
@@ -699,12 +713,19 @@ describe('new task defaults persistence', () => {
     expect(store.defaultPropagateSkipPermissions).toBe(true);
   });
 
-  it('does not persist defaultPropagateSkipPermissions=false', async () => {
+  it('restores an explicit defaultPropagateSkipPermissions=false opt-out', async () => {
+    setStore('defaultPropagateSkipPermissions', true);
+    mockInvoke.mockResolvedValueOnce(basePayload({ defaultPropagateSkipPermissions: false }));
+    await loadState();
+    expect(store.defaultPropagateSkipPermissions).toBe(false);
+  });
+
+  it('persists an explicit defaultPropagateSkipPermissions=false (opt-out survives)', async () => {
     setStore('defaultPropagateSkipPermissions', false);
     mockInvoke.mockResolvedValueOnce(undefined);
     await saveState();
     const saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
-    expect(saved.defaultPropagateSkipPermissions).toBeUndefined();
+    expect(saved.defaultPropagateSkipPermissions).toBe(false);
   });
 
   it('persists defaultPropagateSkipPermissions=true', async () => {
@@ -719,12 +740,15 @@ describe('new task defaults persistence', () => {
     ['string', 'yes'],
     ['number', 1],
     ['null', null],
-  ])('ignores non-boolean defaultPropagateSkipPermissions (%s)', async (_label, value) => {
-    setStore('defaultPropagateSkipPermissions', true);
-    mockInvoke.mockResolvedValueOnce(basePayload({ defaultPropagateSkipPermissions: value }));
-    await loadState();
-    expect(store.defaultPropagateSkipPermissions).toBe(false);
-  });
+  ])(
+    'falls back to the fork default (true) for non-boolean defaultPropagateSkipPermissions (%s)',
+    async (_label, value) => {
+      setStore('defaultPropagateSkipPermissions', false);
+      mockInvoke.mockResolvedValueOnce(basePayload({ defaultPropagateSkipPermissions: value }));
+      await loadState();
+      expect(store.defaultPropagateSkipPermissions).toBe(true);
+    },
+  );
 });
 
 describe('showSteps → defaultStepsEnabled migration', () => {

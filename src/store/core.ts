@@ -82,8 +82,12 @@ export const [store, setStore] = createStore<AppStore>({
   coordinatorNotificationDelayMs: 60_000,
   coordinatorControlHintDismissed: false,
   defaultStepsEnabled: false,
-  defaultSkipPermissions: false,
-  defaultPropagateSkipPermissions: false,
+  // Fork direction (miadisabelle): per-tool permission prompts are unworkable for our
+  // agent workflow, so skip-permissions — and its propagation to coordinator sub-agents —
+  // is ON by default. Persistence honors an explicit opt-out (see persistence.ts). To
+  // restore upstream behavior, set both of these back to false.
+  defaultSkipPermissions: true,
+  defaultPropagateSkipPermissions: true,
   customThemes: {},
   activeCustomThemeId: null,
   mcpStatus: { running: false, port: null, coordinatorTaskId: null, mcpConfigPath: null },
