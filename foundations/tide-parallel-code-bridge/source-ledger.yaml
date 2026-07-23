@@ -1,0 +1,98 @@
+meta:
+  packet: tide-parallel-code-bridge
+  generated: 2026-07-23
+  method: deep-research-foundations
+  repos:
+    - name: miadisabelle/mia-parallel-code
+      commit: 0bc5806
+    - name: jgwill/Miadi
+      commit: working-tree-2026-07-23
+  verification_status: code-verified # both repos read first-hand by parallel investigators
+  note: >-
+    All claims cite source code read directly during investigation. No external literature is
+    load-bearing for this packet. The cross-repo issue plan is DRAFT (no external state created).
+
+sources:
+  # --- Parallel Code remote (access + bridge surface) ---
+  - id: pc-server-bind
+    field: remote-runtime
+    title: Remote server binds 0.0.0.0:7777 (all interfaces incl. tailnet)
+    url: electron/remote/server.ts:1287,1333; electron/ipc/register.ts:1315
+    supports: The Tailscale interface IS listening; reachability failure is URL selection, not bind
+    verified: true
+  - id: pc-qr-url
+    field: remote-runtime
+    title: QR encodes http://<wifi ?? tailscale ?? 127.0.0.1>:7777?token=mobileToken
+    url: electron/remote/server.ts:1293-1295; src/components/ConnectPhoneModal.tsx:24-50,78-114
+    supports: A0 — default QR = LAN IP, unreachable over Tailscale
+    verified: true
+  - id: pc-tailscale-detect
+    field: remote-runtime
+    title: Tailscale IP detected heuristically as non-internal IPv4 starting 100.
+    url: electron/remote/server.ts:191-209
+    supports: A0 — tailscaleUrl null if no 100.x IPv4; pill disabled
+    verified: true
+  - id: pc-auth-tokens
+    field: remote-runtime
+    title: Token classes coordinator|subtask|mobile|paired; coordinator needs X-Coordinator-Id
+    url: electron/remote/server.ts:285,684-696,705-722,987-990; electron/mcp/client.ts:27-31
+    supports: A1 — bridge auth surface; coordinator token withheld from QR
+    verified: true
+  - id: pc-rest-surface
+    field: bridge-surface
+    title: Coordinator + mobile REST routes (create/prompt/status/output/…)
+    url: electron/remote/server.ts:624-651,786-838,902-909,918-926
+    supports: A3/A5/A6 — the API a tide transport consumes
+    verified: true
+  - id: pc-ws-protocol
+    field: bridge-surface
+    title: WS /ws protocol — auth|input|resize|kill|subscribe; output|scrollback|agents|status
+    url: electron/remote/protocol.ts:21-134; electron/remote/server.ts:1172-1206
+    supports: A4/A5/A6 — RemoteAgent + attention states; input steer path
+    verified: true
+
+  # --- Miadi tide (contract, runtime, gate, weave) ---
+  - id: tide-what
+    field: tide-runtime
+    title: tide is an AI-driven tmux(+herdr) observe/steer runtime (ex hermes-navigator)
+    url: jgwill/Miadi foundations/tide-runtime-tmuxai/README.md:11; rispecs/tide-runtime/STATUS.md:30
+    supports: Framing — what tide is; tmuxai crosswalk
+    verified: true
+  - id: tide-multiplexer-seam
+    field: tide-contract
+    title: Multiplexer = "tmux" | "herdr" — the extension discriminator
+    url: jgwill/Miadi packages/tide-contract/src/index.ts:17; rispecs/tide-runtime/STATUS.md:255-256
+    supports: A2 — add "parallel"; herdr proved the client/contract-only pattern
+    verified: true
+  - id: tide-client-transports
+    field: tide-integration
+    title: '@miadi/tide is the single talk-to-runtime seam; herdr.ts sits beside client.ts'
+    url: jgwill/Miadi packages/tide/src/client.ts:1-11,62-82,238-268,337-421,426-442
+    supports: A3/A8 — where parallel.ts lands; config/discovery; hardcoded-bin antipattern
+    verified: true
+  - id: tide-steer-gate
+    field: tide-integration
+    title: requireSteerGate demands local target + controller mode + interactive TTY
+    url: jgwill/Miadi packages/tide/src/steer-gate.ts:31-33,165-193
+    supports: A6/A7 — the blocker remote auth dissolves; "didn't talk to her"
+    verified: true
+  - id: tide-ui-unwired
+    field: tide-runtime
+    title: /tide cockpit is a client polling /api/tide/*; presumes local daemon+tmux on host
+    url: jgwill/Miadi app/tide/page.tsx:148-173; app/tide/CLAUDE.md:20; rispecs/tide-runtime/STATUS.md:215-216
+    supports: Why unusable — no backend ships; mock/prototype surface
+    verified: true
+  - id: inquiry-weave
+    field: chronicle
+    title: '@miadi/inquiry-weave relates artefact · issue · episode via weave.yaml (relate/register)'
+    url: jgwill/Miadi packages/inquiry-weave/README.md:1,30-47,152-174
+    supports: A10 — deferred weaving into a Chronicle episode
+    verified: true
+
+  # --- Cross-repo related issues (referenced, not verified as content) ---
+  - id: rel-issues
+    field: cross-repo
+    title: Related issues — mia-parallel-code#1,#2; jgwill/Miadi#378,#291,#384; Etuaptmumk-RSM#161
+    url: miadisabelle/mia-parallel-code#1,#2; jgwill/Miadi#378,#291,#384
+    supports: Traversal — the intention graph future agents follow
+    verified: false

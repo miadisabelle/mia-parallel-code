@@ -1,0 +1,132 @@
+meta:
+  packet: prompt-intent-embedding
+  generated: 2026-07-23
+  method: deep-research-foundations
+  repo: miadisabelle/mia-parallel-code
+  commit: 0bc5806
+  verification_status: mixed # code=verified-local; literature=training-knowledge-only
+  note: >-
+    Primary sources are the repository's own code at the cited commit (locally verified and
+    independently cross-traced). Secondary literature carries stable arXiv IDs/DOIs but was
+    not live-web-verified this session; marked verified:false. A web-verification pass is the
+    named follow-up to reach live-web-verified.
+
+sources:
+  # --- Primary: repository code (field = injection mechanics) ---
+  - id: code-steps-instruction
+    field: prompt-augmentation
+    title: STEPS_INSTRUCTION definition + append sites (the block appended to the user prompt)
+    url: src/store/tasks.ts:199,340,710
+    supports: Instruction appending after a '---' separator; savedInitialPrompt keeps clean text
+    verified: true
+  - id: code-coordinator-preamble
+    field: prompt-augmentation
+    title: COORDINATOR_PREAMBLE definition + concat site with {{MAX_CONCURRENT}} templating
+    url: src/store/coordinator-preamble.ts:6; src/store/tasks.ts:358
+    supports: Preamble prepend, coordinator mode only
+    verified: true
+  - id: code-sub-task-preamble
+    field: prompt-augmentation
+    title: SUB_TASK_PREAMBLE prepended to MCP-created sub-task prompt string
+    url: electron/mcp/sub-task-preamble.ts:1; electron/mcp/coordinator.ts:852
+    supports: Preamble prepend for coordinated sub-tasks
+    verified: true
+  - id: code-subtask-mode-preamble
+    field: agent-instruction-files
+    title: SUB_TASK_MODE_PREAMBLE injected into worktree config files + router
+    url: electron/mcp/preamble.ts:23,82; electron/mcp/coordinator.ts:876
+    supports: Out-of-band context-file injection (AGENTS.md/GEMINI.md/.agent.md/settings.local.json systemPrompt)
+    verified: true
+  - id: code-preamble-strip
+    field: provenance-hygiene
+    title: Preamble stripping before land/merge so instructions never enter history
+    url: electron/mcp/preamble.ts:140,292; electron/mcp/coordinator.ts:1390,1694
+    supports: Branch-hygiene / creative-provenance decision point for Miadi
+    verified: true
+  - id: code-pty-delivery
+    field: pty-terminal-automation
+    title: writePromptToTask - Focus-In + bracketed-paste body + pasteDelayMs + carriage return
+    url: electron/mcp/coordinator.ts:1117; src/store/tasks.ts:716; electron/ipc/pty.ts:506
+    supports: Prompt delivered by typing into TUI over pty stdin, not via API/argv
+    verified: true
+  - id: code-prompt-ready-detect
+    field: pty-terminal-automation
+    title: Agent-ready tail detection + initial-prompt delivery gating
+    url: electron/shared/prompt-detect.ts:33; electron/mcp/coordinator.ts:414,496
+    supports: App watches the terminal for readiness instead of awaiting a return value
+    verified: true
+  - id: code-agent-defs
+    field: pty-terminal-automation
+    title: DEFAULT_AGENTS - command/args (args:[]), resume_args, skip_permissions_args
+    url: electron/ipc/agents.ts
+    supports: Prompt is never on argv on the main path; model-agnostic transport
+    verified: true
+  - id: code-mcp-tools
+    field: agent-orchestration
+    title: MCP tool surface (coordinator vs sub-task) + dispatch
+    url: electron/mcp/mcp-tool-list.ts:9,53; electron/mcp/server.ts:40
+    supports: Tool-description prompting complements the preambles
+    verified: true
+  - id: code-remote-path
+    field: agent-orchestration
+    title: Remote HTTP/WS entry reuses the same three injection mechanisms
+    url: electron/remote/server.ts:382,452,1206; src/store/remoteTaskHandler.ts:69
+    supports: Second entry door, no fourth injection style
+    verified: true
+
+  # --- Secondary: field literature (vocabulary + why it matters) ---
+  - id: brown-2020-fewshot
+    field: prompt-augmentation
+    title: 'Language Models are Few-Shot Learners (in-context learning)'
+    url: https://arxiv.org/abs/2005.14165
+    supports: Preambles are in-context conditioning; context steers behavior
+    verified: false
+  - id: liu-2023-prompt-survey
+    field: prompt-augmentation
+    title: 'Pre-train, Prompt, and Predict: A Systematic Survey of Prompting Methods in NLP'
+    url: https://arxiv.org/abs/2107.13586
+    doi: 10.1145/3560815
+    supports: Prompting as a named discipline (prompt augmentation)
+    verified: false
+  - id: white-2023-prompt-patterns
+    field: prompt-augmentation
+    title: 'A Prompt Pattern Catalog to Enhance Prompt Engineering with ChatGPT'
+    url: https://arxiv.org/abs/2302.11382
+    supports: Persona+rules+tool-affordance preamble is a documented prompt pattern
+    verified: false
+  - id: agents-md-convention
+    field: agent-instruction-files
+    title: 'AGENTS.md — open convention for agent instruction/steering files'
+    url: https://agents.md
+    supports: Parallel Code injects into AGENTS.md/GEMINI.md/.agent.md steering files
+    verified: false
+  - id: claude-code-memory
+    field: agent-instruction-files
+    title: 'Claude Code memory / settings (CLAUDE.md, .claude/settings.local.json systemPrompt)'
+    url: https://docs.claude.com/en/docs/claude-code
+    supports: Default-agent injection target is .claude/settings.local.json systemPrompt
+    verified: false
+  - id: libes-1990-expect
+    field: pty-terminal-automation
+    title: 'expect: Curing Those Uncontrollable Fits of Interaction (Don Libes)'
+    url: https://www.usenix.org/legacy/publications/library/proceedings/summer90/
+    supports: Lineage of automating interactive programs via pty
+    verified: false
+  - id: bracketed-paste-xterm
+    field: pty-terminal-automation
+    title: 'XTerm Control Sequences — bracketed paste mode (CSI ?2004 h/l, ESC[200~/201~)'
+    url: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+    supports: Bracketed paste framing prevents multiline paste being read as commands
+    verified: false
+  - id: node-pty
+    field: pty-terminal-automation
+    title: 'node-pty — fork pseudoterminals in Node.js (Microsoft)'
+    url: https://github.com/microsoft/node-pty
+    supports: The pseudo-terminal library backing the transport sink
+    verified: false
+  - id: mcp-spec
+    field: agent-orchestration
+    title: 'Model Context Protocol specification'
+    url: https://modelcontextprotocol.io
+    supports: Coordinator/sub-task tool surface follows MCP
+    verified: false
