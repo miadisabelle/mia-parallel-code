@@ -21,6 +21,7 @@
 | A8  | discovery & config                              | jgwill/Miadi      | `.miadi/tide.yaml`, `packages/tide/src/client.ts`, episode lanes     | integration       |
 | A9  | Direction-B shim (`/api/tide/*` in front of PC) | jgwill/Miadi      | `app/api/tide/*/route.ts`                                            | alternative       |
 | A10 | Chronicle weave wiring                          | jgwill/Miadi      | `packages/inquiry-weave`                                             | deferred          |
+| A11 | Chronicle awareness in the desktop UI           | mia-parallel-code | `electron/ipc/weave.ts` (new), `src/store/projects.ts`, `src/components/Sidebar.tsx` | feature (independent) |
 
 ---
 
@@ -176,8 +177,42 @@ into an existing or new Chronicle episode. Env: `MIADI_INQUIRY_ROOT`, `MIADI_CHR
 
 ---
 
+## A11 — Chronicle awareness in the desktop UI _(independent; can ship first)_
+
+**Why.** After `inquiry-weave relate`, an artefact carries its own `.weave.yaml` **inside the repo** —
+so the desktop app can answer *"which Chronicle episode is this work part of?"* with a **local file
+read**: no network, no API dependency, works offline inside the worktree an agent is already using.
+This is what turns generic *parallel-code* into **`miadi-parallel-code`**: upstream's app knows about
+branches and tasks; ours would know **which story the work belongs to**.
+
+**Resolution sources (increasing richness, decreasing availability).**
+
+| Source | Yields | Cost |
+| --- | --- | --- |
+| `.weave.yaml` beside the artefact (in-repo) | episode number + slug + path, issue + issue_url, `related_at` | free, offline |
+| `MW_API_URL` (medicine-wheel) | the episode card: title, goal, status | one HTTP call |
+| `MIADI_CHRONICLE_ROOT` (if mounted) | `episode.yaml`, mission, lineage, sibling episodes | filesystem |
+
+**The change.**
+
+- New `electron/ipc/weave.ts` — scan a project's worktree for `.weave.yaml` (mirroring how `git.ts`
+  reads repo state); parse `weave: 1` shape; return `{episodes[], issue, issue_url}`.
+- `src/store/projects.ts` — project record carries an optional `episode` field.
+- `src/components/Sidebar.tsx` — an episode badge on the project row, expanding to a card with the
+  episode title and its linked issues.
+
+**Caveats** — see `jgwill/Miadi#539`: `relate --dry-run` currently writes files; an artefact outside
+`MIADI_INQUIRY_ROOT` reads as `artefactExists: false` via `status` (the desktop client should trust
+the in-repo `.weave.yaml`, not re-resolve against the inquiry root); `lineage` is not yet shipped.
+
+**Acceptance.** Opening a project whose repo contains `.weave.yaml` shows its episode badge; clicking
+it reveals the episode title and issue links; no network required for the badge.
+
+---
+
 ## Recommended sequence
 
+0. **A11** (chronicle awareness) — independent of the bridge; only reads files we already write.
 1. **A0** (access) — smallest stone, unblocks William, no cross-repo coordination.
 2. **A2 → A3 → A4/A5/A6** (Direction A bridge) — the contract-first path, reusing the herdr pattern.
 3. **A1/A7/A8** (auth, posture, config) — hardening the bridge.
