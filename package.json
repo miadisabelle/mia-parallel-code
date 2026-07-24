@@ -99,6 +99,7 @@
   "build": {
     "appId": "com.parallel-code.app",
     "productName": "Parallel Code",
+    "afterPack": "scripts/after-pack.cjs",
     "directories": {
       "buildResources": "build",
       "output": "release"
