@@ -1,7 +1,8 @@
 {
   "name": "parallel-code",
   "version": "1.14.1",
-  "description": "",
+  "description": "Run parallel AI coding agents, each in its own git worktree.",
+  "homepage": "https://github.com/miadisabelle/mia-parallel-code",
   "author": {
     "name": "Johannes Millan",
     "email": "contact@super-productivity.com"
