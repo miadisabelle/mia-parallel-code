@@ -1,5 +1,5 @@
 import { For, Show } from 'solid-js';
-import { setActiveTask, store } from '../store/store';
+import { activateTaskFromPointer, store } from '../store/store';
 
 export function FocusModeTaskIndicators() {
   const items = () =>
@@ -19,7 +19,7 @@ export function FocusModeTaskIndicators() {
                 type="button"
                 class={`focus-mode-task-indicator${isActive() ? ' active' : ''}`}
                 onMouseDown={(event) => event.stopPropagation()}
-                onClick={() => setActiveTask(item.id)}
+                onClick={() => activateTaskFromPointer(item.id)}
                 title={isActive() ? `${item.name} (current)` : `Switch to ${item.name}`}
                 aria-label={isActive() ? `${item.name}, current item` : `Switch to ${item.name}`}
                 aria-current={isActive() ? 'true' : undefined}

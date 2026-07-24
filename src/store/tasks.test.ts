@@ -920,6 +920,80 @@ describe('createTask does not mutate defaultStepsEnabled', () => {
   });
 });
 
+// ─── createTask activation ────────────────────────────────────────────────────
+// A phone creating a task must not yank the desktop's selection out from under
+// whoever is typing there; the desktop's own New Task dialog still activates.
+
+describe('createTask activation', () => {
+  const agentDef = {
+    id: 'agent-def',
+    name: 'Claude',
+    command: 'claude',
+    args: [],
+    resume_args: [],
+    skip_permissions_args: [],
+    description: 'Claude',
+  };
+
+  function harnessState(): Record<string, unknown> {
+    return expectDefined(core.harness, 'mock store harness').state() as Record<string, unknown>;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const harness = expectDefined(core.harness, 'mock store harness');
+    harness.reset(harness.state());
+    mockTasks = {};
+    mockAgents = {};
+    mockTaskOrder = [];
+    harnessState().activeTaskId = null;
+    harnessState().activeAgentId = null;
+    vi.mocked(getProjectPath).mockReturnValue('/repo');
+    vi.mocked(getProjectBranchPrefix).mockReturnValue('task');
+    vi.mocked(isProjectMissing).mockReturnValue(false);
+    mockInvoke.mockImplementation((channel: string) => {
+      if (channel === IPC.CreateTask) {
+        return Promise.resolve({
+          id: 'task-new',
+          branch_name: 'task/my-task',
+          worktree_path: '/repo/.worktrees/my-task',
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+  });
+
+  const baseOpts = {
+    name: 'My Task',
+    agentDef,
+    projectId: 'proj-1',
+    gitIsolation: 'worktree' as const,
+    baseBranch: 'main',
+  };
+
+  it('activates the new task by default', async () => {
+    harnessState().activeTaskId = 'task-existing';
+    await createTask(baseOpts);
+    expect(harnessState().activeTaskId).toBe('task-new');
+  });
+
+  it('leaves the current selection alone when activate is false', async () => {
+    harnessState().activeTaskId = 'task-existing';
+    harnessState().activeAgentId = 'agent-existing';
+
+    await createTask({ ...baseOpts, activate: false });
+
+    expect(harnessState().activeTaskId).toBe('task-existing');
+    expect(harnessState().activeAgentId).toBe('agent-existing');
+    expect(mockTaskOrder).toContain('task-new');
+  });
+
+  it('still adopts the task when nothing is selected yet', async () => {
+    await createTask({ ...baseOpts, activate: false });
+    expect(harnessState().activeTaskId).toBe('task-new');
+  });
+});
+
 // ─── sendPrompt tests ─────────────────────────────────────────────────────────
 
 function writePayloads(): string[] {

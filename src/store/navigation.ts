@@ -1,3 +1,4 @@
+import { batch } from 'solid-js';
 import { store, setStore } from './core';
 import { getTaskFocusedPanel, setTaskFocusedPanel } from './focused-panel';
 import { showNotification } from './notification';
@@ -34,10 +35,41 @@ export function setActiveTask(id: string): void {
       (store.activeAgentId && task.agentIds.includes(store.activeAgentId)
         ? store.activeAgentId
         : (task.agentIds[0] ?? null));
-    if (activeAgentId) setStore('tasks', id, 'selectedAgentId', activeAgentId);
   }
-  setStore('activeTaskId', id);
-  setStore('activeAgentId', activeAgentId);
+  // One batch: effects that read the selection (panel focus, agent selection,
+  // terminal re-fitting, the tiling strip's scroll-into-view) must never see
+  // the half-applied pair where `activeTaskId` is already the new task while
+  // `activeAgentId` still points at an agent of the previous one — that
+  // intermediate state resolves `ai-terminal` to the wrong pane.
+  batch(() => {
+    if (activeAgentId) setStore('tasks', id, 'selectedAgentId', activeAgentId);
+    setStore('activeTaskId', id);
+    setStore('activeAgentId', activeAgentId);
+  });
+}
+
+/**
+ * Activate a task because the user pointed at its column.
+ *
+ * Distinct from `setActiveTask`, which keyboard jumps also use: pointing into
+ * a column must additionally take focus away from the sidebar and the new-task
+ * placeholder. Both flags are hard gates — `isPanelFocused` returns false for
+ * every panel while either is set, and `navigateRow`/`navigateColumn` keep
+ * routing the arrow keys to the sidebar — so activating without clearing them
+ * leaves the column highlighted as active while the app still behaves as if
+ * the sidebar owned focus. Keyboard jumps deliberately keep sidebar focus, so
+ * the two paths stay separate.
+ */
+export function activateTaskFromPointer(id: string): void {
+  if (!store.tasks[id] && !store.terminals[id]) return;
+  // Idempotent: the same interaction can reach this twice (pointerdown on the
+  // column, then a title-bar tap), and nothing below would change.
+  if (store.activeTaskId === id && !store.sidebarFocused && !store.placeholderFocused) return;
+  batch(() => {
+    setActiveTask(id);
+    setStore('sidebarFocused', false);
+    setStore('placeholderFocused', false);
+  });
 }
 
 export function setActiveAgent(agentId: string): void {

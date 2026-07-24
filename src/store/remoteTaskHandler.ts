@@ -74,6 +74,12 @@ async function handleCreateTask(req: CreateTaskRequest): Promise<void> {
       baseBranch,
       symlinkDirs,
       initialPrompt: req.prompt,
+      // A task created from a phone must not move the desktop's selection: the
+      // person at the desktop may be mid-sentence in another column, and the
+      // jump would scroll the strip and re-target keyboard focus under them.
+      // With no task active there is nothing to protect, so the store still
+      // adopts it (see initTaskInStore).
+      activate: false,
     });
     reply(req.reqId, true, { taskId });
   } catch (err) {

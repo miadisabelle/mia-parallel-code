@@ -71,6 +71,7 @@ export {
 } from './tasks';
 export {
   setActiveTask,
+  activateTaskFromPointer,
   setActiveAgent,
   moveActiveTask,
   jumpToTask,

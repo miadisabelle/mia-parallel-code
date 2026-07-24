@@ -1,3 +1,4 @@
+import { batch } from 'solid-js';
 import { store, setStore } from './core';
 
 // Keep in sync with `scroll-padding-inline` on `.tiling-layout-strip` in styles.css.
@@ -78,14 +79,19 @@ export function isPanelFocusedPrefix(taskId: string, prefix: string): boolean {
 
 export function setTaskFocusedPanel(taskId: string, panel: string): void {
   const normalizedPanel = normalizeTaskPanel(taskId, panel);
-  setStore('focusedPanel', taskId, normalizedPanel);
   const agentId = agentIdFromAiTerminalPanel(normalizedPanel);
-  if (agentId && store.tasks[taskId]?.agentIds.includes(agentId)) {
-    setStore('activeAgentId', agentId);
-    setStore('tasks', taskId, 'selectedAgentId', agentId);
-  }
-  setStore('sidebarFocused', false);
-  setStore('placeholderFocused', false);
+  // One batch: `isPanelFocused` reads the focused panel *and* both focus flags,
+  // so applying them one at a time makes every subscriber re-render against a
+  // state where the new panel is recorded but the sidebar still claims focus.
+  batch(() => {
+    setStore('focusedPanel', taskId, normalizedPanel);
+    if (agentId && store.tasks[taskId]?.agentIds.includes(agentId)) {
+      setStore('activeAgentId', agentId);
+      setStore('tasks', taskId, 'selectedAgentId', agentId);
+    }
+    setStore('sidebarFocused', false);
+    setStore('placeholderFocused', false);
+  });
   triggerFocus(`${taskId}:${normalizedPanel}`);
   scrollTaskIntoView(taskId);
 }

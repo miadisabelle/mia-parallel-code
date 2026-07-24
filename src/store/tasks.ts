@@ -129,14 +129,17 @@ function initTaskInStore(
   agent: Agent,
   projectId: string,
   agentDef: AgentDef | undefined,
+  activate = true,
 ): void {
   setStore(
     produce((s) => {
       s.tasks[taskId] = task;
       s.agents[agent.id] = agent;
       s.taskOrder.push(taskId);
-      s.activeTaskId = taskId;
-      s.activeAgentId = agent.id;
+      if (activate || s.activeTaskId === null) {
+        s.activeTaskId = taskId;
+        s.activeAgentId = agent.id;
+      }
       s.lastProjectId = projectId;
       if (agentDef) s.lastAgentId = agentDef.id;
     }),
@@ -231,6 +234,10 @@ export interface CreateTaskOptions {
   coordinatorMode?: boolean;
   propagateSkipPermissions?: boolean;
   maxConcurrentTasks?: number;
+  /** Make the new task the active one. Defaults to true. Callers that are not
+   *  the person at the desktop (a paired phone, for instance) pass false so the
+   *  selection and keyboard focus stay where the desktop user left them. */
+  activate?: boolean;
 }
 
 export async function createTask(opts: CreateTaskOptions): Promise<string> {
@@ -392,7 +399,7 @@ export async function createTask(opts: CreateTaskOptions): Promise<string> {
     def: agentDef,
   });
 
-  initTaskInStore(taskId, task, agent, projectId, agentDef);
+  initTaskInStore(taskId, task, agent, projectId, agentDef, opts.activate ?? true);
 
   saveState(); // fire-and-forget — errors handled internally
   return taskId;

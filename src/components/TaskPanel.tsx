@@ -2,7 +2,7 @@ import { Show, createSignal, createEffect, onMount, onCleanup, batch } from 'sol
 import {
   store,
   retryCloseTask,
-  setActiveTask,
+  activateTaskFromPointer,
   setActiveAgent,
   clearInitialPrompt,
   clearPrefillPrompt,
@@ -159,21 +159,32 @@ export function TaskPanel(props: TaskPanelProps) {
     if (autoFocusTimer !== undefined) clearTimeout(autoFocusTimer);
   });
   createEffect(() => {
-    if (props.isActive && !store.focusedPanel[props.task.id]) {
-      const id = props.task.id;
-      if (autoFocusTimer !== undefined) clearTimeout(autoFocusTimer);
-      autoFocusTimer = setTimeout(() => {
-        autoFocusTimer = undefined;
-        if (!store.focusedPanel[id] && !panelRef.contains(document.activeElement)) {
-          if (store.showPromptInput) {
-            promptRef?.focus();
-          } else {
-            setTaskFocusedPanel(id, 'ai-terminal');
-            triggerFocus(`${id}:ai-terminal`);
-          }
-        }
-      }, 0);
-    }
+    if (!props.isActive) return;
+    const id = props.task.id;
+    // Tracked so the timer also runs when the task becomes active with a panel
+    // already remembered — e.g. clicking its title bar, which lands DOM focus
+    // nowhere and would otherwise leave typing going into the void.
+    void store.focusedPanel[id];
+    if (autoFocusTimer !== undefined) clearTimeout(autoFocusTimer);
+    autoFocusTimer = setTimeout(() => {
+      autoFocusTimer = undefined;
+      const focused = document.activeElement;
+      // Already inside this panel, or someone else (sidebar list, dialog,
+      // another column) legitimately owns focus — never steal it. Only `body`
+      // means the click landed on a non-focusable header and left focus loose.
+      if (focused && focused !== document.body) return;
+      const remembered = store.focusedPanel[id];
+      if (remembered) {
+        triggerFocus(`${id}:${remembered}`);
+        return;
+      }
+      if (store.showPromptInput) {
+        promptRef?.focus();
+      } else {
+        setTaskFocusedPanel(id, 'ai-terminal');
+        triggerFocus(`${id}:ai-terminal`);
+      }
+    }, 0);
   });
 
   // React to pendingAction from keyboard shortcuts
@@ -432,8 +443,13 @@ export function TaskPanel(props: TaskPanelProps) {
         overflow: 'clip',
         position: 'relative',
       }}
-      onClick={() => {
-        setActiveTask(props.task.id);
+      onPointerDown={() => {
+        // Activate on press, not on click. Selecting a task smooth-scrolls the
+        // strip, so a click started on a partially visible neighbour can end
+        // over a different column — the browser then fires `click` on the
+        // common ancestor instead of this panel and the activation is silently
+        // lost. pointerdown is decided before anything moves.
+        activateTaskFromPointer(props.task.id);
       }}
     >
       <TaskClosingOverlay
