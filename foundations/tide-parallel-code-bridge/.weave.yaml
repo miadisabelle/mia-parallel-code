@@ -1,0 +1,8 @@
+weave: 1
+artefact: tide-parallel-code-bridge
+episodes:
+  - path: 2026-07-23-episode-295-parallel-code-and-the-reachable-tide
+    number: 295
+    related_at: 2026-07-23T14:51:29.734Z
+issue: jgwill/Miadi#531
+issue_url: https://github.com/jgwill/Miadi/issues/531

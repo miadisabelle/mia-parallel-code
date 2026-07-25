@@ -1,0 +1,8 @@
+weave: 1
+artefact: prompt-intent-embedding
+episodes:
+  - path: 2026-07-23-episode-295-parallel-code-and-the-reachable-tide
+    number: 295
+    related_at: 2026-07-23T14:53:19.736Z
+issue: miadisabelle/mia-parallel-code#2
+issue_url: https://github.com/miadisabelle/mia-parallel-code/issues/2
