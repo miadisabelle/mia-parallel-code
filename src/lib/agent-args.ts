@@ -1,5 +1,6 @@
 import type { AgentDef } from '../ipc/types';
 import type { Task } from '../store/types';
+import { resolveSkipPermissionsArgs } from '../../electron/ipc/agent-defaults';
 
 function isCodexCommand(command: string): boolean {
   return command.split('/').pop()?.includes('codex') === true;
@@ -41,9 +42,11 @@ export function buildTaskAgentArgs(
 ): string[] {
   return [
     ...(resumed && agentDef.resume_args?.length ? (agentDef.resume_args ?? []) : agentDef.args),
-    ...(task.skipPermissions && agentDef.skip_permissions_args?.length
-      ? (agentDef.skip_permissions_args ?? [])
-      : []),
+    // Resolve rather than read agentDef.skip_permissions_args directly: a def
+    // restored from an older profile or synthesised from a bare command carries
+    // no skip args, and reading it straight would turn an explicit
+    // skipPermissions: true into a launch that prompts on every tool call (#7).
+    ...(task.skipPermissions ? resolveSkipPermissionsArgs(agentDef) : []),
     ...(task.mcpLaunchArgs ?? legacyMcpConfigArgs(agentDef.command, task.mcpConfigPath)),
   ];
 }

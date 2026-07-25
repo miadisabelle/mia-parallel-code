@@ -8,6 +8,8 @@ import { store } from './core';
 import { createTask, updateTaskNotes } from './tasks';
 import { invoke } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
+import { resolveSkipPermissionsArgs } from '../../electron/ipc/agent-defaults';
+import type { AgentDef } from '../ipc/types';
 
 interface RendererRequest {
   reqId: string;
@@ -26,6 +28,22 @@ interface GetNotesRequest extends RendererRequest {
 interface SetNotesRequest extends RendererRequest {
   taskId: string;
   notes: string;
+}
+
+/**
+ * Whether a task created from a phone launches its agent with skip-permissions.
+ *
+ * Mirrors the desktop New Task dialog: adopt the profile default, but only for
+ * an agent that actually has a skip-permissions flag.  Without this the remote
+ * path left skipPermissions undefined on every task it created, so a profile
+ * with the flag defaulted ON still launched agents that prompt on every tool
+ * call (#7) — the desktop dialog honoured the default and the phone did not.
+ */
+export function remoteTaskSkipPermissions(
+  agentDef: Pick<AgentDef, 'command'> & Partial<Pick<AgentDef, 'skip_permissions_args'>>,
+  defaultSkipPermissions: boolean,
+): boolean {
+  return defaultSkipPermissions && resolveSkipPermissionsArgs(agentDef).length > 0;
 }
 
 function reply(reqId: string, ok: boolean, data?: unknown, error?: string): void {
@@ -74,6 +92,7 @@ async function handleCreateTask(req: CreateTaskRequest): Promise<void> {
       baseBranch,
       symlinkDirs,
       initialPrompt: req.prompt,
+      skipPermissions: remoteTaskSkipPermissions(agentDef, store.defaultSkipPermissions),
       // A task created from a phone must not move the desktop's selection: the
       // person at the desktop may be mid-sentence in another column, and the
       // jump would scroll the strip and re-target keyboard focus under them.

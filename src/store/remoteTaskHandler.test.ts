@@ -1,7 +1,7 @@
 /* eslint-disable solid/reactivity -- these tests read the store proxy synchronously to exercise isKnownTask; no reactive tracking is involved. */
 import { describe, it, expect } from 'vitest';
 import { createStore } from 'solid-js/store';
-import { isKnownTask } from './remoteTaskHandler';
+import { isKnownTask, remoteTaskSkipPermissions } from './remoteTaskHandler';
 
 // Guards the prototype-pollution fix: a mobile HTTP request supplies the task
 // id, and Solid's store proxy resolves inherited keys to prototype objects.
@@ -38,5 +38,37 @@ describe('isKnownTask', () => {
     // …yet isKnownTask correctly rejects them.
     expect(isKnownTask(store.tasks, 'constructor')).toBe(false);
     expect(isKnownTask(store.tasks, 'toString')).toBe(false);
+  });
+});
+
+// #7: handleCreateTask never passed skipPermissions, so every task created from
+// a phone launched its agent without --dangerously-skip-permissions even though
+// the profile defaulted the flag ON — the desktop dialog honoured the default
+// and the remote path did not.
+describe('remoteTaskSkipPermissions', () => {
+  const claude = { command: 'claude', skip_permissions_args: ['--dangerously-skip-permissions'] };
+
+  it('adopts the profile default for an agent that supports the flag', () => {
+    expect(remoteTaskSkipPermissions(claude, true)).toBe(true);
+  });
+
+  it('honours an explicit opt-out', () => {
+    expect(remoteTaskSkipPermissions(claude, false)).toBe(false);
+  });
+
+  it('adopts the default for a def restored without its skip args', () => {
+    expect(remoteTaskSkipPermissions({ command: 'claude', skip_permissions_args: [] }, true)).toBe(
+      true,
+    );
+  });
+
+  it('stays off for an agent that has no skip-permissions flag', () => {
+    expect(
+      remoteTaskSkipPermissions({ command: 'opencode', skip_permissions_args: [] }, true),
+    ).toBe(false);
+  });
+
+  it('stays off for an unknown agent command', () => {
+    expect(remoteTaskSkipPermissions({ command: 'mystery-agent' }, true)).toBe(false);
   });
 });

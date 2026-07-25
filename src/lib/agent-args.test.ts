@@ -171,6 +171,63 @@ describe('buildTaskAgentArgs', () => {
       ),
     ).toEqual(['--continue', '--additional-mcp-config', '@/tmp/mcp.json']);
   });
+
+  // #7: an AgentDef reaches this function in degraded forms — restored from an
+  // older profile, or synthesised from a bare command by the MCP sub-task
+  // listener.  Reading skip_permissions_args straight off the def turned an
+  // explicit skipPermissions: true into a launch that prompts on every tool
+  // call, with nothing in the args to show the intent had been dropped.
+  describe('degraded agent defs (#7)', () => {
+    const degradedClaude = {
+      id: 'claude-code',
+      name: 'Claude Code',
+      description: '',
+      command: 'claude',
+      args: [],
+      resume_args: [],
+      skip_permissions_args: [],
+    };
+
+    it('resolves the skip-permissions flag from the command when the def lost its args', () => {
+      expect(buildTaskAgentArgs(degradedClaude, { skipPermissions: true }, false)).toEqual([
+        '--dangerously-skip-permissions',
+      ]);
+    });
+
+    it('still resolves the flag alongside the MCP config fallback', () => {
+      expect(
+        buildTaskAgentArgs(
+          degradedClaude,
+          { skipPermissions: true, mcpConfigPath: '/tmp/mcp.json' },
+          false,
+        ),
+      ).toEqual(['--dangerously-skip-permissions', '--mcp-config', '/tmp/mcp.json']);
+    });
+
+    it('resolves the flag for a def whose command is a full path', () => {
+      expect(
+        buildTaskAgentArgs(
+          { ...degradedClaude, command: '/usr/local/bin/claude' },
+          { skipPermissions: true },
+          false,
+        ),
+      ).toEqual(['--dangerously-skip-permissions']);
+    });
+
+    it('adds nothing when the task did not opt in', () => {
+      expect(buildTaskAgentArgs(degradedClaude, { skipPermissions: false }, false)).toEqual([]);
+    });
+
+    it('adds nothing for an unknown agent that has no flag to resolve', () => {
+      expect(
+        buildTaskAgentArgs(
+          { ...degradedClaude, id: 'mystery', command: 'mystery-agent' },
+          { skipPermissions: true },
+          false,
+        ),
+      ).toEqual([]);
+    });
+  });
 });
 
 describe('isResumeArgsFailure', () => {
