@@ -33,4 +33,13 @@ describe('autosave snapshot includes new-task-default fields', () => {
   it('showSteps is not tracked separately (migrated to defaultStepsEnabled)', () => {
     expect('showSteps' in store).toBe(false);
   });
+
+  it('autoResumeSessions changes the snapshot', () => {
+    setStore('autoResumeSessions', false);
+    const before = persistedSnapshot();
+    setStore('autoResumeSessions', true);
+    const after = persistedSnapshot();
+    expect(before).not.toBe(after);
+    setStore('autoResumeSessions', false);
+  });
 });

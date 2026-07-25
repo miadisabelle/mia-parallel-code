@@ -559,7 +559,9 @@ function AgentTerminalPane(props: {
                 <span>
                   {a().signal === 'spawn_failed'
                     ? 'Failed to start'
-                    : `Process exited (${a().exitCode ?? '?'})`}
+                    : a().suspended
+                      ? 'Session suspended'
+                      : `Process exited (${a().exitCode ?? '?'})`}
                 </span>
                 <AgentRestartMenu agentId={a().id} agentDefId={a().def.id} />
                 <Show when={a().def.resume_args?.length}>
@@ -583,7 +585,9 @@ function AgentTerminalPane(props: {
                 </Show>
               </div>
             </Show>
-            <Show when={`${a().id}:${a().generation}`} keyed>
+            {/* A suspended agent (restored without auto-resume) must not mount a
+                TerminalView — mounting spawns the PTY. Resume clears the flag. */}
+            <Show when={!a().suspended && `${a().id}:${a().generation}`} keyed>
               <TerminalView
                 taskId={props.task.id}
                 agentId={a().id}

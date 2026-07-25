@@ -89,6 +89,9 @@ export interface Agent {
   generation: number;
   spawnDelayMs?: number;
   attachExisting?: boolean;
+  /** Restored from a previous app session but intentionally not spawned —
+   *  waiting for an explicit Resume. See persistence.ts (autoResumeSessions). */
+  suspended?: boolean;
 }
 
 export interface Task {
@@ -276,6 +279,7 @@ export interface PersistedState {
   defaultSkipPermissions?: boolean;
   defaultPropagateSkipPermissions?: boolean;
   autoStartRemoteAccess?: boolean;
+  autoResumeSessions?: boolean;
 }
 
 export interface MCPStatus {
@@ -385,5 +389,6 @@ export interface AppStore {
   defaultStepsEnabled: boolean;
   defaultSkipPermissions: boolean;
   defaultPropagateSkipPermissions: boolean;
+  autoResumeSessions: boolean;
   mcpStatus: MCPStatus;
 }

@@ -829,3 +829,72 @@ describe('showSteps → defaultStepsEnabled migration', () => {
     expect(saved.defaultStepsEnabled).toBe(true);
   });
 });
+
+// Fork direction: restoring the app must not respawn every persisted session with
+// resume args — that re-enters each agent's previous conversation and can trigger
+// automatic context compaction across all of them at once. Auto-resume is opt-in;
+// live PTYs (renderer reload) always reattach because attaching spawns nothing.
+describe('session auto-resume (fork)', () => {
+  beforeEach(() => {
+    setStore('autoResumeSessions', false);
+  });
+
+  function payloadWithTask(def: AgentDef, extra: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'hsl(0, 70%, 75%)' }],
+      lastProjectId: 'project-1',
+      lastAgentId: null,
+      taskOrder: ['task-1'],
+      collapsedTaskOrder: [],
+      tasks: { 'task-1': { ...persistedTask(def), agentIds: ['agent-live'] } },
+      activeTaskId: 'task-1',
+      sidebarVisible: true,
+      ...extra,
+    });
+  }
+
+  it('suspends restored agents by default instead of respawning with resume args', async () => {
+    mockInvoke.mockResolvedValueOnce(payloadWithTask(agentDef()));
+    await loadState();
+    const agent = store.agents[store.tasks['task-1'].agentIds[0]];
+    expect(agent.suspended).toBe(true);
+    expect(agent.status).toBe('exited');
+    expect(agent.signal).toBe('suspended');
+    expect(store.autoResumeSessions).toBe(false);
+  });
+
+  it('auto-resumes restored agents when autoResumeSessions is opted in', async () => {
+    mockInvoke.mockResolvedValueOnce(payloadWithTask(agentDef(), { autoResumeSessions: true }));
+    await loadState();
+    const agent = store.agents[store.tasks['task-1'].agentIds[0]];
+    expect(agent.suspended).toBeUndefined();
+    expect(agent.status).toBe('running');
+    expect(store.autoResumeSessions).toBe(true);
+  });
+
+  it('reattaches agents whose PTY is still alive even without opt-in', async () => {
+    mockInvoke
+      .mockResolvedValueOnce(payloadWithTask(agentDef()))
+      .mockResolvedValueOnce(['agent-live']);
+    await loadState();
+    const agent = store.agents['agent-live'];
+    expect(agent.suspended).toBeUndefined();
+    expect(agent.status).toBe('running');
+    expect(agent.attachExisting).toBe(true);
+  });
+
+  it('does not persist autoResumeSessions=false; persists an explicit true', async () => {
+    setStore('autoResumeSessions', false);
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    let saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
+    expect(saved.autoResumeSessions).toBeUndefined();
+
+    vi.clearAllMocks();
+    setStore('autoResumeSessions', true);
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
+    expect(saved.autoResumeSessions).toBe(true);
+  });
+});

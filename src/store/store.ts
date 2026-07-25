@@ -144,6 +144,7 @@ export {
   setWindowState,
   setCoordinatorModeEnabled,
   setDefaultStepsEnabled,
+  setAutoResumeSessions,
   setDefaultSkipPermissions,
   setDefaultPropagateSkipPermissions,
 } from './ui';

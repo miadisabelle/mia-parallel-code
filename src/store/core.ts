@@ -88,6 +88,11 @@ export const [store, setStore] = createStore<AppStore>({
   // restore upstream behavior, set both of these back to false.
   defaultSkipPermissions: true,
   defaultPropagateSkipPermissions: true,
+  // Fork direction (miadisabelle): auto-resuming every persisted session at launch
+  // re-enters each agent's previous conversation (`claude --continue`), which can
+  // trigger automatic context compaction across all sessions at once. OFF by default —
+  // restored agents stay suspended until explicitly resumed from their task pane.
+  autoResumeSessions: false,
   customThemes: {},
   activeCustomThemeId: null,
   mcpStatus: { running: false, port: null, coordinatorTaskId: null, mcpConfigPath: null },

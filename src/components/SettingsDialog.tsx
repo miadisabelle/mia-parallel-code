@@ -35,6 +35,7 @@ import {
   setCoordinatorModeEnabled,
   setCoordinatorNotificationDelayMs,
   setDefaultStepsEnabled,
+  setAutoResumeSessions,
   setDefaultSkipPermissions,
   setDefaultPropagateSkipPermissions,
   updateStatus,
@@ -437,6 +438,12 @@ export function SettingsDialog(props: SettingsDialogProps) {
               checked={store.desktopNotificationsEnabled}
               onChange={setDesktopNotificationsEnabled}
               description="Show native notifications when tasks finish or need attention"
+            />
+            <SettingsCheckboxRow
+              label="Auto-resume agent sessions on launch"
+              checked={store.autoResumeSessions}
+              onChange={setAutoResumeSessions}
+              description="Respawn every persisted agent with its resume args (e.g. claude --continue) when the app starts. Off by default: resuming all sessions at once can immediately trigger each agent's automatic context compaction. When off, restored tasks wait for an explicit Resume."
             />
             <SettingsCheckboxRow
               label="Show prompt input box below terminal"

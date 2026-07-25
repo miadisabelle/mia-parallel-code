@@ -22,6 +22,7 @@ interface AgentLike {
   generation: number;
   spawnDelayMs?: number;
   attachExisting?: boolean;
+  suspended?: boolean;
 }
 
 interface AgentDefLike {
@@ -107,6 +108,16 @@ describe('restartAgent', () => {
     });
     expect(mockAgents['agent-1'].spawnDelayMs).toBeUndefined();
     expect(mockMarkAgentSpawned).toHaveBeenCalledWith('agent-1');
+  });
+
+  it('clears the suspended flag so the terminal mounts and spawns', () => {
+    mockAgents['agent-1'] = exitedAgent({ signal: 'suspended', suspended: true });
+
+    restartAgent('agent-1', true);
+
+    expect(mockAgents['agent-1'].suspended).toBeUndefined();
+    expect(mockAgents['agent-1'].status).toBe('running');
+    expect(mockAgents['agent-1'].resumed).toBe(true);
   });
 });
 

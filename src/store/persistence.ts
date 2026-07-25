@@ -220,6 +220,7 @@ export async function saveState(): Promise<void> {
     defaultSkipPermissions: store.defaultSkipPermissions,
     defaultPropagateSkipPermissions: store.defaultPropagateSkipPermissions,
     autoStartRemoteAccess: store.autoStartRemoteAccess || undefined,
+    autoResumeSessions: store.autoResumeSessions || undefined,
   };
 
   for (const taskId of store.taskOrder) {
@@ -388,6 +389,7 @@ interface LegacyPersistedState {
   defaultSkipPermissions?: unknown;
   defaultPropagateSkipPermissions?: unknown;
   autoStartRemoteAccess?: unknown;
+  autoResumeSessions?: unknown;
 }
 
 export async function loadState(): Promise<void> {
@@ -455,6 +457,18 @@ export async function loadState(): Promise<void> {
   const restoredRunningAgentIds: string[] = [];
   const usedRestoredAgentIds = new Set<string>();
   const today = getLocalDateKey();
+
+  // Fork direction: auto-resume at launch is opt-in. Restored agents whose PTY is
+  // still alive in the main process (renderer reload, hidden window) reattach as
+  // before — attaching never spawns anything. Agents whose PTY is gone (fresh app
+  // start) are suspended instead of respawned with resume args, because resuming
+  // every session at once makes each agent immediately re-enter its previous
+  // conversation and can trigger automatic context compaction across all of them.
+  const autoResumeSessions = raw.autoResumeSessions === true;
+  const liveIdsRaw = await Promise.resolve(invoke<string[]>(IPC.ListRunningAgentIds)).catch(
+    () => [],
+  );
+  const liveAgentIds = new Set(Array.isArray(liveIdsRaw) ? liveIdsRaw : []);
 
   setStore(
     produce((s) => {
@@ -599,6 +613,9 @@ export async function loadState(): Promise<void> {
 
       s.autoStartRemoteAccess = raw.autoStartRemoteAccess === true;
 
+      // Fork direction: auto-resume of persisted sessions at launch is opt-in.
+      s.autoResumeSessions = raw.autoResumeSessions === true;
+
       const rawDockerImage = raw.dockerImage;
       s.dockerImage =
         typeof rawDockerImage === 'string' && rawDockerImage.trim()
@@ -706,14 +723,18 @@ export async function loadState(): Promise<void> {
         for (let i = 0; i < agentDefs.length; i++) {
           const agentId = agentIds[i];
           const agentDef = agentDefs[i];
+          // Reattach live PTYs always; dead ones only spawn (with resume args)
+          // when auto-resume is opted in — otherwise they wait, suspended.
+          const autoSpawn = autoResumeSessions || liveAgentIds.has(agentId);
           const agent: Agent = {
             id: agentId,
             taskId,
             def: agentDef,
             resumed: true,
-            status: 'running',
+            status: autoSpawn ? 'running' : 'exited',
             exitCode: null,
-            signal: null,
+            signal: autoSpawn ? null : 'suspended',
+            suspended: autoSpawn ? undefined : true,
             lastOutput: [],
             generation: 0,
             spawnDelayMs:
@@ -721,7 +742,7 @@ export async function loadState(): Promise<void> {
             attachExisting: true,
           };
           s.agents[agentId] = agent;
-          restoredRunningAgentIds.push(agentId);
+          if (autoSpawn) restoredRunningAgentIds.push(agentId);
         }
       }
 

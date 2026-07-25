@@ -28,6 +28,7 @@ export function persistedSnapshot(): string {
     defaultStepsEnabled: store.defaultStepsEnabled,
     defaultSkipPermissions: store.defaultSkipPermissions,
     defaultPropagateSkipPermissions: store.defaultPropagateSkipPermissions,
+    autoResumeSessions: store.autoResumeSessions,
     showSidebarTips: store.showSidebarTips,
     showSidebarProgress: store.showSidebarProgress,
     projectsCollapsed: store.projectsCollapsed,

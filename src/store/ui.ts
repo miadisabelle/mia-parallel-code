@@ -212,6 +212,10 @@ export function setDefaultPropagateSkipPermissions(enabled: boolean): void {
   setStore('defaultPropagateSkipPermissions', enabled);
 }
 
+export function setAutoResumeSessions(enabled: boolean): void {
+  setStore('autoResumeSessions', enabled);
+}
+
 export function setCoordinatorNotificationDelayMs(ms: number): void {
   const clamped = Math.max(5_000, Math.min(300_000, Math.round(ms)));
   setStore('coordinatorNotificationDelayMs', clamped);
