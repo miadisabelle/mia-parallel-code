@@ -21,6 +21,36 @@
 const fs = require('fs');
 const path = require('path');
 
+// The packaged tree inherits the *builder's* umask. On a shared server that is
+// often 007, which produces drwxrwx--- directories and -rw-rw---- files with no
+// "other" bits at all. dpkg preserves those modes verbatim, so `/opt/<app>`
+// installs root-owned and untraversable — the desktop user who is supposed to
+// run the app cannot even enter the directory, and the launcher fails before
+// Electron starts. Force world-readable, world-traversable modes on everything
+// we ship, regardless of the umask the build happened to run under.
+function normalizePermissions(target) {
+  let stat;
+  try {
+    stat = fs.lstatSync(target);
+  } catch {
+    return;
+  }
+  // Symlinks carry no meaningful mode of their own and lchmod is not portable.
+  if (stat.isSymbolicLink()) return;
+
+  if (stat.isDirectory()) {
+    fs.chmodSync(target, 0o755);
+    for (const entry of fs.readdirSync(target)) {
+      normalizePermissions(path.join(target, entry));
+    }
+    return;
+  }
+
+  // Keep the executable bit where the owner already had one (binaries, the
+  // launcher wrapper, chrome_crashpad_handler) and widen it to everyone.
+  fs.chmodSync(target, stat.mode & 0o100 ? 0o755 : 0o644);
+}
+
 exports.default = async function afterPack(context) {
   if (context.electronPlatformName !== 'linux') return;
 
@@ -31,8 +61,18 @@ exports.default = async function afterPack(context) {
   const launcher = path.join(dir, name);
   const real = path.join(dir, `${name}.bin`);
 
+  // Icons and other build resources are staged into the package straight from
+  // the repo, so they carry whatever modes the checkout got — outside appOutDir
+  // and therefore not covered by the pass below. This hook runs before the deb
+  // and AppImage targets assemble, which is the last point both are reachable.
+  const buildResources = path.join(process.cwd(), 'build');
+  if (fs.existsSync(buildResources)) normalizePermissions(buildResources);
+
   // Idempotent — a re-pack over the same dir must not double-wrap.
-  if (fs.existsSync(real)) return;
+  if (fs.existsSync(real)) {
+    normalizePermissions(dir);
+    return;
+  }
 
   if (!fs.existsSync(launcher)) {
     throw new Error(`after-pack: expected Electron launcher not found at ${launcher}`);
@@ -49,4 +89,6 @@ exec -a "${name}" "$HERE/${name}.bin" --no-sandbox "$@"
 
   fs.writeFileSync(launcher, wrapper, { mode: 0o755 });
   fs.chmodSync(launcher, 0o755);
+
+  normalizePermissions(dir);
 };

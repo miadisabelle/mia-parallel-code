@@ -8,19 +8,19 @@
 
 ## Aspect map (one row = one candidate issue/spec)
 
-| #   | Aspect                                          | Repo              | Primary landing file(s)                                              | Kind              |
-| --- | ----------------------------------------------- | ----------------- | -------------------------------------------------------------------- | ----------------- |
-| A0  | Tailscale-reachable Connect-Phone QR            | mia-parallel-code | `src/components/ConnectPhoneModal.tsx`, `electron/remote/server.ts`  | fix (first stone) |
-| A1  | Bridge auth surface (token without QR)          | mia-parallel-code | `electron/remote/server.ts`, `electron/mcp/client.ts`                | extension         |
-| A2  | tide-contract: `parallel` Multiplexer           | jgwill/Miadi      | `packages/tide-contract/src/index.ts`, `schema/tide-api.schema.json` | spec + contract   |
-| A3  | `@miadi/tide`: `parallel.ts` transport          | jgwill/Miadi      | `packages/tide/src/{parallel,client,index}.ts`                       | integration       |
-| A4  | Identity & status mapping                       | jgwill/Miadi      | `packages/tide/src/parallel.ts`                                      | integration       |
-| A5  | peek ← scrollback/output                        | jgwill/Miadi      | `packages/tide/src/parallel.ts`                                      | integration       |
-| A6  | steer ← prompt/input (no TTY gate)              | jgwill/Miadi      | `packages/tide/src/{parallel,steer-gate}.ts`                         | integration       |
-| A7  | posture ↔ token mapping                         | both              | `steer-gate.ts` ↔ `electron/remote/server.ts` pairing                | design            |
-| A8  | discovery & config                              | jgwill/Miadi      | `.miadi/tide.yaml`, `packages/tide/src/client.ts`, episode lanes     | integration       |
-| A9  | Direction-B shim (`/api/tide/*` in front of PC) | jgwill/Miadi      | `app/api/tide/*/route.ts`                                            | alternative       |
-| A10 | Chronicle weave wiring                          | jgwill/Miadi      | `packages/inquiry-weave`                                             | deferred          |
+| #   | Aspect                                          | Repo              | Primary landing file(s)                                                              | Kind                  |
+| --- | ----------------------------------------------- | ----------------- | ------------------------------------------------------------------------------------ | --------------------- |
+| A0  | Tailscale-reachable Connect-Phone QR            | mia-parallel-code | `src/components/ConnectPhoneModal.tsx`, `electron/remote/server.ts`                  | fix (first stone)     |
+| A1  | Bridge auth surface (token without QR)          | mia-parallel-code | `electron/remote/server.ts`, `electron/mcp/client.ts`                                | extension             |
+| A2  | tide-contract: `parallel` Multiplexer           | jgwill/Miadi      | `packages/tide-contract/src/index.ts`, `schema/tide-api.schema.json`                 | spec + contract       |
+| A3  | `@miadi/tide`: `parallel.ts` transport          | jgwill/Miadi      | `packages/tide/src/{parallel,client,index}.ts`                                       | integration           |
+| A4  | Identity & status mapping                       | jgwill/Miadi      | `packages/tide/src/parallel.ts`                                                      | integration           |
+| A5  | peek ← scrollback/output                        | jgwill/Miadi      | `packages/tide/src/parallel.ts`                                                      | integration           |
+| A6  | steer ← prompt/input (no TTY gate)              | jgwill/Miadi      | `packages/tide/src/{parallel,steer-gate}.ts`                                         | integration           |
+| A7  | posture ↔ token mapping                         | both              | `steer-gate.ts` ↔ `electron/remote/server.ts` pairing                                | design                |
+| A8  | discovery & config                              | jgwill/Miadi      | `.miadi/tide.yaml`, `packages/tide/src/client.ts`, episode lanes                     | integration           |
+| A9  | Direction-B shim (`/api/tide/*` in front of PC) | jgwill/Miadi      | `app/api/tide/*/route.ts`                                                            | alternative           |
+| A10 | Chronicle weave wiring                          | jgwill/Miadi      | `packages/inquiry-weave`                                                             | deferred              |
 | A11 | Chronicle awareness in the desktop UI           | mia-parallel-code | `electron/ipc/weave.ts` (new), `src/store/projects.ts`, `src/components/Sidebar.tsx` | feature (independent) |
 
 ---
@@ -180,18 +180,18 @@ into an existing or new Chronicle episode. Env: `MIADI_INQUIRY_ROOT`, `MIADI_CHR
 ## A11 — Chronicle awareness in the desktop UI _(independent; can ship first)_
 
 **Why.** After `inquiry-weave relate`, an artefact carries its own `.weave.yaml` **inside the repo** —
-so the desktop app can answer *"which Chronicle episode is this work part of?"* with a **local file
+so the desktop app can answer _"which Chronicle episode is this work part of?"_ with a **local file
 read**: no network, no API dependency, works offline inside the worktree an agent is already using.
-This is what turns generic *parallel-code* into **`miadi-parallel-code`**: upstream's app knows about
+This is what turns generic _parallel-code_ into **`miadi-parallel-code`**: upstream's app knows about
 branches and tasks; ours would know **which story the work belongs to**.
 
 **Resolution sources (increasing richness, decreasing availability).**
 
-| Source | Yields | Cost |
-| --- | --- | --- |
+| Source                                      | Yields                                                        | Cost          |
+| ------------------------------------------- | ------------------------------------------------------------- | ------------- |
 | `.weave.yaml` beside the artefact (in-repo) | episode number + slug + path, issue + issue_url, `related_at` | free, offline |
-| `MW_API_URL` (medicine-wheel) | the episode card: title, goal, status | one HTTP call |
-| `MIADI_CHRONICLE_ROOT` (if mounted) | `episode.yaml`, mission, lineage, sibling episodes | filesystem |
+| `MW_API_URL` (medicine-wheel)               | the episode card: title, goal, status                         | one HTTP call |
+| `MIADI_CHRONICLE_ROOT` (if mounted)         | `episode.yaml`, mission, lineage, sibling episodes            | filesystem    |
 
 **The change.**
 
