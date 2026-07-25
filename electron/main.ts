@@ -196,23 +196,46 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
-  // Grant microphone and clipboard access (deny camera/video)
-  session.defaultSession.setPermissionRequestHandler(
-    (_webContents, permission, callback, details) => {
-      if (permission === 'clipboard-read' || permission === 'clipboard-sanitized-write') {
-        return callback(true);
-      }
-      if (permission === 'media') {
-        const types = (details as { mediaTypes?: string[] }).mediaTypes ?? [];
-        return callback(types.every((t) => t === 'audio'));
-      }
-      callback(false);
-    },
-  );
+// A window hidden by "Keep in Background" must stay recoverable. Without the
+// single-instance lock, relaunching the app started a SECOND process that
+// respawned every persisted session on top of the hidden one still holding the
+// live PTYs — and the hidden window itself could never be brought back. The
+// first instance owns the profile; a second launch just re-shows its window.
+// Dev runs skip the lock so `npm run dev` can coexist with an installed build.
+const isPrimaryInstance = !app.isPackaged || app.requestSingleInstanceLock();
 
-  createWindow();
-});
+function showMainWindow(): void {
+  if (!mainWindow) return;
+  if (!mainWindow.isVisible()) mainWindow.show();
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+}
+
+if (!isPrimaryInstance) {
+  app.quit();
+} else {
+  app.on('second-instance', showMainWindow);
+  // macOS dock click after the window was hidden or closed to background.
+  app.on('activate', showMainWindow);
+
+  app.whenReady().then(() => {
+    // Grant microphone and clipboard access (deny camera/video)
+    session.defaultSession.setPermissionRequestHandler(
+      (_webContents, permission, callback, details) => {
+        if (permission === 'clipboard-read' || permission === 'clipboard-sanitized-write') {
+          return callback(true);
+        }
+        if (permission === 'media') {
+          const types = (details as { mediaTypes?: string[] }).mediaTypes ?? [];
+          return callback(types.every((t) => t === 'audio'));
+        }
+        callback(false);
+      },
+    );
+
+    createWindow();
+  });
+}
 
 app.on('before-quit', () => {
   killAllAgents();
