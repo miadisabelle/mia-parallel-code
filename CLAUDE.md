@@ -28,3 +28,12 @@ Electron desktop app — SolidJS frontend, Node.js backend. Published for **macO
 - Electron IPC for all frontend-backend communication
 - IPC channel names defined in `electron/ipc/channels.ts` (shared enum)
 - `strict: true` TypeScript, no `any`
+
+## Fork Direction — Upstream Contribution Intent
+
+This fork tracks which commits could become upstream PRs. When opening one, cherry-pick per feature:
+
+| Theme                                                                         | Fork issues | Commits                                                              | Upstream note                                                                                                                                 |
+| ----------------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Skip-permissions default ON + persistent opt-out                              | #1, #7      | `c753a28` (+ launch-path fixes in v1.14.x)                           | Default flip is fork-flavored; upstream PR should keep their default OFF and contribute only the persistence/launch-path fixes                |
+| No auto-resume at launch (stops the automatic /compact storm); opt-in setting | #8          | `edb2ec9` (IPC, upstream-neutral) + `ef53283` (suspension + setting) | Upstream may prefer `autoResumeSessions` defaulting `true` to preserve their behavior — flip one line in `src/store/core.ts` on the PR branch |
