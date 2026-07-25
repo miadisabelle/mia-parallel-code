@@ -13,6 +13,7 @@ import {
   resumeAgent,
   killAgent,
   countRunningAgents,
+  getActiveAgentIds,
   killAllAgents,
   getAgentMeta,
   notifyAgentListChanged,
@@ -492,6 +493,11 @@ export function registerAllHandlers(win: BrowserWindow): void {
     return killAgent(args.agentId);
   });
   ipcMain.handle(IPC.CountRunningAgents, () => countRunningAgents());
+
+  // Which persisted agents still have a live PTY in this process. The renderer's
+  // restore path uses this to reattach live sessions (renderer reload) without
+  // auto-spawning `--continue` for the dead ones (fresh app start).
+  ipcMain.handle(IPC.ListRunningAgentIds, () => getActiveAgentIds());
   ipcMain.handle(IPC.KillAllAgents, () => killAllAgents());
 
   // --- Agent commands ---
