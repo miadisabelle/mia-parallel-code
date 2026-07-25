@@ -1,6 +1,6 @@
 {
   "name": "parallel-code",
-  "version": "1.15.0",
+  "version": "1.15.1",
   "description": "Run parallel AI coding agents, each in its own git worktree.",
   "homepage": "https://github.com/miadisabelle/mia-parallel-code",
   "author": {
