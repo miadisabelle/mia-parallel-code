@@ -29,23 +29,29 @@ Electron desktop app — SolidJS frontend, Node.js backend. Published for **macO
 - IPC channel names defined in `electron/ipc/channels.ts` (shared enum)
 - `strict: true` TypeScript, no `any`
 
-## Shipping a GitHub Release
+## Shipping a Release
 
-`./release/` holds electron-builder's output (`.deb`, `.AppImage`, `latest-linux.yml`) for whatever version is currently in `package.json`. When the user mentions shipping, releasing, or publishing the build to GitHub — anywhere in conversation, no separate confirmation needed — run:
+Three independent things can happen around a version bump. They are not the same action — don't assume one covers the others.
+
+**`npm run release`** (package.json script) is `npm run typecheck && npm version patch && git push --follow-tags`. It bumps the version and pushes the tag. **It does not build anything and does not ship anything** — those are separate steps that always follow it. `.npmrc` sets `message=chore(release): %s`, so `npm run release` (or plain `npm version`) produces the conventional `chore(release): X.Y.Z` commit; don't fold a version bump into an unrelated commit by hand. Correct order for a patch: commit the fix (no version change in it) → `npm run release` → `npm run build` → `bash scripts/release-github.sh`. For a minor/major bump, or to pin an exact version, `npm version patch` can't express it — bump manually instead with `npm version 1.16.0 --no-git-tag-version`, then build, then let `scripts/release-github.sh` (below) create the tag as part of shipping.
+
+**`bash scripts/release-github.sh`** ships the already-built `./release/` (electron-builder's `.deb`, `.AppImage`, `latest-linux.yml`) as a GitHub Release, for whatever version is currently in `package.json`. Run `npm run build` first — this script does not build, it fails loudly if `./release` is stale. When the user mentions shipping, releasing, or publishing the build to GitHub — anywhere in conversation, no separate confirmation needed — run:
 
 ```
 bash scripts/release-github.sh
 ```
 
-This runs `scripts/release-github.sh`, which:
+It:
 
 - Verifies the artifacts in `./release` match the current `package.json` version (fails loudly if stale — run `npm run build` first)
-- Tags `vX.Y.Z` at HEAD and pushes it
+- Tags `vX.Y.Z` at HEAD and pushes it (if the tag doesn't already exist — this is the tag push that also triggers Buildkite, below)
 - Uploads the `.deb`, the `.AppImage` (renamed to match `latest-linux.yml`'s hyphenated filename), and `latest-linux.yml` itself as release assets — `latest-linux.yml` is required for electron-updater's auto-update feed to find the build
 - Auto-generates release notes from commits since the previous `v*` tag
 - Idempotent: if `vX.Y.Z` is already released, it exits without re-creating or re-uploading anything
 
 This is a documented, pre-authorized trigger — the release action itself, not a proposal to confirm first.
+
+**Buildkite (`.buildkite/pipeline.yml`)** fires automatically on _any_ `vX.Y.Z` tag reaching GitHub — regardless of whether the tag came from `npm run release` or from `scripts/release-github.sh` above. It builds independently on Buildkite's own hosted agent (not from `./release/` on this machine) and publishes the resulting `.deb` to the `miadi-apt` Buildkite Package Registry, so `apt install parallel-code` stays current. This is separate infrastructure from GitHub Releases: no local build required, no trigger phrase needed, nothing to run by hand — pushing the tag is the whole trigger. Publish token lives in Buildkite's cluster Secrets (`PACKAGES_API_TOKEN`), never in this repo.
 
 ## Fork Direction — Upstream Contribution Intent
 
