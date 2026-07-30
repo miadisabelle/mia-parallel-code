@@ -6,8 +6,9 @@ steps:
       npm ci
       npm run build
       deb=$(ls release/*.deb)
+      token=$(buildkite-agent secret get PACKAGES_API_TOKEN)
       curl -sf -X POST "https://api.buildkite.com/v2/packages/organizations/miadisabelle/registries/miadi-apt/packages" \
-        -H "Authorization: Bearer ${PACKAGES_API_TOKEN}" \
+        -H "Authorization: Bearer ${token}" \
         -F "file=@${deb}"
     agents:
       queue: "linux-medium"
