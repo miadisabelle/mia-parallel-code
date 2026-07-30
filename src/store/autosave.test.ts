@@ -34,6 +34,29 @@ describe('autosave snapshot includes new-task-default fields', () => {
     expect('showSteps' in store).toBe(false);
   });
 
+  // A per-task skip-permissions flip must reach the debounced autosave, or the
+  // change is silently dropped on the next launch.
+  it('a task-level skipPermissions flip changes the snapshot', () => {
+    const taskId = 'autosave-skip-perms-task';
+    setStore('tasks', taskId, {
+      id: taskId,
+      name: 'T',
+      projectId: 'p',
+      agentIds: [],
+      shellAgentIds: [],
+      skipPermissions: false,
+    } as never);
+    setStore('taskOrder', (order) => [...order, taskId]);
+
+    const before = persistedSnapshot();
+    setStore('tasks', taskId, 'skipPermissions', true);
+    const after = persistedSnapshot();
+    expect(before).not.toBe(after);
+
+    setStore('taskOrder', (order) => order.filter((id) => id !== taskId));
+    setStore('tasks', taskId, undefined as never);
+  });
+
   it('autoResumeSessions changes the snapshot', () => {
     setStore('autoResumeSessions', false);
     const before = persistedSnapshot();

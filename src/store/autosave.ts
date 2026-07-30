@@ -64,6 +64,11 @@ export function persistedSnapshot(): string {
               externalWorktree: t.externalWorktree,
               savedInitialPrompt: t.savedInitialPrompt,
               collapsed: t.collapsed,
+              // Without these two the snapshot is blind to a skip-permissions
+              // flip on an existing task: the debounced autosave never fires
+              // and the change is lost on the next launch.
+              skipPermissions: t.skipPermissions,
+              propagateSkipPermissions: t.propagateSkipPermissions,
               coordinatedBy: t.coordinatedBy,
               coordinatorMode: t.coordinatorMode,
               mcpConfigPath: t.mcpConfigPath,

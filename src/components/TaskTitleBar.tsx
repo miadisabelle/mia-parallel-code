@@ -10,7 +10,9 @@ import {
   toggleTaskFocusMode,
   clearTaskLandingReview,
   getPrChecks,
+  setTaskSkipPermissions,
 } from '../store/store';
+import { resolveSkipPermissionsArgs } from '../../electron/ipc/agent-defaults';
 import { EditableText, type EditableTextHandle } from './EditableText';
 import { IconButton } from './IconButton';
 import { StatusDot } from './StatusDot';
@@ -98,6 +100,22 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
     }
     return displayTaskNameFromPrompt(initialPrompt) || props.task.name;
   };
+  // The badge is only meaningful for agents that have a skip-permissions flag;
+  // resolve by command too, so a task whose def was restored from an older
+  // profile (no skip_permissions_args) still gets the toggle.
+  const skipPermissionsAgent = () => {
+    const def = props.task.agentIds
+      .map((id) => store.agents[id]?.def)
+      .find((d) => d && resolveSkipPermissionsArgs(d).length > 0);
+    return def ?? null;
+  };
+  const skipPermissionsOn = () => props.task.skipPermissions === true;
+  const skipPermissionsTitle = () =>
+    skipPermissionsOn()
+      ? `Skip-permissions is ON — the agent launches with ${resolveSkipPermissionsArgs(
+          skipPermissionsAgent() ?? { command: '' },
+        ).join(' ')}.\nClick to turn it off. Applies on the agent's next start or restart.`
+      : "Skip-permissions is OFF — the agent asks before every tool call.\nClick to turn it on. Applies on the agent's next start or restart.";
   const ciChecks = () => {
     const c = getPrChecks(props.task.id);
     return c && c.overall !== 'none' ? c : null;
@@ -171,6 +189,21 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
         </Show>
         <Show when={props.task.externalWorktree}>
           <span style={badgeStyle(theme.accent)}>Imported</span>
+        </Show>
+        <Show when={skipPermissionsAgent()}>
+          <button
+            style={{
+              ...badgeStyle(skipPermissionsOn() ? theme.warning : theme.fgMuted),
+              cursor: 'pointer',
+            }}
+            title={skipPermissionsTitle()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setTaskSkipPermissions(props.task.id, !skipPermissionsOn());
+            }}
+          >
+            {skipPermissionsOn() ? 'skip confirms' : 'confirms on'}
+          </button>
         </Show>
         <Show when={props.task.needsReview}>
           <span

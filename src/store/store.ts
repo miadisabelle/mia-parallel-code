@@ -68,6 +68,7 @@ export {
   applyTaskMcpLaunchResult,
   markTaskMcpError,
   retryTaskMcpStartup,
+  setTaskSkipPermissions,
 } from './tasks';
 export {
   setActiveTask,

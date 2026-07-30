@@ -153,6 +153,7 @@ import {
   updateTaskBranch,
   createAgentRecord,
   selectActiveNeighborAfterRemoval,
+  setTaskSkipPermissions,
 } from './tasks';
 import { getCoordinatorChildren } from './sidebar-order';
 import { recordMergedLines, recordTaskMerged } from './completion';
@@ -1421,5 +1422,44 @@ describe('pasteDelayMs', () => {
   it('caps at 500ms for a very large prompt', () => {
     const text = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join('\n');
     expect(pasteDelayMs(text)).toBe(500);
+  });
+});
+
+// A task created before the "skip all confirms by default" setting existed —
+// or created with the box unticked — was frozen at skipPermissions: false with
+// no way back, so the setting appeared to do nothing on any existing task.
+describe('setTaskSkipPermissions', () => {
+  beforeEach(() => {
+    mockTasks['skip-perms-task'] = { agentIds: [], shellAgentIds: [], skipPermissions: false };
+  });
+
+  it('turns skip-permissions on for an existing task and persists it', () => {
+    setTaskSkipPermissions('skip-perms-task', true);
+    expect(mockTasks['skip-perms-task'].skipPermissions).toBe(true);
+    expect(mockSaveState).toHaveBeenCalledTimes(1);
+  });
+
+  it('turns it back off', () => {
+    mockTasks['skip-perms-task'].skipPermissions = true;
+    setTaskSkipPermissions('skip-perms-task', false);
+    expect(mockTasks['skip-perms-task'].skipPermissions).toBe(false);
+    expect(mockSaveState).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats an absent flag as off, so enabling it writes and persists', () => {
+    delete mockTasks['skip-perms-task'].skipPermissions;
+    setTaskSkipPermissions('skip-perms-task', true);
+    expect(mockTasks['skip-perms-task'].skipPermissions).toBe(true);
+    expect(mockSaveState).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not persist when the value is unchanged', () => {
+    setTaskSkipPermissions('skip-perms-task', false);
+    expect(mockSaveState).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op for an unknown task', () => {
+    expect(() => setTaskSkipPermissions('nonexistent', true)).not.toThrow();
+    expect(mockSaveState).not.toHaveBeenCalled();
   });
 });
