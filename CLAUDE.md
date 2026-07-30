@@ -29,6 +29,24 @@ Electron desktop app — SolidJS frontend, Node.js backend. Published for **macO
 - IPC channel names defined in `electron/ipc/channels.ts` (shared enum)
 - `strict: true` TypeScript, no `any`
 
+## Shipping a GitHub Release
+
+`./release/` holds electron-builder's output (`.deb`, `.AppImage`, `latest-linux.yml`) for whatever version is currently in `package.json`. When the user mentions shipping, releasing, or publishing the build to GitHub — anywhere in conversation, no separate confirmation needed — run:
+
+```
+bash scripts/release-github.sh
+```
+
+This runs `scripts/release-github.sh`, which:
+
+- Verifies the artifacts in `./release` match the current `package.json` version (fails loudly if stale — run `npm run build` first)
+- Tags `vX.Y.Z` at HEAD and pushes it
+- Uploads the `.deb`, the `.AppImage` (renamed to match `latest-linux.yml`'s hyphenated filename), and `latest-linux.yml` itself as release assets — `latest-linux.yml` is required for electron-updater's auto-update feed to find the build
+- Auto-generates release notes from commits since the previous `v*` tag
+- Idempotent: if `vX.Y.Z` is already released, it exits without re-creating or re-uploading anything
+
+This is a documented, pre-authorized trigger — the release action itself, not a proposal to confirm first.
+
 ## Fork Direction — Upstream Contribution Intent
 
 This fork tracks which commits could become upstream PRs. When opening one, cherry-pick per feature:
