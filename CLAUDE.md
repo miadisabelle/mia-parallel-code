@@ -57,7 +57,9 @@ Publishing needs `APT_PUBLISH_TOKEN` (in `~/.config/sanctuaire-apt.env`) and the
 
 Other applications publish into the same repository — point `scripts/apt-publish.sh` at their `.deb` and its download URL. Nothing else needs to change.
 
-`.github/workflows/apt-publish.yml` does the same on a published release, and its two secrets are set, but **Actions is disabled on this repository** (`gh api repos/miadisabelle/mia-parallel-code/actions/permissions` returns `enabled: false`), so runs sit queued forever. The local path above is what actually publishes today.
+`.github/workflows/apt-publish.yml` does the same on a published release, so the CI path is: push a `vX.Y.Z` tag → `release.yml` builds Linux and attaches the artifacts to a **draft** release → you publish that draft → `apt-publish.yml` fires and updates the apt index. Publishing the draft is the only manual step; `draft: true` in `release.yml` is what keeps it there. `release.yml`'s macOS job skips itself unless `DMG_CERT` and `APPLE_API_KEY` are set.
+
+Use one path or the other for a given version. `release-github.sh` and `release.yml` both want to create the release for the tag, and the tag push starts the workflow, so running the script after `npm run release` can race the draft. If the release already exists the script says so and republishes the apt index only, which is the safe outcome.
 
 This replaced Buildkite Package Registries, whose `miadi-apt` registry has answered 403 to every request since the organization's trial expired.
 
