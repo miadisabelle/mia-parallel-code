@@ -23,6 +23,26 @@ jobs:
           draft: true
           generate_release_notes: true
 
+  # Secrets are not available to a job-level `if`, so the presence of the Apple
+  # signing material is resolved here and consumed as an output. Without it the
+  # macOS job is skipped rather than failing on every tag.
+  check-signing:
+    runs-on: ubuntu-latest
+    outputs:
+      macos: ${{ steps.probe.outputs.macos }}
+    steps:
+      - id: probe
+        env:
+          DMG_CERT: ${{ secrets.DMG_CERT }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          if [ -n "$DMG_CERT" ] && [ -n "$APPLE_API_KEY" ]; then
+            echo "macos=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Apple signing secrets are not set; skipping the macOS build."
+          fi
+
   build-linux:
     needs: create-release
     runs-on: ubuntu-22.04
@@ -42,7 +62,8 @@ jobs:
         run: npm run build -- --publish always
 
   build-macos:
-    needs: create-release
+    needs: [create-release, check-signing]
+    if: needs.check-signing.outputs.macos == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
