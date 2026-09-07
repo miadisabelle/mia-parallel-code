@@ -112,6 +112,21 @@ export default [
     },
   },
 
+  // Cloudflare Worker source (scripts/apt-worker.js): runs on workerd, not Node
+  {
+    files: ['scripts/apt-worker.js'],
+    languageOptions: {
+      sourceType: 'module',
+      globals: {
+        URL: 'readonly',
+        Response: 'readonly',
+        Request: 'readonly',
+        Headers: 'readonly',
+        fetch: 'readonly',
+      },
+    },
+  },
+
   // Disable rules that conflict with Prettier (must be last)
   eslintConfigPrettier,
 ];

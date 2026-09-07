@@ -36,7 +36,10 @@ export default {
     }
 
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-      return new Response('method not allowed\n', { status: 405, headers: { allow: 'GET, HEAD, PUT' } });
+      return new Response('method not allowed\n', {
+        status: 405,
+        headers: { allow: 'GET, HEAD, PUT' },
+      });
     }
 
     if (!key) return new Response('Sanctuaire Agentique apt repository\n');
