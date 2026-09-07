@@ -33,8 +33,22 @@ if [[ "$yml_version" != "$version" ]]; then
   exit 1
 fi
 
+
+# The apt repository at apt.sanctuaireagentique.com indexes the release asset
+# rather than a copy, so this runs after the release exists — including on a
+# re-run, which is how a publish that was missed earlier gets picked up.
+publish_to_apt() {
+  if [[ -z "${APT_PUBLISH_TOKEN:-}" && ! -f "$HOME/.config/sanctuaire-apt.env" ]]; then
+    echo "Skipping apt publish: no APT_PUBLISH_TOKEN (see scripts/apt-publish.sh)." >&2
+    return 0
+  fi
+  bash scripts/apt-publish.sh "$deb" \
+    "https://github.com/${repo_slug}/releases/download/${tag}/$(basename "$deb")"
+}
+
 if gh release view "$tag" --repo "$repo_slug" >/dev/null 2>&1; then
   echo "Release $tag already exists: https://github.com/${repo_slug}/releases/tag/${tag}"
+  publish_to_apt
   exit 0
 fi
 
@@ -66,5 +80,7 @@ gh release create "$tag" \
   "$appimage_asset" \
   "$deb" \
   "$yml"
+
+publish_to_apt
 
 echo "Shipped: https://github.com/${repo_slug}/releases/tag/${tag}"

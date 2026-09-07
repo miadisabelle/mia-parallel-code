@@ -51,7 +51,15 @@ It:
 
 This is a documented, pre-authorized trigger — the release action itself, not a proposal to confirm first.
 
-**Buildkite (`.buildkite/pipeline.yml`)** fires automatically on _any_ `vX.Y.Z` tag reaching GitHub — regardless of whether the tag came from `npm run release` or from `scripts/release-github.sh` above. It builds independently on Buildkite's own hosted agent (not from `./release/` on this machine) and publishes the resulting `.deb` to the `miadi-apt` Buildkite Package Registry, so `apt install parallel-code` stays current. This is separate infrastructure from GitHub Releases: no local build required, no trigger phrase needed, nothing to run by hand — pushing the tag is the whole trigger. Publish token lives in Buildkite's cluster Secrets (`PACKAGES_API_TOKEN`), never in this repo.
+**apt repository** — `https://apt.sanctuaireagentique.com`, a Cloudflare Worker (`apt-sanctuaire`) in front of the R2 bucket `apt`, signed with our own key. `scripts/release-github.sh` calls `scripts/apt-publish.sh` at the end, so shipping a GitHub Release updates `apt install parallel-code` in the same command — re-running the script after a release already exists republishes the apt index alone. Only the indices live in R2: the pool redirects to the release asset on GitHub, so no large file is copied.
+
+Publishing needs `APT_PUBLISH_TOKEN` (in `~/.config/sanctuaire-apt.env`) and the signing key `43AEC70665D2B71FC9B53C7DB936F575CFCBE635` in the local gpg keyring. On a machine without them the step is skipped with a message and the GitHub Release still ships.
+
+Other applications publish into the same repository — point `scripts/apt-publish.sh` at their `.deb` and its download URL. Nothing else needs to change.
+
+`.github/workflows/apt-publish.yml` does the same on a published release, and its two secrets are set, but **Actions is disabled on this repository** (`gh api repos/miadisabelle/mia-parallel-code/actions/permissions` returns `enabled: false`), so runs sit queued forever. The local path above is what actually publishes today.
+
+This replaced Buildkite Package Registries, whose `miadi-apt` registry has answered 403 to every request since the organization's trial expired.
 
 ## Fork Direction — Upstream Contribution Intent
 
