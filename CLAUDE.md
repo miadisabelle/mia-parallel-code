@@ -44,7 +44,7 @@ bash scripts/release-github.sh
 It:
 
 - Verifies the artifacts in `./release` match the current `package.json` version (fails loudly if stale — run `npm run build` first)
-- Tags `vX.Y.Z` at HEAD and pushes it (if the tag doesn't already exist — this is the tag push that also triggers Buildkite, below)
+- Tags `vX.Y.Z` at HEAD and pushes it (if the tag doesn't already exist)
 - Uploads the `.deb`, the `.AppImage` (renamed to match `latest-linux.yml`'s hyphenated filename), and `latest-linux.yml` itself as release assets — `latest-linux.yml` is required for electron-updater's auto-update feed to find the build
 - Auto-generates release notes from commits since the previous `v*` tag
 - Idempotent: if `vX.Y.Z` is already released, it exits without re-creating or re-uploading anything
