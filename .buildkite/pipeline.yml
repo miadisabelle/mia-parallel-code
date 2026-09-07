@@ -1,5 +1,5 @@
 steps:
-  - label: ":debian: Publish .deb to miadi-apt"
+  - label: ':debian: Publish .deb to miadi-apt'
     if: build.tag != null
     command: |
       apt-get update -qq && apt-get install -y -qq python3 make g++ fakeroot >/dev/null
@@ -11,4 +11,4 @@ steps:
         -H "Authorization: Bearer ${token}" \
         -F "file=@${deb}"
     agents:
-      queue: "linux-medium"
+      queue: 'linux-medium'

@@ -1,10 +1,19 @@
-import { createSignal } from 'solid-js';
+import { createSignal, untrack } from 'solid-js';
 import { invoke } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
 import { store, setStore } from './core';
 import type { WorktreeStatus } from '../ipc/types';
 import type { TaskGitStatusSnapshot } from './types';
-import { warn as logWarn, errMessage } from '../lib/log';
+import {
+  detectBranchDivergence,
+  divergenceKey,
+  trackDivergence,
+  type BranchDivergence,
+  type DivergenceObservation,
+} from '../lib/branch-divergence';
+import { warn as logWarn, info as logInfo, errMessage } from '../lib/log';
+import { adoptTaskBranch } from './task-branch';
+import { clearAgentHookStatus, getAgentHookStatus } from './agentHookStatus';
 import {
   chunkContainsAgentPrompt,
   PROMPT_PATTERNS,
@@ -446,14 +455,65 @@ export function isAgentBracketedPasteEnabled(agentId: string): boolean {
   return agentStates.get(agentId)?.bracketedPasteEnabled === true;
 }
 
+// When each agent's current question first appeared (epoch ms). Cleared as soon
+// as the question goes away, so an entry only ever describes the open question.
+const questionSinceByAgent = new Map<string, number>();
+
 function updateQuestionState(agentId: string, hasQuestion: boolean): void {
-  setQuestionAgents((prev) => {
-    if (hasQuestion === prev.has(agentId)) return prev;
-    const next = new Set(prev);
-    if (hasQuestion) next.add(agentId);
-    else next.delete(agentId);
-    return next;
-  });
+  const asking = untrack(questionAgents);
+  if (hasQuestion === asking.has(agentId)) return;
+
+  const next = new Set(asking);
+  if (hasQuestion) {
+    next.add(agentId);
+    questionSinceByAgent.set(agentId, Date.now());
+  } else {
+    next.delete(agentId);
+    questionSinceByAgent.delete(agentId);
+  }
+  setQuestionAgents(next);
+}
+
+export interface TaskOpenQuestion {
+  /** The agent whose terminal is showing the question. */
+  agentId: string;
+  /** When the question appeared (epoch ms). */
+  since: number;
+}
+
+/** This task's newest open question — who is asking and since when — or null
+ *  when nothing in the task is asking.
+ *
+ *  Deliberately independent of `getTaskAttentionState`: that function reports a
+ *  single prioritized status, so an exited-non-zero agent (`error`) or a review
+ *  flag hides a question another agent is still blocked on. The sidebar tray
+ *  reads this instead. The desktop-notification watcher and `remoteStatusSync`
+ *  still classify `needs_input` from the attention state and so inherit that
+ *  masking — knowingly unconverted, since changing when a notification fires is
+ *  a product decision, not a mechanical follow-through. */
+export function getTaskOpenQuestion(taskId: string): TaskOpenQuestion | null {
+  const asking = questionAgents(); // reactive read
+  const task = store.tasks[taskId];
+  if (!task) return null;
+
+  let newest: TaskOpenQuestion | null = null;
+  const runningAgentIds = task.agentIds.filter((id) => store.agents[id]?.status === 'running');
+  for (const agentId of [...runningAgentIds, ...task.shellAgentIds]) {
+    const since = agentQuestionSince(agentId, asking);
+    if (since === undefined) continue;
+    if (newest === null || since > newest.since) newest = { agentId, since };
+  }
+  return newest;
+}
+
+function agentQuestionSince(agentId: string, asking: ReadonlySet<string>): number | undefined {
+  const hook = getAgentHookStatus(agentId);
+  if (hook?.state === 'waiting') return hook.since;
+  if (hook?.state === 'working' || !asking.has(agentId)) return undefined;
+  // The asking set and the onset map are separate structures kept in step by
+  // `updateQuestionState`, their sole writer. This is the one place they meet,
+  // so it is the one place that has to tolerate them drifting apart.
+  return questionSinceByAgent.get(agentId);
 }
 
 // --- Agent activity tracking ---
@@ -560,6 +620,8 @@ export function markAgentSpawned(agentId: string): void {
   state.lastAnalysisAt = undefined;
   cancelPendingAnalysis(state);
   state.lastDataAt = Date.now();
+  // A fresh process has no turn yet; a leftover hook state would lie about it.
+  clearAgentHookStatus(agentId);
   addToActive(agentId);
   resetIdleTimer(agentId);
 }
@@ -801,6 +863,7 @@ export function clearAgentActivity(agentId: string): void {
   agentReadyCallbacks.delete(agentId);
   removeFromActive(agentId);
   updateQuestionState(agentId, false);
+  clearAgentHookStatus(agentId);
 }
 
 // --- Derived status ---
@@ -820,6 +883,23 @@ function hasTaskAgentError(taskId: string): boolean {
     if (agent?.status !== 'exited') return false;
     return agent.exitCode !== 0 || agent.signal !== null;
   });
+}
+
+/** Hook state wins when present: a self-reported turn in flight is not a question,
+ *  however much the screen looks like one. Only once the turn has ended do the
+ *  heuristics get a say — login and trust prompts arrive with no hook at all. */
+function isAgentBlockedOnInput(agentId: string): boolean {
+  const hook = getAgentHookStatus(agentId);
+  if (hook?.state === 'waiting') return true;
+  if (hook?.state === 'working') return false;
+  return isAgentAskingQuestion(agentId);
+}
+
+/** Same precedence for activity: output still streaming after `Stop` is the
+ *  agent redrawing its prompt, not work, and must not hold the task busy. */
+function isAgentWorking(agentId: string, active: ReadonlySet<string>): boolean {
+  const hook = getAgentHookStatus(agentId);
+  return hook ? hook.state === 'working' : active.has(agentId);
 }
 
 function hasRunningTaskActivity(taskId: string, predicate: (id: string) => boolean): boolean {
@@ -842,7 +922,7 @@ export function getTaskAttentionState(taskId: string): TaskAttentionState {
 
   if (task.needsReview) return 'review';
 
-  const hasQuestion = hasRunningTaskActivity(taskId, isAgentAskingQuestion);
+  const hasQuestion = hasRunningTaskActivity(taskId, isAgentBlockedOnInput);
   if (hasQuestion) return 'needs_input';
 
   const steps = task.stepsContent;
@@ -852,7 +932,7 @@ export function getTaskAttentionState(taskId: string): TaskAttentionState {
   }
 
   const active = activeAgents(); // reactive read
-  const hasActive = hasRunningTaskActivity(taskId, (id) => active.has(id));
+  const hasActive = hasRunningTaskActivity(taskId, (id) => isAgentWorking(id, active));
   if (hasActive) return 'active';
 
   if (isTaskReady(taskId)) return 'ready';
@@ -880,7 +960,7 @@ export function getTaskDotStatus(taskId: string): TaskDotStatus {
   }
 
   const active = activeAgents(); // reactive read
-  const hasActive = hasRunningTaskActivity(taskId, (id) => active.has(id));
+  const hasActive = hasRunningTaskActivity(taskId, (id) => isAgentWorking(id, active));
   if (hasActive) return 'busy';
 
   if (task.needsReview) return 'review';
@@ -937,9 +1017,52 @@ function scheduleGitStatusStaleTimer(taskId: string, refreshedAt: number): void 
   gitStatusStaleTimers.set(taskId, timer);
 }
 
+// Per-task divergence sightings for the two-snapshot debounce. Not reactive on
+// purpose: entries only change together with a store.taskGitStatus write, so
+// getBranchDivergence stays reactive through the snapshot it reads.
+const divergenceObservations = new Map<string, DivergenceObservation | null>();
+
+/**
+ * Confirmed divergence between the branch a task tracks and the branch the
+ * agent actually put its worktree on. Null until the same divergence has
+ * survived two consecutive git-status snapshots (agents switch branches
+ * transiently mid-rebase).
+ */
+export function getBranchDivergence(taskId: string): BranchDivergence | null {
+  const task = store.tasks[taskId];
+  const snapshot = store.taskGitStatus[taskId];
+  if (!task || !snapshot) return null;
+  const divergence = detectBranchDivergence(task, snapshot);
+  if (!divergence) return null;
+  const obs = divergenceObservations.get(taskId);
+  return obs && obs.key === divergenceKey(divergence) && snapshot.refreshedAt > obs.firstSeenAt
+    ? divergence
+    : null;
+}
+
 export function clearTaskGitStatusTracking(taskId: string): void {
   clearGitStatusStaleTimer(taskId);
   gitRefreshVersions.delete(taskId);
+  divergenceObservations.delete(taskId);
+}
+
+/** Auto-adopt a confirmed divergent branch as the task branch. Runs after
+ *  every successful snapshot write; the two-snapshot debounce inside
+ *  getBranchDivergence keeps transient checkouts (rebases, bisects) from
+ *  adopting. The banner on the task explains what happened and offers undo;
+ *  an undone (dismissed) branch is never re-adopted. */
+function maybeAdoptDivergentBranch(taskId: string): void {
+  const divergence = getBranchDivergence(taskId);
+  if (divergence?.kind !== 'switched' || !divergence.adoptable) return;
+  const task = store.tasks[taskId];
+  // Don't touch branch identity mid-close: cleanup deletes by branch name.
+  if (!task || task.closingStatus) return;
+  logInfo('taskStatus', 'Auto-adopting branch the agent switched the worktree to', {
+    taskId,
+    from: task.branchName,
+    to: divergence.branch,
+  });
+  adoptTaskBranch(taskId, divergence.branch);
 }
 
 async function refreshTaskGitStatus(
@@ -962,6 +1085,7 @@ async function refreshTaskGitStatus(
             has_committed_changes: false,
             has_uncommitted_changes: false,
             current_branch: null,
+            base_branch: null,
             refreshedAt: 0,
             refreshing: true,
           },
@@ -978,9 +1102,30 @@ async function refreshTaskGitStatus(
     const next: TaskGitStatusSnapshot = {
       ...status,
       refreshedAt,
+      // Solid's setStore MERGES objects at a path instead of replacing them,
+      // so flags from earlier snapshots survive any write that omits them. A
+      // single failed refresh (error), 5-minute polling gap (stale), or
+      // invalidateExisting pass (refreshing) would otherwise poison the
+      // snapshot for the rest of the session, permanently suppressing branch
+      // divergence detection and the ready status. `error: undefined` deletes
+      // the key on merge.
+      refreshing: false,
+      stale: false,
+      error: undefined,
     };
+    // Update the divergence debounce before the snapshot write so consumers
+    // reacting to the write read a consistent observation.
+    divergenceObservations.set(
+      taskId,
+      trackDivergence(
+        divergenceObservations.get(taskId) ?? null,
+        detectBranchDivergence(task, next),
+        refreshedAt,
+      ),
+    );
     setStore('taskGitStatus', taskId, next);
     scheduleGitStatusStaleTimer(taskId, refreshedAt);
+    maybeAdoptDivergentBranch(taskId);
   } catch (err) {
     if (!store.tasks[taskId] || !isCurrentGitRefresh(taskId, version)) return;
     clearGitStatusStaleTimer(taskId);
@@ -998,6 +1143,7 @@ async function refreshTaskGitStatus(
             has_committed_changes: false,
             has_uncommitted_changes: false,
             current_branch: null,
+            base_branch: null,
             refreshedAt: 0,
             refreshing: false,
             error: errMessage(err),

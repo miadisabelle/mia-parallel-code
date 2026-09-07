@@ -16,10 +16,16 @@ module.exports = {
         //     both processes must resolve an agent's flags identically, and the renderer decides
         //     launch args synchronously (no IPC round-trip available at spawn time)
         //   - electron/mcp/prompt-detect.ts — regex-only prompt detector reused by the renderer task-status pipeline
+        //   - electron/mcp/validation.ts — string-only branch/UUID validators; the renderer
+        //     shares them so it never offers a branch the IPC layer would reject
+        //   - electron/shared/ — renderer-safe constants/pure helpers (no Node/Electron imports)
         pathNot: [
           '^electron/ipc/channels\\.ts',
           '^electron/ipc/agent-defaults\\.ts',
           '^electron/mcp/prompt-detect\\.ts',
+          '^electron/mcp/validation\\.ts',
+          '^electron/agent-hooks/status\\.ts',
+          '^electron/shared/',
         ],
       },
     },

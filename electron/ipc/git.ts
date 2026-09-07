@@ -4,10 +4,31 @@ import fs from 'fs';
 import path from 'path';
 import type { BrowserWindow } from 'electron';
 import { debug as logDebug } from '../log.js';
-import { appendGitInfoExcludeBlockAtPath, resolveGitInfoExcludePath } from './git-exclude.js';
-import type { ChangedFile, CommitInfo, FileDiffResult } from './shared-types.js';
+import {
+  appendGitInfoExcludeBlock,
+  appendGitInfoExcludeBlockAtPath,
+  normalizeExcludeLine,
+  resolveGitInfoExcludePath,
+} from './git-exclude.js';
+import {
+  findForeignOwnedEntries,
+  foreignOwnedRemovalError,
+  reclaimOwnership,
+} from './worktree-cleanup.js';
+import {
+  ensureNodeModulesEntryLinks,
+  isManagedNodeModules,
+  realpathOrNull,
+} from './worktree-node-modules.js';
+import type {
+  ChangedFile,
+  CommitInfo,
+  FileDiffResult,
+  GitIgnoredEntry,
+  WorktreeStatus,
+} from './shared-types.js';
 
-export type { ChangedFile, CommitInfo, FileDiffResult } from './shared-types.js';
+export type { ChangedFile, CommitInfo, FileDiffResult, GitIgnoredEntry } from './shared-types.js';
 
 const _exec = promisify(execFile);
 
@@ -122,6 +143,7 @@ const SYMLINK_CANDIDATES = [
   '.env',
   'node_modules',
 ];
+const DEFAULT_SYMLINK_CANDIDATES = new Set(SYMLINK_CANDIDATES);
 
 /**
  * Entries inside `.claude/` that must NOT be seeded from the main repo's
@@ -155,8 +177,16 @@ const SANDBOX_EXCLUDE_PATTERNS = [
   '/.zprofile',
   '/.zshrc',
 ];
+const INTERNAL_SYMLINK_EXCLUSIONS = new Set([
+  '.claude',
+  '.worktrees',
+  ...SANDBOX_EXCLUDE_PATTERNS.map((pattern) => pattern.slice(1)),
+]);
 const SANDBOX_EXCLUDE_HEADER = '# parallel-code: sandbox bind-mount artifacts';
 const seededSandboxExcludes = new Set<string>();
+
+const WORKTREE_CONTAINER_EXCLUDE_HEADER = '# parallel-code: task worktree container';
+const WORKTREE_CONTAINER_EXCLUDE = '/.worktrees/';
 
 /**
  * Header written once per repo when symlink excludes are first added. Each
@@ -164,6 +194,53 @@ const seededSandboxExcludes = new Set<string>();
  * added in later worktrees are also covered.
  */
 const SYMLINK_EXCLUDE_HEADER = '# parallel-code: worktree symlinks';
+
+/**
+ * Single name-validation rule shared by the symlink producer
+ * (`getSymlinkCandidates`) and consumer (`createWorktree`) — anything the
+ * dialog can offer must be creatable, and anything creatable must pass here.
+ * `..` is only rejected as a full name: as a substring (`foo..bar`) it is a
+ * legal filename, not a traversal.
+ */
+export function isValidSymlinkName(name: string): boolean {
+  if (name.length === 0 || name === '.' || name === '..') return false;
+  if (name.includes('/') || name.includes('\\')) return false;
+  // CR/LF would inject arbitrary rules when written to .git/info/exclude.
+  if (name.includes('\n') || name.includes('\r')) return false;
+  return true;
+}
+
+/** Escape a filename so it matches literally as a gitignore pattern. */
+function escapeGitignoreLiteral(name: string): string {
+  const escaped = name.replace(/[\\*?[\]]/g, '\\$&');
+  const anchored = escaped.startsWith('!') || escaped.startsWith('#') ? `\\${escaped}` : escaped;
+  // Gitignore strips unescaped trailing spaces — escape each so a name like
+  // `foo ` matches itself instead of `foo`.
+  return anchored.replace(/ +$/, (spaces) => '\\ '.repeat(spaces.length));
+}
+
+/** Whether the repo treats paths case-insensitively (macOS default). */
+async function getCoreIgnoreCase(repoRoot: string): Promise<boolean> {
+  try {
+    // --bool normalizes yes/on/1 and case variants to true/false; an invalid
+    // value exits non-zero and lands in the catch below.
+    const { stdout } = await exec('git', ['config', '--bool', '--get', 'core.ignorecase'], {
+      cwd: repoRoot,
+    });
+    return stdout.trim() === 'true';
+  } catch {
+    return false;
+  }
+}
+
+/** Reserved/default names are all-lowercase; fold the candidate when the fs is case-insensitive. */
+function isReservedSymlinkName(name: string, ignoreCase: boolean): boolean {
+  return INTERNAL_SYMLINK_EXCLUSIONS.has(ignoreCase ? name.toLowerCase() : name);
+}
+
+function isDefaultSymlinkCandidate(name: string, ignoreCase: boolean): boolean {
+  return DEFAULT_SYMLINK_CANDIDATES.has(ignoreCase ? name.toLowerCase() : name);
+}
 
 // --- Internal helpers ---
 
@@ -533,50 +610,65 @@ async function detectRepoLockKey(p: string): Promise<string> {
 function normalizeStatusPath(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return '';
-  // Handle rename/copy "old -> new"
-  const destination = trimmed.split(' -> ').pop()?.trim() ?? trimmed;
-  return destination.replace(/^"|"$/g, '').replace(/\\(.)/g, '$1');
+  return trimmed.replace(/^"|"$/g, '').replace(/\\(.)/g, '$1');
 }
 
-/** Parse combined `git diff --raw --numstat` output into status and numstat maps. */
+/** Parse combined `git diff --raw --numstat -z` output into status and numstat maps. */
 function parseDiffRawNumstat(output: string): {
   statusMap: Map<string, string>;
   numstatMap: Map<string, [number, number]>;
+  previousPathMap: Map<string, string>;
 } {
   const statusMap = new Map<string, string>();
   const numstatMap = new Map<string, [number, number]>();
+  const previousPathMap = new Map<string, string>();
 
-  for (const line of output.split('\n')) {
-    if (line.startsWith(':')) {
-      // --raw format: ":old_mode new_mode old_hash new_hash status\tpath"
-      const parts = line.split('\t');
-      if (parts.length >= 2) {
-        const statusLetter = parts[0].split(/\s+/).pop()?.charAt(0) ?? 'M';
-        const rawPath = parts[parts.length - 1];
-        const p = normalizeStatusPath(rawPath);
-        if (p) statusMap.set(p, statusLetter);
+  const fields = output.split('\0');
+  for (let index = 0; index < fields.length; index++) {
+    const field = fields[index];
+    if (!field) continue;
+
+    if (field.startsWith(':')) {
+      const statusLetter = field.split(/\s+/).pop()?.charAt(0) ?? 'M';
+      const firstPath = fields[++index] ?? '';
+      if (statusLetter === 'R' || statusLetter === 'C') {
+        const destinationPath = fields[++index] ?? '';
+        if (destinationPath) {
+          statusMap.set(destinationPath, statusLetter);
+          if (firstPath) previousPathMap.set(destinationPath, firstPath);
+        }
+      } else if (firstPath) {
+        statusMap.set(firstPath, statusLetter);
       }
       continue;
     }
-    // --numstat format: "added\tremoved\tpath"
-    const parts = line.split('\t');
-    if (parts.length >= 3) {
-      const added = parseInt(parts[0], 10);
-      const removed = parseInt(parts[1], 10);
-      if (!isNaN(added) && !isNaN(removed)) {
-        const rawPath = parts[parts.length - 1];
-        const p = normalizeStatusPath(rawPath);
-        if (p) numstatMap.set(p, [added, removed]);
+
+    const firstTab = field.indexOf('\t');
+    const secondTab = firstTab < 0 ? -1 : field.indexOf('\t', firstTab + 1);
+    if (secondTab < 0) continue;
+
+    const added = Number.parseInt(field.slice(0, firstTab), 10);
+    const removed = Number.parseInt(field.slice(firstTab + 1, secondTab), 10);
+    if (!Number.isFinite(added) || !Number.isFinite(removed)) continue;
+
+    let destinationPath = field.slice(secondTab + 1);
+    if (!destinationPath) {
+      const previousPath = fields[++index] ?? '';
+      destinationPath = fields[++index] ?? '';
+      if (destinationPath && previousPath && !previousPathMap.has(destinationPath)) {
+        previousPathMap.set(destinationPath, previousPath);
       }
     }
+    if (destinationPath) numstatMap.set(destinationPath, [added, removed]);
   }
 
-  return { statusMap, numstatMap };
+  return { statusMap, numstatMap, previousPathMap };
 }
 
 export function changedFilesFromMaps(opts: {
   statusMap: Map<string, string>;
   numstatMap: Map<string, [number, number]>;
+  previousPathMap?: Map<string, string>;
   committed: boolean | ((filePath: string) => boolean);
   sort?: boolean;
 }): ChangedFile[] {
@@ -589,6 +681,7 @@ export function changedFilesFromMaps(opts: {
     seen.add(p);
     files.push({
       path: p,
+      previous_path: opts.previousPathMap?.get(p),
       lines_added: added,
       lines_removed: removed,
       status: opts.statusMap.get(p) ?? 'M',
@@ -600,6 +693,7 @@ export function changedFilesFromMaps(opts: {
     if (seen.has(p)) continue;
     files.push({
       path: p,
+      previous_path: opts.previousPathMap?.get(p),
       lines_added: 0,
       lines_removed: 0,
       status,
@@ -665,6 +759,7 @@ function safeRealpath(p: string): string {
 
 interface ListedWorktree {
   path: string;
+  head: string | null;
   branchName: string | null;
   detached: boolean;
 }
@@ -685,6 +780,7 @@ function parseWorktreeList(output: string): ListedWorktree[] {
       if (current?.path) entries.push(current);
       current = {
         path: line.slice('worktree '.length).trim(),
+        head: null,
         branchName: null,
         detached: false,
       };
@@ -692,6 +788,10 @@ function parseWorktreeList(output: string): ListedWorktree[] {
     }
 
     if (!current) continue;
+    if (line.startsWith('HEAD ')) {
+      current.head = line.slice('HEAD '.length).trim() || null;
+      continue;
+    }
     if (line.startsWith('branch ')) {
       const ref = line.slice('branch '.length).trim();
       const prefix = 'refs/heads/';
@@ -728,6 +828,60 @@ async function computeBranchDiffStats(
   return { linesAdded, linesRemoved };
 }
 
+/**
+ * Remove a worktree directory, trying progressively harder:
+ * `git worktree remove` → direct removal (retried, because Docker Desktop's
+ * VirtioFS bind-mount may still be releasing after the container exits) →
+ * ownership reclaim for files a root container left behind.
+ *
+ * Throws with an actionable message when the leftovers need `sudo` to clear.
+ */
+async function forceRemoveWorktreeDir(repoRoot: string, worktreePath: string): Promise<void> {
+  try {
+    await exec('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot });
+    return;
+  } catch {
+    // Fall through to direct removal.
+  }
+
+  const rmError = await removeDirWithRetries(worktreePath);
+  if (!rmError) return;
+
+  const uid = process.getuid?.() ?? -1;
+  const gid = process.getgid?.() ?? -1;
+  const foreign = findForeignOwnedEntries(worktreePath, uid);
+  if (foreign.length === 0) throw rmError;
+
+  const reclaimFailure = await reclaimOwnership(worktreePath, uid, gid);
+  if (!reclaimFailure) {
+    const retryError = await removeDirWithRetries(worktreePath);
+    if (!retryError) return;
+  }
+  // Either the reclaim could not run, or it ran without freeing the files
+  // (macOS bind mounts can drop the chown). Both need the same manual step.
+  throw foreignOwnedRemovalError(
+    worktreePath,
+    foreign,
+    reclaimFailure ?? 'ownership reclaim did not release the files',
+  );
+}
+
+/** Delete a directory tree, retrying with backoff. Returns the last error, or undefined on success. */
+async function removeDirWithRetries(dirPath: string): Promise<unknown> {
+  const delays = [0, 500, 1500, 3000];
+  let lastErr: unknown;
+  for (const delay of delays) {
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    try {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+      return undefined;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  return lastErr;
+}
+
 // --- Public functions (used by tasks.ts and register.ts) ---
 
 export async function createWorktree(
@@ -742,11 +896,7 @@ export async function createWorktree(
   if (forceClean) {
     // Clean up stale worktree/branch from a previous session that wasn't properly removed
     if (fs.existsSync(worktreePath)) {
-      try {
-        await exec('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot });
-      } catch {
-        fs.rmSync(worktreePath, { recursive: true, force: true });
-      }
+      await forceRemoveWorktreeDir(repoRoot, worktreePath);
       await exec('git', ['worktree', 'prune'], { cwd: repoRoot }).catch((e) =>
         console.warn('git worktree prune failed:', e),
       );
@@ -789,24 +939,40 @@ export async function createWorktree(
     );
   }
 
+  // Before `worktree add`: a `git status` racing creation must never see it.
+  ensureWorktreeContainerExclude(repoRoot);
+
   const worktreeArgs = ['worktree', 'add', '-b', branchName, worktreePath];
   if (baseBranch) worktreeArgs.push(baseBranch);
   await exec('git', worktreeArgs, { cwd: repoRoot });
 
-  // Symlink selected directories. `.claude` is handled separately below — it
-  // can't be a symlink because Claude Code's bwrap sandbox binds specific
-  // entries inside it, and bwrap refuses to bind-mount at symlink paths.
+  // Symlink selected directories. Reserved names (`.claude`, the `.worktrees`
+  // container, sandbox bind-mount artifacts) are rejected here as a defensive
+  // backstop — the backend does not trust the UI's candidate list. `.claude`
+  // in particular can never be a symlink: Claude Code's bwrap sandbox binds
+  // specific entries inside it and refuses to bind-mount at symlink paths.
+  // Comparisons fold case when the repo's core.ignorecase says the filesystem
+  // is case-insensitive, so `.WORKTREES`/`.CLAUDE` variants can't slip through.
+  const ignoreCase = await getCoreIgnoreCase(repoRoot);
   const createdSymlinks: string[] = [];
   for (const name of symlinkDirs) {
-    if (name === '.claude') continue;
-    // Reject names that could escape the worktree directory
-    if (name.includes('/') || name.includes('\\') || name.includes('..') || name === '.') continue;
+    // Reject names that could escape the worktree directory or inject rules
+    // into .git/info/exclude
+    if (!isValidSymlinkName(name)) continue;
+    if (isReservedSymlinkName(name, ignoreCase)) continue;
     const source = path.join(repoRoot, name);
     const target = path.join(worktreePath, name);
     try {
       if (!fs.existsSync(source)) continue;
       if (fs.existsSync(target)) continue;
-      fs.symlinkSync(source, target);
+      if (name === 'node_modules') {
+        // Not a whole-dir symlink: per-entry links, so root-level cache writes
+        // (vite's `.vite-temp`/`.vite`, `.cache`) land inside the worktree —
+        // the only path agent sandboxes allow writes to.
+        if (!ensureNodeModulesEntryLinks(source, target)) continue;
+      } else {
+        fs.symlinkSync(source, target);
+      }
       createdSymlinks.push(name);
     } catch (err) {
       console.warn(`Failed to symlink directory '${name}' into worktree:`, err);
@@ -833,7 +999,7 @@ export async function createWorktree(
  * from the previous shallow-symlink behavior and seeds any newly-missing
  * entries from the source.
  */
-export function ensureClaudeSandboxFiles(worktreePath: string, repoRoot?: string): void {
+export function ensureClaudeSandboxFiles(worktreePath: string, repoRoot?: string | null): void {
   const claudeDir = path.join(worktreePath, '.claude');
   try {
     fs.mkdirSync(claudeDir, { recursive: true });
@@ -862,7 +1028,7 @@ export function ensureClaudeSandboxFiles(worktreePath: string, repoRoot?: string
 
   // Seed missing entries from the main repo's .claude/. Dereferences any
   // symlinks in the source so the copy is pure real files (bwrap-safe).
-  const root = repoRoot ?? detectRepoRoot(worktreePath);
+  const root = repoRoot === undefined ? detectRepoRoot(worktreePath) : repoRoot;
   if (root && root !== worktreePath) {
     const source = path.join(root, '.claude');
     if (fs.existsSync(source)) {
@@ -902,6 +1068,25 @@ export function ensureClaudeSandboxFiles(worktreePath: string, repoRoot?: string
 }
 
 /**
+ * Keep the worktree container out of the project's `git status`. `.worktrees/`
+ * sits inside the repo's own working tree, so in a project whose `.gitignore`
+ * doesn't list it every task leaves the root dirty — and merging then fails on
+ * the clean-tree guard with "Working tree has uncommitted changes". Writing to
+ * `.git/info/exclude` leaves a tracked `.gitignore` alone; the leading `/`
+ * keeps a nested `foo/.worktrees/` visible. Also runs as a backfill on agent
+ * spawn, for worktrees created before this rule existed. `pathInRepo` may be
+ * the repo root or any worktree — both resolve to the shared exclude file.
+ */
+export function ensureWorktreeContainerExclude(pathInRepo: string): void {
+  appendGitInfoExcludeBlock(
+    pathInRepo,
+    WORKTREE_CONTAINER_EXCLUDE,
+    `${WORKTREE_CONTAINER_EXCLUDE_HEADER}\n${WORKTREE_CONTAINER_EXCLUDE}\n`,
+    (err) => console.warn(`Failed to git-exclude ${WORKTREE_CONTAINER_EXCLUDE}:`, err),
+  );
+}
+
+/**
  * Append `SANDBOX_EXCLUDE_PATTERNS` to the shared `.git/info/exclude` so the
  * bwrap-left char-device placeholders at the worktree root are filtered out
  * of `git status` / `git ls-files` regardless of what the branch's committed
@@ -930,7 +1115,14 @@ export function ensureSandboxExcludes(worktreePath: string): void {
  * duplicating already-present entries.
  */
 export function ensureSymlinkExcludes(worktreePath: string, symlinkNames: string[]): void {
-  if (symlinkNames.length === 0) return;
+  // Names containing CR/LF would inject arbitrary ignore rules — refuse them
+  // outright rather than writing a corrupted exclude file.
+  const validNames = symlinkNames.filter((name) => {
+    if (isValidSymlinkName(name)) return true;
+    console.warn(`Refusing to exclude invalid symlink name: ${JSON.stringify(name)}`);
+    return false;
+  });
+  if (validNames.length === 0) return;
 
   const excludePath = resolveGitInfoExcludePath(worktreePath);
   if (!excludePath) return;
@@ -947,9 +1139,15 @@ export function ensureSymlinkExcludes(worktreePath: string, symlinkNames: string
 
   // Root-anchored, no trailing slash — matches the symlink file itself, not
   // just directories, so `node_modules/` gitignore entries can't sneak through.
-  const toAdd = symlinkNames
-    .map((name) => `/${name}`)
-    .filter((pattern) => !existing.includes(pattern));
+  // Names are escaped to gitignore literals so `*`/`?` in a filename can't act
+  // as wildcards against unrelated files. Dedup compares Git-normalized lines
+  // (CRLF and unescaped trailing ASCII spaces stripped) — exact match would
+  // rewrite a hand-written `/foo ` line, and substring matching would let an
+  // existing `/foobar` swallow a needed `/foo`.
+  const existingLines = new Set(splitContentLines(existing).map(normalizeExcludeLine));
+  const toAdd = validNames
+    .map((name) => `/${escapeGitignoreLiteral(name)}`)
+    .filter((pattern) => !existingLines.has(pattern));
 
   if (toAdd.length === 0) return;
 
@@ -961,6 +1159,9 @@ export function ensureSymlinkExcludes(worktreePath: string, symlinkNames: string
     `${header}${toAdd.join('\n')}\n`,
     (err) => console.warn(`Failed to append to ${excludePath}:`, err),
     existing,
+    // `toAdd` already holds exactly the missing lines — the helper's
+    // single-marker recheck must not gate this multi-line block.
+    true,
   );
 }
 
@@ -968,7 +1169,7 @@ export function ensureSymlinkExcludes(worktreePath: string, symlinkNames: string
  * Find the main repository root for a worktree via `git rev-parse
  * --git-common-dir`. Returns null when the cwd isn't inside a git repo.
  */
-function detectRepoRoot(worktreePath: string): string | null {
+export function detectRepoRoot(worktreePath: string): string | null {
   try {
     const out = execFileSync('git', ['rev-parse', '--git-common-dir'], {
       cwd: worktreePath,
@@ -982,35 +1183,48 @@ function detectRepoRoot(worktreePath: string): string | null {
   }
 }
 
+/**
+ * Spawn-time backfill for a worktree's `node_modules`: converts the legacy
+ * whole-dir symlink to per-entry links and tops up links for packages
+ * installed in the main checkout since the worktree was created. Only acts on
+ * a `node_modules` this app manages (`isManagedNodeModules`) — the main
+ * checkout's real install, a worktree-local `npm ci`, and a foreign symlink
+ * are all left untouched. The ownership check also backstops the main-repo
+ * path guard: a real install has no entry links into itself, so it can never
+ * be classified as managed.
+ *
+ * Pass `repoRoot` when the caller already resolved it (null meaning "not a
+ * repo") to avoid a redundant `git rev-parse` subprocess.
+ */
+export function refreshWorktreeNodeModules(worktreePath: string, repoRoot?: string | null): void {
+  const root = repoRoot === undefined ? detectRepoRoot(worktreePath) : repoRoot;
+  if (!root) return;
+  // Realpath comparison so a symlinked alias of the main checkout can't slip
+  // past the same-directory guard.
+  const rootReal = realpathOrNull(root) ?? path.resolve(root);
+  const worktreeReal = realpathOrNull(worktreePath) ?? path.resolve(worktreePath);
+  if (rootReal === worktreeReal) return;
+  const source = path.join(root, 'node_modules');
+  const target = path.join(worktreePath, 'node_modules');
+  if (!isManagedNodeModules(source, target)) return;
+  ensureNodeModulesEntryLinks(source, target);
+}
+
 export async function removeWorktree(
   repoRoot: string,
   branchName: string,
   deleteBranch: boolean,
+  explicitWorktreePath?: string,
 ): Promise<void> {
-  const worktreePath = `${repoRoot}/.worktrees/${branchName}`;
+  // After the user adopts a branch the agent switched the worktree to, the
+  // folder keeps its original branch-derived name — callers that know the real
+  // path must pass it, deriving from branchName is only a fallback.
+  const worktreePath = explicitWorktreePath ?? `${repoRoot}/.worktrees/${branchName}`;
 
   if (!fs.existsSync(repoRoot)) return;
 
   if (fs.existsSync(worktreePath)) {
-    try {
-      await exec('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot });
-    } catch {
-      // Fallback: direct directory removal. Docker Desktop's VirtioFS bind-mount
-      // may still be releasing after the container exits — retry with backoff.
-      const delays = [0, 500, 1500, 3000];
-      let lastErr: unknown;
-      for (const delay of delays) {
-        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-        try {
-          fs.rmSync(worktreePath, { recursive: true, force: true });
-          lastErr = undefined;
-          break;
-        } catch (e) {
-          lastErr = e;
-        }
-      }
-      if (lastErr) throw lastErr;
-    }
+    await forceRemoveWorktreeDir(repoRoot, worktreePath);
   }
 
   // Prune stale worktree entries
@@ -1032,23 +1246,43 @@ export async function removeWorktree(
 
 // --- IPC command functions ---
 
-export async function getGitIgnoredDirs(projectRoot: string): Promise<string[]> {
-  const results: string[] = [];
-  for (const name of SYMLINK_CANDIDATES) {
-    const dirPath = path.join(projectRoot, name);
-    try {
-      await fs.promises.stat(dirPath); // throws if entry doesn't exist
-    } catch {
-      continue;
-    }
-    try {
-      await exec('git', ['check-ignore', '-q', name], { cwd: projectRoot });
-      results.push(name);
-    } catch {
-      /* not ignored */
-    }
+export async function getSymlinkCandidates(projectRoot: string): Promise<GitIgnoredEntry[]> {
+  try {
+    const ignoreCase = await getCoreIgnoreCase(projectRoot);
+    // Single git call returning the full candidate set: root-level, ignored,
+    // untracked. The `:(glob)` pathspec magic keeps `*` from crossing `/`, so
+    // `:(glob)*` matches only root-level non-dot entries and `:(glob).*`
+    // catches root-level dotfiles (glob `*` skips a leading dot). Output size
+    // is bounded by the root entry count, nested ignored files inside tracked
+    // directories never appear, and `--others` excludes tracked files — so no
+    // per-candidate check-ignore re-verification is needed.
+    const { stdout } = await exec(
+      'git',
+      [
+        'ls-files',
+        '-z',
+        '--others',
+        '--ignored',
+        '--exclude-standard',
+        '--directory',
+        '--',
+        ':(glob)*',
+        ':(glob).*',
+      ],
+      { cwd: projectRoot, maxBuffer: MAX_BUFFER },
+    );
+    return stdout
+      .split('\0')
+      .filter(Boolean)
+      .map((entry) => (entry.endsWith('/') ? entry.slice(0, -1) : entry))
+      .filter((name) => isValidSymlinkName(name) && !isReservedSymlinkName(name, ignoreCase))
+      .map((name) => ({ name, isDefault: isDefaultSymlinkCandidate(name, ignoreCase) }));
+  } catch (err) {
+    // Degrade, never fail: a missing git binary or broken repo must not block
+    // task creation — the worktree is simply created without symlinks.
+    console.warn(`Failed to probe symlink candidates in ${projectRoot}:`, err);
+    return [];
   }
-  return results;
 }
 
 export async function getMainBranch(projectRoot: string): Promise<string> {
@@ -1088,7 +1322,7 @@ export async function getChangedFiles(
 
   let finalDiffStr = '';
   try {
-    const { stdout } = await exec('git', ['diff', '--raw', '--numstat', diffBase.sha], {
+    const { stdout } = await exec('git', ['diff', '--raw', '--numstat', '-z', diffBase.sha], {
       cwd: worktreePath,
       maxBuffer: MAX_BUFFER,
     });
@@ -1097,8 +1331,11 @@ export async function getChangedFiles(
     /* empty */
   }
 
-  const { statusMap: finalStatusMap, numstatMap: finalNumstatMap } =
-    parseDiffRawNumstat(finalDiffStr);
+  const {
+    statusMap: finalStatusMap,
+    numstatMap: finalNumstatMap,
+    previousPathMap: finalPreviousPathMap,
+  } = parseDiffRawNumstat(finalDiffStr);
 
   // git diff --raw --numstat <headHash> — tracked uncommitted changes (HEAD vs working tree).
   // Compares HEAD tree directly to the working tree, so it does not need the index
@@ -1106,7 +1343,7 @@ export async function getChangedFiles(
   // git ls-files --others --exclude-standard — untracked files (no index lock needed).
   // Both commands run in parallel since they are independent.
   const [uncommittedResult, untrackedResult] = await Promise.all([
-    exec('git', ['diff', '--raw', '--numstat', headHash], {
+    exec('git', ['diff', '--raw', '--numstat', '-z', headHash], {
       cwd: worktreePath,
       maxBuffer: MAX_BUFFER,
     }).catch(() => ({ stdout: '' })),
@@ -1131,6 +1368,7 @@ export async function getChangedFiles(
   const files = changedFilesFromMaps({
     statusMap: finalStatusMap,
     numstatMap: finalNumstatMap,
+    previousPathMap: finalPreviousPathMap,
     committed: isCommitted,
     sort: false,
   });
@@ -1284,7 +1522,7 @@ export async function getUncommittedChangedFiles(worktreePath: string): Promise<
   const headHash = await pinHead(worktreePath);
   let diffStr = '';
   try {
-    const { stdout } = await exec('git', ['diff', '--raw', '--numstat', headHash], {
+    const { stdout } = await exec('git', ['diff', '--raw', '--numstat', '-z', headHash], {
       cwd: worktreePath,
       maxBuffer: MAX_BUFFER,
     });
@@ -1293,8 +1531,14 @@ export async function getUncommittedChangedFiles(worktreePath: string): Promise<
     /* empty */
   }
 
-  const { statusMap, numstatMap } = parseDiffRawNumstat(diffStr);
-  const files = changedFilesFromMaps({ statusMap, numstatMap, committed: false, sort: false });
+  const { statusMap, numstatMap, previousPathMap } = parseDiffRawNumstat(diffStr);
+  const files = changedFilesFromMaps({
+    statusMap,
+    numstatMap,
+    previousPathMap,
+    committed: false,
+    sort: false,
+  });
   const seen = new Set(files.map((file) => file.path));
 
   files.push(...(await getUntrackedChangedFiles(worktreePath, seen)));
@@ -1443,16 +1687,19 @@ export async function getFileDiff(
   return { diff, oldContent, newContent };
 }
 
+const UNREADABLE_WORKTREE_STATUS: WorktreeStatus = {
+  has_committed_changes: false,
+  has_uncommitted_changes: false,
+  current_branch: null,
+  base_branch: null,
+};
+
 export async function getWorktreeStatus(
   worktreePath: string,
   baseBranch?: string,
-): Promise<{
-  has_committed_changes: boolean;
-  has_uncommitted_changes: boolean;
-  current_branch: string | null;
-}> {
+): Promise<WorktreeStatus> {
   if (!fs.existsSync(worktreePath)) {
-    return { has_committed_changes: false, has_uncommitted_changes: false, current_branch: null };
+    return UNREADABLE_WORKTREE_STATUS;
   }
   let statusOut: string;
   try {
@@ -1462,13 +1709,21 @@ export async function getWorktreeStatus(
     }));
   } catch {
     // Worktree removed between existsSync and exec (race condition)
-    return { has_committed_changes: false, has_uncommitted_changes: false, current_branch: null };
+    return UNREADABLE_WORKTREE_STATUS;
   }
   const hasUncommittedChanges = statusOut.trim().length > 0;
 
-  const currentBranch = await getCurrentBranchName(worktreePath).catch(() => null);
+  // Resolved base branch name, so the frontend can tell "agent switched to a
+  // feature branch" (adoptable) apart from "agent is sitting on main" (not).
+  const [currentBranch, resolvedBaseBranch, headSha] = await Promise.all([
+    getCurrentBranchName(worktreePath).catch(() => null),
+    baseBranch ?? detectMainBranch(worktreePath).catch(() => null),
+    exec('git', ['rev-parse', 'HEAD'], { cwd: worktreePath })
+      .then(({ stdout }) => stdout.trim() || null)
+      .catch(() => null),
+  ]);
 
-  const mergeBase = await detectMergeBase(worktreePath, 'HEAD', baseBranch);
+  const mergeBase = await detectMergeBase(worktreePath, 'HEAD', resolvedBaseBranch ?? undefined);
   let hasCommittedChanges = false;
   try {
     const { stdout: logOut } = await exec('git', ['log', `${mergeBase}..HEAD`, '--oneline'], {
@@ -1483,6 +1738,8 @@ export async function getWorktreeStatus(
     has_committed_changes: hasCommittedChanges,
     has_uncommitted_changes: hasUncommittedChanges,
     current_branch: currentBranch,
+    base_branch: resolvedBaseBranch,
+    head_sha: headSha,
   };
 }
 
@@ -1538,6 +1795,34 @@ export async function listImportableWorktrees(projectRoot: string): Promise<
     (a, b) => a.branch_name.localeCompare(b.branch_name) || a.path.localeCompare(b.path),
   );
   return filtered;
+}
+
+/** Resolve an already checked-out local branch without creating or switching worktrees. */
+export async function getBranchWorktreePath(
+  projectRoot: string,
+  branchName: string,
+): Promise<{ path: string; head: string; headCommittedAt: string | null } | null> {
+  const { stdout } = await exec('git', ['worktree', 'list', '--porcelain'], {
+    cwd: projectRoot,
+    maxBuffer: MAX_BUFFER,
+  });
+  const match = parseWorktreeList(stdout).find(
+    (entry) => !entry.detached && entry.branchName === branchName,
+  );
+  if (!match?.path || !match.head) return null;
+  try {
+    const { stdout } = await exec('git', ['show', '-s', '--format=%cI', match.head], {
+      cwd: match.path,
+    });
+    const timestamp = new Date(stdout.trim());
+    return {
+      path: match.path,
+      head: match.head,
+      headCommittedAt: Number.isNaN(timestamp.getTime()) ? null : timestamp.toISOString(),
+    };
+  } catch {
+    return { path: match.path, head: match.head, headCommittedAt: null };
+  }
 }
 
 /** Stage all changes and commit in a worktree. */
@@ -1716,7 +2001,7 @@ export async function mergeTask(
     invalidateDiffBaseCache();
 
     if (cleanup) {
-      await removeWorktree(projectRoot, branchName, true);
+      await removeWorktree(projectRoot, branchName, true, worktreePath);
     }
 
     await restoreBranch();
@@ -1747,7 +2032,7 @@ export async function getChangedFilesFromBranch(
 
   let diffStr = '';
   try {
-    const { stdout } = await exec('git', ['diff', '--raw', '--numstat', diffRange], {
+    const { stdout } = await exec('git', ['diff', '--raw', '--numstat', '-z', diffRange], {
       cwd: projectRoot,
       maxBuffer: MAX_BUFFER,
     });
@@ -1756,9 +2041,9 @@ export async function getChangedFilesFromBranch(
     return [];
   }
 
-  const { statusMap, numstatMap } = parseDiffRawNumstat(diffStr);
+  const { statusMap, numstatMap, previousPathMap } = parseDiffRawNumstat(diffStr);
 
-  return changedFilesFromMaps({ statusMap, numstatMap, committed: true });
+  return changedFilesFromMaps({ statusMap, numstatMap, previousPathMap, committed: true });
 }
 
 export async function getFileDiffFromBranch(
@@ -1965,7 +2250,7 @@ export async function getCommitChangedFiles(
   try {
     const { stdout } = await exec(
       'git',
-      ['diff', '--raw', '--numstat', `${commitHash}^..${commitHash}`],
+      ['diff', '--raw', '--numstat', '-z', `${commitHash}^..${commitHash}`],
       { cwd: worktreePath, maxBuffer: MAX_BUFFER },
     );
     diffStr = stdout;
@@ -1974,7 +2259,7 @@ export async function getCommitChangedFiles(
     try {
       const { stdout } = await exec(
         'git',
-        ['diff', '--raw', '--numstat', `${EMPTY_TREE}..${commitHash}`],
+        ['diff', '--raw', '--numstat', '-z', `${EMPTY_TREE}..${commitHash}`],
         { cwd: worktreePath, maxBuffer: MAX_BUFFER },
       );
       diffStr = stdout;
@@ -1984,9 +2269,9 @@ export async function getCommitChangedFiles(
     }
   }
 
-  const { statusMap, numstatMap } = parseDiffRawNumstat(diffStr);
+  const { statusMap, numstatMap, previousPathMap } = parseDiffRawNumstat(diffStr);
 
-  return changedFilesFromMaps({ statusMap, numstatMap, committed: true });
+  return changedFilesFromMaps({ statusMap, numstatMap, previousPathMap, committed: true });
 }
 
 export async function getCommitDiffs(worktreePath: string, commitHash: string): Promise<string> {

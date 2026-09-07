@@ -177,7 +177,7 @@ export const DEFAULT_BINDINGS: KeyBinding[] = [
     id: 'app.task.close-shell',
     layer: 'app',
     category: 'Tasks',
-    description: 'Close current shell',
+    description: 'Close current shell or terminal',
     platform: 'both',
     key: 'w',
     modifiers: { cmdOrCtrl: true },
@@ -362,7 +362,6 @@ export const DEFAULT_BINDINGS: KeyBinding[] = [
     // The automatic recovery (refocus/foreground repaints) is macOS-only, but
     // this stays cross-platform: it is inert until pressed and works as a
     // general "repaint if something looks off" command on any GPU.
-    // Not Cmd/Ctrl+Shift+R — that is Electron's default Force Reload accelerator.
     id: 'app.redraw-terminals',
     layer: 'app',
     category: 'App',

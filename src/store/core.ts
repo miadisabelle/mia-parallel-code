@@ -1,7 +1,15 @@
 import { createStore } from 'solid-js/store';
 import { DEFAULT_TERMINAL_FONT } from '../lib/fonts';
 import { getLocalDateKey } from '../lib/date';
-import type { AppStore } from './types';
+import type { AppStore, UsageState } from './types';
+
+const EMPTY_USAGE: UsageState = {
+  fiveHour: null,
+  sevenDay: null,
+  fetchedAt: null,
+  status: 'idle',
+  error: null,
+};
 
 export const [store, setStore] = createStore<AppStore>({
   projects: [],
@@ -16,6 +24,7 @@ export const [store, setStore] = createStore<AppStore>({
   activeAgentId: null,
   availableAgents: [],
   customAgents: [],
+  agentEnvFiles: {},
   showNewTaskDialog: false,
   sidebarVisible: true,
   panelUserSize: {},
@@ -37,6 +46,7 @@ export const [store, setStore] = createStore<AppStore>({
   mergedLinesAdded: 0,
   mergedLinesRemoved: 0,
   terminalFont: DEFAULT_TERMINAL_FONT,
+  terminalScreenReaderMode: false,
   themePreset: 'islands-dark',
   appearanceMode: 'dark',
   lightThemePreset: 'islands-light',
@@ -50,9 +60,10 @@ export const [store, setStore] = createStore<AppStore>({
   showPlans: true,
   showSidebarTips: true,
   showSidebarProgress: true,
+  sidebarNeedsInputFirst: true,
   projectsCollapsed: false,
   desktopNotificationsEnabled: false,
-  inactiveColumnOpacity: 0.6,
+  inactiveColumnOpacity: 0.9,
   editorCommand: '',
   dockerImage: 'parallel-code-agent:latest',
   dockerAvailable: false,
@@ -96,6 +107,7 @@ export const [store, setStore] = createStore<AppStore>({
   customThemes: {},
   activeCustomThemeId: null,
   mcpStatus: { running: false, port: null, coordinatorTaskId: null, mcpConfigPath: null },
+  usage: { claude: { ...EMPTY_USAGE }, codex: { ...EMPTY_USAGE } },
 });
 
 type CleanupPanelStore = Pick<

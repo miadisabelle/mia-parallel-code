@@ -1,10 +1,20 @@
 import { For, Show } from 'solid-js';
-import { activateTaskFromPointer, store } from '../store/store';
+import {
+  activateTaskFromPointer,
+  getTaskAttentionState,
+  getTaskDotStatus,
+  store,
+} from '../store/store';
+import { StatusDot } from './StatusDot';
 
+/** Title-bar switcher: one named pill per open item. The active pill is
+ *  accent-tinted; task pills carry the same status glyph as the sidebar so
+ *  the bar doubles as an at-a-glance overview. */
 export function FocusModeTaskIndicators() {
   const items = () =>
     store.taskOrder.map((id) => ({
       id,
+      isTask: Boolean(store.tasks[id]),
       name: store.tasks[id]?.name ?? store.terminals[id]?.name ?? 'Open item',
     }));
 
@@ -23,7 +33,16 @@ export function FocusModeTaskIndicators() {
                 title={isActive() ? `${item.name} (current)` : `Switch to ${item.name}`}
                 aria-label={isActive() ? `${item.name}, current item` : `Switch to ${item.name}`}
                 aria-current={isActive() ? 'true' : undefined}
-              />
+              >
+                <Show when={item.isTask}>
+                  <StatusDot
+                    status={getTaskDotStatus(item.id)}
+                    size="sm"
+                    attention={getTaskAttentionState(item.id)}
+                  />
+                </Show>
+                <span class="focus-mode-task-indicator-name">{item.name}</span>
+              </button>
             );
           }}
         </For>

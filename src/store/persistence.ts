@@ -6,6 +6,12 @@ import { startRemoteAccess } from './remote';
 import { effectiveAgentId } from './agent-select';
 import { randomPastelColor } from './projects';
 import { markAgentSpawned } from './taskStatus';
+import { clampCoordinatorConcurrentTasks } from '../lib/coordinator-limits';
+
+// Hand-edited state files may hold anything; the IPC layer rejects non-integers.
+function restoredMaxConcurrentTasks(value: unknown): number | undefined {
+  return typeof value === 'number' ? clampCoordinatorConcurrentTasks(value) : undefined;
+}
 import { getLocalDateKey } from '../lib/date';
 import type {
   Agent,
@@ -22,6 +28,8 @@ import { isLookPreset } from '../lib/look';
 import { validateCustomTheme, parseThemeCss, themeToCss } from '../lib/custom-theme';
 import type { CustomTheme } from '../lib/custom-theme';
 import { syncTerminalCounter } from './terminals';
+import { showNotification, NOTIFICATION_ERROR_MS } from './notification';
+import { errMessage } from '../lib/log';
 
 const RESTORED_AGENT_SPAWN_STAGGER_MS = 1_000;
 
@@ -110,6 +118,13 @@ function validAgentIndex(value: unknown): number | undefined {
     : undefined;
 }
 
+/** Branch names restored from JSON: only non-empty strings. `exclude` drops a
+ *  value that would be nonsensical (e.g. an adopted-from equal to the branch
+ *  itself, which would render an "adopted 'X' (was 'X')" banner). */
+function validBranch(value: unknown, exclude?: string): string | undefined {
+  return typeof value === 'string' && value.length > 0 && value !== exclude ? value : undefined;
+}
+
 /**
  * Serialize a Task to its persisted shape. The caller supplies agentDefs
  * because active and collapsed tasks source them differently (live store
@@ -132,6 +147,7 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     agentDefs: agentDefs.length > 1 ? agentDefs : undefined,
     agentIds: task.agentIds.length > 0 ? [...task.agentIds] : undefined,
     selectedAgentId: task.selectedAgentId,
+    aiTerminalLayout: task.aiTerminalLayout,
     gitIsolation: task.gitIsolation,
     baseBranch: task.baseBranch,
     externalWorktree: task.externalWorktree,
@@ -146,9 +162,12 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     savedPromptedAgentIndexes: task.savedPromptedAgentIndexes,
     planFileName: task.planFileName,
     stepsEnabled: task.stepsEnabled,
+    branchAdoptedFrom: task.branchAdoptedFrom,
+    branchOfferDismissed: task.branchOfferDismissed,
     ...(collapsed ? { collapsed: true } : {}),
     coordinatorMode: task.coordinatorMode,
     propagateSkipPermissions: task.propagateSkipPermissions,
+    maxConcurrentTasks: task.maxConcurrentTasks,
     coordinatedBy: task.coordinatedBy,
     controlledBy: task.controlledBy,
     mcpConfigPath: task.mcpConfigPath,
@@ -157,11 +176,21 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     signalDoneConsumed: task.signalDoneConsumed,
     needsReview: task.needsReview,
     verification: task.verification,
+    verificationRun: task.verificationRun,
     landingState: task.landingState,
     landingReason: task.landingReason,
     landingSummary: task.landingSummary,
     landedMetadata: task.landedMetadata,
   };
+}
+
+/** A run that was still in flight when the app quit has no process behind it
+ *  anymore, so it must not be restored as `running`. */
+function restoredVerificationRun(
+  run: PersistedTask['verificationRun'],
+): PersistedTask['verificationRun'] {
+  if (!run || run.status === 'running') return undefined;
+  return run;
 }
 
 export async function saveState(): Promise<void> {
@@ -182,6 +211,7 @@ export async function saveState(): Promise<void> {
     mergedLinesAdded: store.mergedLinesAdded,
     mergedLinesRemoved: store.mergedLinesRemoved,
     terminalFont: store.terminalFont,
+    terminalScreenReaderMode: store.terminalScreenReaderMode || undefined,
     themePreset: store.themePreset,
     showPromptInput: store.showPromptInput,
     fontSmoothing: store.fontSmoothing,
@@ -190,6 +220,7 @@ export async function saveState(): Promise<void> {
     showPlans: store.showPlans,
     showSidebarTips: store.showSidebarTips,
     showSidebarProgress: store.showSidebarProgress,
+    sidebarNeedsInputFirst: store.sidebarNeedsInputFirst,
     projectsCollapsed: store.projectsCollapsed,
     desktopNotificationsEnabled: store.desktopNotificationsEnabled,
     inactiveColumnOpacity: store.inactiveColumnOpacity,
@@ -197,6 +228,8 @@ export async function saveState(): Promise<void> {
     dockerImage: store.dockerImage !== 'parallel-code-agent:latest' ? store.dockerImage : undefined,
     askCodeProvider: store.askCodeProvider !== 'claude' ? store.askCodeProvider : undefined,
     customAgents: store.customAgents.length > 0 ? [...store.customAgents] : undefined,
+    agentEnvFiles:
+      Object.keys(store.agentEnvFiles).length > 0 ? { ...store.agentEnvFiles } : undefined,
     keybindingMigrationDismissed: store.keybindingMigrationDismissed || undefined,
     focusMode: store.focusMode || undefined,
     verboseLogging: store.verboseLogging || undefined,
@@ -257,9 +290,25 @@ export async function saveState(): Promise<void> {
     persisted.terminals[id] = { id: terminal.id, name: terminal.name };
   }
 
-  await invoke(IPC.SaveAppState, { json: JSON.stringify(persisted) }).catch((e) =>
-    console.warn('Failed to save state:', e),
-  );
+  await invoke(IPC.SaveAppState, { json: JSON.stringify(persisted) }).catch((e: unknown) => {
+    console.warn('Failed to save state:', e);
+    notifySaveFailure(e);
+  });
+}
+
+/** Don't nag on every autosave tick while the cause (full disk, permissions) persists. */
+const SAVE_FAILURE_NOTIFY_INTERVAL_MS = 60_000;
+let lastSaveFailureNotifiedAt = 0;
+
+/** A failed state write means tasks, projects, and settings are silently no
+ *  longer persisting — the user needs to know before they quit. */
+function notifySaveFailure(err: unknown): void {
+  const now = Date.now();
+  if (now - lastSaveFailureNotifiedAt < SAVE_FAILURE_NOTIFY_INTERVAL_MS) return;
+  lastSaveFailureNotifiedAt = now;
+  showNotification(`Couldn't save app state: ${errMessage(err)}`, {
+    durationMs: NOTIFICATION_ERROR_MS,
+  });
 }
 
 /** 20_000 px is ~10× the largest plausible monitor axis and big enough to let
@@ -353,6 +402,7 @@ interface LegacyPersistedState {
   mergedLinesAdded?: unknown;
   mergedLinesRemoved?: unknown;
   terminalFont?: unknown;
+  terminalScreenReaderMode?: unknown;
   themePreset?: unknown;
   showPromptInput?: unknown;
   fontSmoothing?: unknown;
@@ -362,6 +412,7 @@ interface LegacyPersistedState {
   showSteps?: unknown;
   showSidebarTips?: unknown;
   showSidebarProgress?: unknown;
+  sidebarNeedsInputFirst?: unknown;
   projectsCollapsed?: unknown;
   desktopNotificationsEnabled?: unknown;
   inactiveColumnOpacity?: unknown;
@@ -370,6 +421,7 @@ interface LegacyPersistedState {
   askCodeProvider?: unknown;
   minimaxApiKey?: unknown;
   customAgents?: unknown;
+  agentEnvFiles?: unknown;
   terminals?: unknown;
   keybindingMigrationDismissed?: unknown;
   focusMode?: unknown;
@@ -430,6 +482,7 @@ export async function loadState(): Promise<void> {
     } else {
       p.coverageReportPath = undefined;
     }
+    p.tasksCollapsed = typeof p.tasksCollapsed === 'boolean' ? p.tasksCollapsed : undefined;
     // Migrate defaultDirectMode -> defaultGitIsolation
     const legacy = p as Project & { defaultDirectMode?: boolean };
     if (legacy.defaultDirectMode !== undefined && p.defaultGitIsolation === undefined) {
@@ -512,6 +565,8 @@ export async function loadState(): Promise<void> {
         typeof raw.terminalFont === 'string' && raw.terminalFont.trim()
           ? raw.terminalFont
           : DEFAULT_TERMINAL_FONT;
+      s.terminalScreenReaderMode =
+        typeof raw.terminalScreenReaderMode === 'boolean' ? raw.terminalScreenReaderMode : false;
       s.themePreset = isLookPreset(raw.themePreset) ? raw.themePreset : 'minimal';
       s.showPromptInput = typeof raw.showPromptInput === 'boolean' ? raw.showPromptInput : true;
       s.fontSmoothing = typeof raw.fontSmoothing === 'boolean' ? raw.fontSmoothing : true;
@@ -521,6 +576,8 @@ export async function loadState(): Promise<void> {
       s.showSidebarTips = typeof raw.showSidebarTips === 'boolean' ? raw.showSidebarTips : true;
       s.showSidebarProgress =
         typeof raw.showSidebarProgress === 'boolean' ? raw.showSidebarProgress : true;
+      s.sidebarNeedsInputFirst =
+        typeof raw.sidebarNeedsInputFirst === 'boolean' ? raw.sidebarNeedsInputFirst : true;
       s.projectsCollapsed =
         typeof raw.projectsCollapsed === 'boolean' ? raw.projectsCollapsed : false;
       s.desktopNotificationsEnabled =
@@ -636,6 +693,14 @@ export async function loadState(): Promise<void> {
         );
       }
 
+      if (raw.agentEnvFiles && typeof raw.agentEnvFiles === 'object') {
+        s.agentEnvFiles = Object.fromEntries(
+          Object.entries(raw.agentEnvFiles as Record<string, unknown>).filter(
+            (entry): entry is [string, string] => typeof entry[1] === 'string' && !!entry[1].trim(),
+          ),
+        );
+      }
+
       if (typeof raw.keybindingMigrationDismissed === 'boolean') {
         s.keybindingMigrationDismissed = raw.keybindingMigrationDismissed;
       }
@@ -674,6 +739,7 @@ export async function loadState(): Promise<void> {
           worktreePath: pt.worktreePath,
           agentIds,
           selectedAgentId: validAgentId(pt.selectedAgentId, agentIds) ?? agentIds[0],
+          aiTerminalLayout: pt.aiTerminalLayout === 'tabs' ? 'tabs' : undefined,
           shellAgentIds,
           notes: pt.notes,
           lastPrompt: pt.lastPrompt,
@@ -697,8 +763,11 @@ export async function loadState(): Promise<void> {
           savedPromptedAgentIndexes: validPromptedAgentIndexes(pt.savedPromptedAgentIndexes),
           planFileName: pt.planFileName,
           stepsEnabled: pt.stepsEnabled,
+          branchAdoptedFrom: validBranch(pt.branchAdoptedFrom, pt.branchName),
+          branchOfferDismissed: validBranch(pt.branchOfferDismissed),
           coordinatorMode: pt.coordinatorMode,
           propagateSkipPermissions: pt.propagateSkipPermissions,
+          maxConcurrentTasks: restoredMaxConcurrentTasks(pt.maxConcurrentTasks),
           coordinatedBy: pt.coordinatedBy,
           controlledBy:
             pt.controlledBy ?? (pt.coordinatorMode || pt.coordinatedBy ? 'coordinator' : undefined),
@@ -712,6 +781,7 @@ export async function loadState(): Promise<void> {
           signalDoneConsumed: pt.signalDoneConsumed,
           needsReview: pt.needsReview,
           verification: pt.verification,
+          verificationRun: restoredVerificationRun(pt.verificationRun),
           landingState: pt.landingState,
           landingReason: pt.landingReason,
           landingSummary: pt.landingSummary,
@@ -781,6 +851,7 @@ export async function loadState(): Promise<void> {
           worktreePath: pt.worktreePath,
           agentIds: [],
           selectedAgentId: undefined,
+          aiTerminalLayout: pt.aiTerminalLayout === 'tabs' ? 'tabs' : undefined,
           shellAgentIds: [],
           notes: pt.notes,
           lastPrompt: pt.lastPrompt,
@@ -805,11 +876,14 @@ export async function loadState(): Promise<void> {
           savedPromptedAgentIndexes: validPromptedAgentIndexes(pt.savedPromptedAgentIndexes),
           planFileName: pt.planFileName,
           stepsEnabled: pt.stepsEnabled,
+          branchAdoptedFrom: validBranch(pt.branchAdoptedFrom, pt.branchName),
+          branchOfferDismissed: validBranch(pt.branchOfferDismissed),
           collapsed: true,
           savedAgentDef: agentDefs[0],
           savedAgentDefs: agentDefs.length > 0 ? agentDefs : undefined,
           coordinatorMode: pt.coordinatorMode,
           propagateSkipPermissions: pt.propagateSkipPermissions,
+          maxConcurrentTasks: restoredMaxConcurrentTasks(pt.maxConcurrentTasks),
           coordinatedBy: pt.coordinatedBy,
           controlledBy:
             pt.controlledBy ?? (pt.coordinatorMode || pt.coordinatedBy ? 'coordinator' : undefined),
@@ -821,6 +895,7 @@ export async function loadState(): Promise<void> {
           signalDoneConsumed: pt.signalDoneConsumed,
           needsReview: pt.needsReview,
           verification: pt.verification,
+          verificationRun: restoredVerificationRun(pt.verificationRun),
           landingState: pt.landingState,
           landingReason: pt.landingReason,
           landingSummary: pt.landingSummary,

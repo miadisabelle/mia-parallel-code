@@ -24,6 +24,7 @@ export {
   switchAgent,
   addCustomAgent,
   removeCustomAgent,
+  setAgentEnvFile,
 } from './agents';
 export {
   createTask,
@@ -33,7 +34,6 @@ export {
   mergeTask,
   pushTask,
   updateTaskName,
-  updateTaskBranch,
   updateTaskNotes,
   sendPrompt,
   setLastPrompt,
@@ -55,6 +55,7 @@ export {
   setNewTaskPrefillPrompt,
   setPlanContent,
   setStepsContent,
+  toggleAITerminalLayout,
   setTaskLastInputAt,
   markTaskUserActivity,
   setTaskPromptDraftActive,
@@ -70,6 +71,7 @@ export {
   retryTaskMcpStartup,
   setTaskSkipPermissions,
 } from './tasks';
+export { updateTaskBranch, undoBranchAdoption, dismissBranchAdoptionNotice } from './task-branch';
 export {
   setActiveTask,
   activateTaskFromPointer,
@@ -87,6 +89,8 @@ export {
   triggerAction,
   getTaskFocusedPanel,
   setTaskFocusedPanel,
+  aiTerminalPanelId,
+  shellPanelId,
   isPanelFocused,
   isPanelFocusedPrefix,
   focusSidebar,
@@ -118,6 +122,7 @@ export {
   toggleTaskFocusMode,
   setTaskSplitMode,
   setTerminalFont,
+  setTerminalScreenReaderMode,
   applyAppearanceMode,
   markCustomThemesReady,
   setAppearanceMode,
@@ -130,6 +135,8 @@ export {
   setShowPromptInput,
   setShowSidebarTips,
   setShowSidebarProgress,
+  setSidebarNeedsInputFirst,
+  setProjectTasksCollapsed,
   setProjectsCollapsed,
   setFontSmoothing,
   setDesktopNotificationsEnabled,
@@ -167,14 +174,24 @@ export {
   isAutoTrustSettling,
   isAgentAskingQuestion,
   isAgentIdle,
+  getBranchDivergence,
   refreshTaskStatus,
   startTaskStatusPolling,
   stopTaskStatusPolling,
   rescheduleTaskStatusPolling,
 } from './taskStatus';
 export type { TaskAttentionState, TaskDotStatus } from './taskStatus';
+export { getTaskAgentHookStatus, isTaskUnread, noteAgentTerminalInput } from './agentHookStatus';
+export type { TaskAgentHookStatus } from './agentHookStatus';
 export { showNotification, clearNotification } from './notification';
 export { startPrChecksSubscription, getPrChecks, type PrChecksState } from './pr-checks';
+export {
+  cancelTaskVerification,
+  getVerificationOutput,
+  getVerifyCommand,
+  runTaskVerification,
+  sendVerificationFailureToAgent,
+} from './verification';
 export { getMergedTasksTodayCount, getMergedLineTotals } from './completion';
 export {
   createTerminal,
@@ -212,3 +229,4 @@ export {
   startMCPStatusPolling,
   stopMCPStatusPolling,
 } from './mcpStatus';
+export { refreshUsage, startUsagePolling, stopUsagePolling, USAGE_PROVIDERS } from './usage';

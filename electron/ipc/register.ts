@@ -39,12 +39,14 @@ import {
   isPrUrl,
 } from './pr-checks.js';
 import { readCoverageSummary } from './coverage.js';
+import { loadEslintQualityFindings } from './eslint-quality-findings.js';
+import { buildVerifyEnv, validateVerifyCommand, verificationRunner } from './verify.js';
 import { startRemoteServer, getMCPLogs, type RemoteProject } from '../remote/server.js';
 import type { RemoteAttentionState } from '../remote/protocol.js';
 import { atomicWriteFileSync } from '../mcp/atomic.js';
 import { buildMcpLaunchArgs } from '../mcp/agent-args.js';
 import {
-  getGitIgnoredDirs,
+  getSymlinkCandidates,
   getMainBranch,
   getCurrentBranch,
   getChangedFiles,
@@ -55,6 +57,7 @@ import {
   getFileDiffFromBranch,
   getWorktreeStatus,
   listImportableWorktrees,
+  getBranchWorktreePath,
   commitAll,
   discardUncommitted,
   checkMergeStatus,
@@ -94,6 +97,8 @@ import { spawn } from 'child_process';
 import { askAboutCode, cancelAskAboutCode } from './ask-code.js';
 import { setMinimaxApiKey } from './ask-code-minimax.js';
 import { getSystemMonospaceFonts } from './system-fonts.js';
+import { fetchClaudeUsage } from './claude-usage.js';
+import { fetchCodexUsage } from './codex-usage.js';
 import path from 'path';
 import {
   assertString,
@@ -189,6 +194,12 @@ function isMissingCommandError(err: unknown, command: string): boolean {
   );
 }
 
+/** An empty string is allowed: it clears the command on an already-registered coordinator. */
+function validateOptionalVerifyCommand(command: unknown): void {
+  assertOptionalString(command, 'verifyCommand');
+  if (command) validateVerifyCommand(command);
+}
+
 /** Validates renderer-supplied args for StartMCPServer before any file I/O. Exported for testing. */
 export function validateStartMCPServerArgs(args: Record<string, unknown>): void {
   validateUUID(args.coordinatorTaskId, 'coordinatorTaskId');
@@ -200,8 +211,12 @@ export function validateStartMCPServerArgs(args: Record<string, unknown>): void 
   }
   if (args.agentCommand !== undefined) assertString(args.agentCommand, 'agentCommand');
   if (args.agentArgs !== undefined) assertStringArray(args.agentArgs, 'agentArgs');
+  assertOptionalString(args.agentEnvFile, 'agentEnvFile');
   assertOptionalBoolean(args.skipPermissions, 'skipPermissions');
   assertOptionalBoolean(args.propagateSkipPermissions, 'propagateSkipPermissions');
+  if (args.maxConcurrentTasks !== undefined)
+    assertInt(args.maxConcurrentTasks, 'maxConcurrentTasks');
+  validateOptionalVerifyCommand(args.verifyCommand);
   if (args.dockerContainerName !== undefined) {
     assertString(args.dockerContainerName, 'dockerContainerName');
     if (!/^[a-zA-Z0-9_.-]+$/.test(args.dockerContainerName as string)) {
@@ -440,6 +455,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
     assertOptionalBoolean(args.shareDockerAgentAuth, 'shareDockerAgentAuth');
     assertOptionalBoolean(args.attachExisting, 'attachExisting');
     assertOptionalBoolean(args.stepsEnabled, 'stepsEnabled');
+    assertOptionalString(args.envFile, 'envFile');
     if (args.cwd) validatePath(args.cwd, 'cwd');
     if (!args.isShell && args.cwd) {
       try {
@@ -561,12 +577,15 @@ export function registerAllHandlers(win: BrowserWindow): void {
     validateBranchName(args.branchName, 'branchName');
     assertBoolean(args.deleteBranch, 'deleteBranch');
     assertOptionalString(args.taskId, 'taskId');
+    // A verify run still going would keep writing into the worktree being deleted.
+    if (args.taskId) verificationRunner.cancel(args.taskId);
     return deleteTask({
       taskId: args.taskId,
       agentIds: args.agentIds,
       branchName: args.branchName,
       deleteBranch: args.deleteBranch,
       projectRoot: args.projectRoot,
+      worktreePath: optionalWorktreePath(args),
     });
   });
 
@@ -604,10 +623,13 @@ export function registerAllHandlers(win: BrowserWindow): void {
     return getFileDiffFromBranch(projectRoot, branchName, args.filePath, optionalBaseBranch(args));
   });
   ipcMain.handle(IPC.GetGitignoredDirs, (_e, args) => {
-    return getGitIgnoredDirs(projectRootArg(args));
+    return getSymlinkCandidates(projectRootArg(args));
   });
   ipcMain.handle(IPC.ListImportableWorktrees, (_e, args) => {
     return listImportableWorktrees(projectRootArg(args));
+  });
+  ipcMain.handle(IPC.GetBranchWorktreePath, (_e, args) => {
+    return getBranchWorktreePath(projectRootArg(args), branchNameArg(args));
   });
   ipcMain.handle(IPC.GetWorktreeStatus, (_e, args) => {
     const worktreePath = worktreePathArg(args);
@@ -880,6 +902,37 @@ export function registerAllHandlers(win: BrowserWindow): void {
     refreshPrChecksWatcher(args.taskId);
   });
 
+  // --- Local ESLint quality findings ---
+  ipcMain.handle(IPC.GetEslintQualityFindings, (_e, args) => {
+    validatePath(args.worktreePath, 'worktreePath');
+    assertStringArray(args.filePaths, 'filePaths');
+    for (const filePath of args.filePaths) validateRelativePath(filePath, 'filePath');
+    return loadEslintQualityFindings(args.worktreePath, args.filePaths);
+  });
+
+  // --- Project verify command ---
+  ipcMain.handle(IPC.RunTaskVerification, (_e, args) => {
+    assertString(args.taskId, 'taskId');
+    const worktreePath = worktreePathArg(args);
+    validateVerifyCommand(args.command);
+    assertOptionalString(args.branchName, 'branchName');
+    assertString(args.onOutput?.__CHANNEL_ID__, 'channelId');
+    const channel = `channel:${args.onOutput.__CHANNEL_ID__}`;
+    return verificationRunner.start({
+      key: args.taskId,
+      worktreePath,
+      command: args.command,
+      env: buildVerifyEnv({ taskId: args.taskId, branchName: args.branchName, worktreePath }),
+      onOutput: (chunk) => {
+        if (!win.isDestroyed()) win.webContents.send(channel, chunk);
+      },
+    });
+  });
+  ipcMain.handle(IPC.CancelTaskVerification, (_e, args) => {
+    assertString(args.taskId, 'taskId');
+    return verificationRunner.cancel(args.taskId);
+  });
+
   // --- Steps content (one-shot read) ---
   ipcMain.handle(IPC.ReadStepsContent, (_e, args) => {
     validatePath(args.worktreePath, 'worktreePath');
@@ -899,12 +952,14 @@ export function registerAllHandlers(win: BrowserWindow): void {
     validatePath(args.cwd, 'cwd');
     const provider: string | undefined =
       typeof args.provider === 'string' ? args.provider : undefined;
+    assertOptionalString(args.envFile, 'envFile');
     askAboutCode(win, {
       requestId: args.requestId,
       channelId: args.onOutput.__CHANNEL_ID__,
       prompt: args.prompt,
       cwd: args.cwd,
       provider: provider === 'minimax' ? 'minimax' : 'claude',
+      envFile: args.envFile,
     });
   });
 
@@ -1393,6 +1448,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
           projectId: string;
           coordinatorBranch?: string;
           worktreePath?: string;
+          verifyCommand?: string;
         },
       ) => {
         assertString(args.coordinatorTaskId, 'coordinatorTaskId');
@@ -1400,9 +1456,11 @@ export function registerAllHandlers(win: BrowserWindow): void {
         if (args.coordinatorBranch !== undefined) {
           validateBranchName(args.coordinatorBranch, 'coordinatorBranch');
         }
+        validateOptionalVerifyCommand(args.verifyCommand);
         coordinator?.registerCoordinator(args.coordinatorTaskId, args.projectId, {
           branchName: args.coordinatorBranch,
           worktreePath: args.worktreePath,
+          verifyCommand: args.verifyCommand,
         });
       },
     );
@@ -1607,8 +1665,11 @@ export function registerAllHandlers(win: BrowserWindow): void {
         propagateSkipPermissions?: boolean;
         agentCommand?: string;
         agentArgs?: string[];
+        agentEnvFile?: string;
         dockerContainerName?: string;
         dockerImage?: string;
+        maxConcurrentTasks?: number;
+        verifyCommand?: string;
       },
     ) => {
       validateStartMCPServerArgs(args as unknown as Record<string, unknown>);
@@ -1649,6 +1710,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
         branchName: args.coordinatorBranch,
         worktreePath: args.worktreePath,
         skipPermissions: Boolean(args.skipPermissions && args.propagateSkipPermissions),
+        maxConcurrentTasks: args.maxConcurrentTasks,
+        verifyCommand: args.verifyCommand,
       });
 
       // Start remote server if not running
@@ -1764,6 +1827,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         args.agentCommand ?? 'claude',
         args.agentArgs ?? [],
       );
+      coordinator.setCoordinatorAgentEnvFile(args.coordinatorTaskId, args.agentEnvFile);
 
       // In docker mode the coordinator agent auto-discovers .mcp.json in the project root.
       // No host-temp configPath needed.
@@ -1849,6 +1913,9 @@ export function registerAllHandlers(win: BrowserWindow): void {
   });
 
   ipcMain.handle(IPC.GetMCPLogs, () => getMCPLogs());
+
+  ipcMain.handle(IPC.GetClaudeUsage, () => fetchClaudeUsage());
+  ipcMain.handle(IPC.GetCodexUsage, () => fetchCodexUsage());
 
   // --- Forward window events to renderer ---
   win.on('focus', () => {

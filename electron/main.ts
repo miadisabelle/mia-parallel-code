@@ -1,4 +1,5 @@
-import { app, BrowserWindow, ipcMain, session, shell } from 'electron';
+import { app, autoUpdater, BrowserWindow, Menu, ipcMain, session, shell } from 'electron';
+import { buildMenuTemplate } from './menu-template.js';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
@@ -6,9 +7,11 @@ import { execFileSync } from 'child_process';
 import { registerAllHandlers } from './ipc/register.js';
 import { registerLogHandler } from './log.js';
 import { installIpcTracing } from './ipc/trace.js';
+import { startAgentHookRuntime, stopAgentHookRuntime } from './agent-hooks/runtime.js';
 import { killAllAgents } from './ipc/pty.js';
 import { stopAllPlanWatchers } from './ipc/plans.js';
 import { stopAllStepsWatchers } from './ipc/steps.js';
+import { verificationRunner } from './ipc/verify.js';
 import { IPC } from './ipc/channels.js';
 import { resolveUserShell } from './user-shell.js';
 
@@ -79,6 +82,17 @@ function fixEnv(): void {
 
 fixEnv();
 
+// Blink evicts the oldest WebGL context past 16 per renderer process, and every
+// mounted terminal pane holds one — hidden task/tab terminals included. Past 16
+// terminals the oldest panes silently lose their context and degrade to xterm's
+// slower DOM renderer (janky scrolling). 64 covers heavy layouts (~20 tasks ×
+// 3 panes — parallel tasks are the app's premise, so 32 was reachable) while
+// staying bounded: Chromium keeps its cap low because past it GPU drivers tend
+// to crash rather than report out-of-memory, so a huge value trades graceful
+// eviction for GPU-process crashes on weak GPUs. The switch also raises the
+// worker-context limit to the same value (unused — no WebGL in our workers).
+app.commandLine.appendSwitch('max-active-webgl-contexts', '64');
+
 // Verify that preload.cjs ALLOWED_CHANNELS stays in sync with the IPC enum.
 // Logs a warning in dev if they drift — catches mismatches before they hit users.
 //
@@ -114,12 +128,28 @@ if (!app.isPackaged) verifyPreloadAllowlist();
 
 let mainWindow: BrowserWindow | null = null;
 
+// Set only while an update relaunch is genuinely in flight — see the listener
+// in `whenReady` — so `before-quit` can let that one quit through unchallenged.
+let quittingForUpdate = false;
+
 function getIconPath(): string | undefined {
   if (process.platform !== 'linux') return undefined;
   if (app.isPackaged) {
     return path.join(process.resourcesPath, 'icon.png');
   }
   return path.join(__dirname, '..', 'build', 'icon.png');
+}
+
+function setupApplicationMenu(): void {
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate(
+      buildMenuTemplate({
+        platform: process.platform,
+        appName: app.name,
+        onQuit: () => app.quit(),
+      }),
+    ),
+  );
 }
 
 function createWindow() {
@@ -215,10 +245,8 @@ if (!isPrimaryInstance) {
   app.quit();
 } else {
   app.on('second-instance', showMainWindow);
-  // macOS dock click after the window was hidden or closed to background.
-  app.on('activate', showMainWindow);
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     // Grant microphone and clipboard access (deny camera/video)
     session.defaultSession.setPermissionRequestHandler(
       (_webContents, permission, callback, details) => {
@@ -233,15 +261,61 @@ if (!isPrimaryInstance) {
       },
     );
 
+    // electron-updater stages the install, then quits through `app.quit()`.
+    // Vetoing that quit below would leave the update staged with the app still
+    // running, so let it through — the window's own close prompt still asks about
+    // running terminals, and `autoInstallOnAppQuit` re-applies the update on the
+    // next quit if the user backs out. Both platform paths announce the relaunch
+    // on Electron's own updater immediately before quitting (the AppImage updater
+    // emits it by hand, Squirrel natively), so this is set only while a quit is
+    // genuinely in flight — unlike a flag set when the install is *requested*,
+    // which sticks for the whole session on the many paths where
+    // `quitAndInstall()` returns without quitting.
+    autoUpdater.on('before-quit-for-update', () => {
+      quittingForUpdate = true;
+    });
+
+    // Listening before the window exists: a renderer cannot spawn a Claude
+    // agent that misses its hooks. Failure falls back to PTY heuristics.
+    await startAgentHookRuntime(() => mainWindow);
+    setupApplicationMenu();
     createWindow();
   });
 }
 
-app.on('before-quit', () => {
+// A quit reaches `before-quit` *before* any window `close` event, so tearing
+// down agents here destroyed the very terminals the close dialog was about to
+// ask about — and destroyed them even when the user then cancelled the quit.
+// Decide here, tear down in `will-quit`: route the quit through the window so
+// the renderer's close handler owns the "kill / keep alive in background /
+// cancel" decision, and nothing is destroyed until it answers.
+//
+// Consequence worth knowing: with terminals running this vetoes a macOS
+// logout/restart too, the way any app with a confirm-on-quit prompt does.
+app.on('before-quit', (event) => {
+  if (!mainWindow || mainWindow.isDestroyed() || quittingForUpdate) return;
+  event.preventDefault();
+  // The confirmation is a sheet on this window, and show() also focuses — a
+  // quit from the menu while the app sits hidden must not prompt invisibly.
+  mainWindow.show();
+  mainWindow.close();
+});
+
+// Runs only on a quit that got through the check above, so it cannot destroy
+// anything the user still had a chance to cancel.
+app.on('will-quit', () => {
   killAllAgents();
+  // Detached process groups would outlive Electron otherwise.
+  verificationRunner.cancelAll();
+  stopAgentHookRuntime();
   stopAllPlanWatchers();
   stopAllStepsWatchers();
 });
+
+// "Keep them alive in the background" hides the window; without this the dock
+// icon is a dead end and the only way back is attempting to quit. Routed through
+// showMainWindow so a minimized or unfocused window comes back too.
+app.on('activate', showMainWindow);
 
 app.on('window-all-closed', () => {
   app.quit();

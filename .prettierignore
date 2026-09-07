@@ -11,6 +11,8 @@ node_modules/
 .omc/
 .planning/
 .letta/
+.playwright-mcp/
+.coaia/
 CLAUDE.local.md
 package-lock.json
 *.AppImage

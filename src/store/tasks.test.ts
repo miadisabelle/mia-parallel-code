@@ -15,7 +15,7 @@ const core = vi.hoisted(() => ({
         agents: Record<string, unknown>;
         taskOrder: string[];
         collapsedTaskOrder: string[];
-        projects: { id: string; path: string }[];
+        projects: { id: string; path: string; tasksCollapsed?: boolean }[];
         availableAgents: unknown[];
         defaultStepsEnabled: boolean;
       }>
@@ -36,7 +36,8 @@ let mockTasks: Record<string, MockTask> = {};
 let mockAgents: Record<string, unknown> = {};
 let mockTaskOrder: string[] = [];
 let mockCollapsedTaskOrder: string[] = [];
-let mockProjects: { id: string; path: string }[] = [];
+let mockProjects: { id: string; path: string; tasksCollapsed?: boolean }[] = [];
+let mockAgentEnvFiles: Record<string, string> = {};
 const ipcHandlers = new Map<string, (data: unknown) => void>();
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -79,6 +80,12 @@ vi.mock('./core', async () => {
       mockProjects = next;
     },
     availableAgents: [],
+    get agentEnvFiles() {
+      return mockAgentEnvFiles;
+    },
+    set agentEnvFiles(next) {
+      mockAgentEnvFiles = next;
+    },
     get defaultStepsEnabled() {
       return mockDefaultStepsEnabled;
     },
@@ -114,7 +121,17 @@ vi.mock('./completion', () => ({
 vi.mock('../lib/log', () => ({ warn: vi.fn() }));
 vi.mock('../lib/clean-task-name', () => ({ cleanTaskName: vi.fn() }));
 vi.mock('./coordinator-preamble', () => ({ COORDINATOR_PREAMBLE: '' }));
-vi.mock('./sidebar-order', () => ({ getCoordinatorChildren: vi.fn() }));
+vi.mock('./sidebar-order', () => ({
+  getCoordinatorChildren: vi.fn(),
+  computeSidebarDraggableTaskOrder: vi.fn(() =>
+    mockTaskOrder.filter((taskId) => {
+      const projectId = mockTasks[taskId]?.projectId;
+      return !mockProjects.some(
+        (project) => project.id === projectId && project.tasksCollapsed === true,
+      );
+    }),
+  ),
+}));
 vi.mock('../lib/github-url', () => ({
   parseGitHubUrl: vi.fn(),
   taskNameFromGitHubUrl: vi.fn(),
@@ -138,6 +155,7 @@ import {
   collapseTask,
   closeTask,
   mergeTask,
+  pushTask,
   sendPrompt,
   pasteDelayMs,
   markTaskUserActivity,
@@ -150,11 +168,13 @@ import {
   markTaskMcpError,
   retryTaskMcpStartup,
   clearTaskLandingReview,
-  updateTaskBranch,
+  toggleAITerminalLayout,
+  reorderTaskVisually,
   createAgentRecord,
   selectActiveNeighborAfterRemoval,
   setTaskSkipPermissions,
 } from './tasks';
+import { updateTaskBranch } from './task-branch';
 import { getCoordinatorChildren } from './sidebar-order';
 import { recordMergedLines, recordTaskMerged } from './completion';
 import { markAgentSpawned, rescheduleTaskStatusPolling } from './taskStatus';
@@ -236,6 +256,7 @@ beforeEach(() => {
   mockTaskOrder = [];
   mockCollapsedTaskOrder = [];
   mockProjects = [];
+  mockAgentEnvFiles = {};
   mockDefaultStepsEnabled = false;
   mockInvoke.mockResolvedValue(undefined);
   mockSaveState.mockResolvedValue(undefined);
@@ -267,6 +288,43 @@ describe('updateTaskBranch', () => {
     updateTaskBranch('task-1', 'task/same');
 
     expect(mockTasks['task-1'].prUrl).toBe('https://github.com/acme/app/pull/12');
+  });
+});
+
+describe('reorderTaskVisually', () => {
+  it('uses only expanded project tasks when resolving a visible drop index', () => {
+    mockProjects = [
+      { id: 'project-hidden', path: '/hidden', tasksCollapsed: true },
+      { id: 'project-visible', path: '/visible' },
+    ];
+    mockTasks = {
+      hidden: { projectId: 'project-hidden', agentIds: [], shellAgentIds: [] },
+      first: { projectId: 'project-visible', agentIds: [], shellAgentIds: [] },
+      second: { projectId: 'project-visible', agentIds: [], shellAgentIds: [] },
+    };
+    mockTaskOrder = ['hidden', 'first', 'second'];
+    vi.mocked(getCoordinatorChildren).mockReturnValue({ active: [], collapsed: [] });
+
+    reorderTaskVisually('first', 1);
+
+    expect(mockTaskOrder).toEqual(['hidden', 'second', 'first']);
+  });
+});
+
+describe('toggleAITerminalLayout', () => {
+  it('flips an unset (split) layout to tabs and back', () => {
+    mockTasks['task-1'] = { agentIds: ['a', 'b'], shellAgentIds: [] };
+
+    toggleAITerminalLayout('task-1');
+    expect(mockTasks['task-1'].aiTerminalLayout).toBe('tabs');
+
+    toggleAITerminalLayout('task-1');
+    expect(mockTasks['task-1'].aiTerminalLayout).toBe('split');
+  });
+
+  it('is a no-op for an unknown task', () => {
+    toggleAITerminalLayout('missing');
+    expect(mockTasks['missing']).toBeUndefined();
   });
 });
 
@@ -866,6 +924,33 @@ describe('createTask coordinator base branch prompt', () => {
       expect.objectContaining({ coordinatorBranch: 'task/coordinator-work' }),
     );
   });
+
+  it('sends the agent env file so coordinator sub-tasks inherit its credentials', async () => {
+    mockAgentEnvFiles = { 'agent-def': '~/.config/parallel-code/claude.env' };
+
+    await createTask({
+      name: 'Coordinator',
+      agentDef: {
+        id: 'agent-def',
+        name: 'Claude',
+        command: 'claude',
+        args: [],
+        resume_args: [],
+        skip_permissions_args: [],
+        description: 'Claude',
+      },
+      projectId: 'proj-1',
+      gitIsolation: 'worktree',
+      baseBranch: 'main',
+      initialPrompt: 'Pick a task',
+      coordinatorMode: true,
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith(
+      IPC.StartMCPServer,
+      expect.objectContaining({ agentEnvFile: '~/.config/parallel-code/claude.env' }),
+    );
+  });
 });
 
 // ─── createTask stepsEnabled default regression ────────────────────────────────
@@ -1356,6 +1441,37 @@ describe('MCP_TaskStateSync listener', () => {
     expect(mockTasks['task-1'].mcpStartupError).toBeUndefined();
   });
 
+  it('replaces the verification run outright and clears it on null', () => {
+    const base = {
+      command: 'npm test',
+      exitCode: null,
+      headSha: null,
+      dirty: false,
+      startedAt: '2026-09-03T10:00:00Z',
+      finishedAt: '2026-09-03T10:10:00Z',
+      outputTail: '',
+    };
+    taskStateSyncHandler({
+      taskId: 'task-1',
+      verificationRun: { ...base, status: 'timed_out', message: 'Timed out after 10 min.' },
+    });
+    expect(mockTasks['task-1'].verificationRun).toMatchObject({
+      status: 'timed_out',
+      message: 'Timed out after 10 min.',
+    });
+
+    // The next run arrives without a message key; it must not inherit the old one.
+    taskStateSyncHandler({
+      taskId: 'task-1',
+      verificationRun: { ...base, status: 'passed', exitCode: 0 },
+    });
+    expect(mockTasks['task-1'].verificationRun).toMatchObject({ status: 'passed' });
+    expect((mockTasks['task-1'].verificationRun as { message?: string }).message).toBeUndefined();
+
+    taskStateSyncHandler({ taskId: 'task-1', verificationRun: null });
+    expect(mockTasks['task-1'].verificationRun).toBeUndefined();
+  });
+
   it('stores automation write lock sync fields', () => {
     taskStateSyncHandler({
       taskId: 'task-1',
@@ -1461,5 +1577,77 @@ describe('setTaskSkipPermissions', () => {
   it('is a no-op for an unknown task', () => {
     expect(() => setTaskSkipPermissions('nonexistent', true)).not.toThrow();
     expect(mockSaveState).not.toHaveBeenCalled();
+  });
+});
+
+describe('mergeTask / pushTask preconditions', () => {
+  beforeEach(() => {
+    const harness = expectDefined(core.harness, 'mock store harness');
+    harness.reset(harness.state());
+    mockInvoke.mockReset();
+    vi.mocked(getProjectPath).mockReset();
+  });
+
+  it('mergeTask throws instead of silently returning for a missing task', async () => {
+    await expect(mergeTask('nope')).rejects.toThrow('Task no longer exists');
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it('mergeTask refuses a task that is being closed', async () => {
+    mockTasks['task-1'] = {
+      agentIds: [],
+      shellAgentIds: [],
+      gitIsolation: 'worktree',
+      closingStatus: 'removing',
+      projectId: 'proj-1',
+    };
+    await expect(mergeTask('task-1')).rejects.toThrow('being closed');
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it('mergeTask refuses direct-mode tasks with a reason', async () => {
+    mockTasks['task-1'] = {
+      agentIds: [],
+      shellAgentIds: [],
+      gitIsolation: 'direct',
+      projectId: 'proj-1',
+    };
+    await expect(mergeTask('task-1')).rejects.toThrow('worktree');
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it('mergeTask reports a missing project folder', async () => {
+    mockTasks['task-1'] = {
+      agentIds: [],
+      shellAgentIds: [],
+      gitIsolation: 'worktree',
+      projectId: 'proj-gone',
+    };
+    vi.mocked(getProjectPath).mockReturnValue(undefined);
+    await expect(mergeTask('task-1')).rejects.toThrow('Project folder not found');
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  it('pushTask throws for a missing task, a direct-mode task, and a missing project', async () => {
+    const channel = { onmessage: undefined } as unknown as Parameters<typeof pushTask>[1];
+    await expect(pushTask('nope', channel)).rejects.toThrow('Task no longer exists');
+
+    mockTasks['task-1'] = {
+      agentIds: [],
+      shellAgentIds: [],
+      gitIsolation: 'direct',
+      projectId: 'p',
+    };
+    await expect(pushTask('task-1', channel)).rejects.toThrow('worktree');
+
+    mockTasks['task-2'] = {
+      agentIds: [],
+      shellAgentIds: [],
+      gitIsolation: 'worktree',
+      projectId: 'p',
+    };
+    vi.mocked(getProjectPath).mockReturnValue(undefined);
+    await expect(pushTask('task-2', channel)).rejects.toThrow('Project folder not found');
+    expect(mockInvoke).not.toHaveBeenCalled();
   });
 });
