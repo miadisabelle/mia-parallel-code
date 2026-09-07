@@ -112,8 +112,8 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "johannesjo",
-        "repo": "parallel-code"
+        "owner": "miadisabelle",
+        "repo": "mia-parallel-code"
       }
     ],
     "files": [
