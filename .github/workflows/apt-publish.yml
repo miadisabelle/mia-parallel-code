@@ -1,0 +1,43 @@
+name: Publish to apt repository
+
+# Runs when a release is published, whether it came from the draft that
+# release.yml creates or straight from scripts/release-github.sh. The .deb is
+# not rebuilt here: the release asset is the file the apt repository points at.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v1.16.1)
+        required: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install apt-ftparchive
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils
+
+      - name: Import repository signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
+
+      - name: Download the release .deb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir dist-deb
+
+      - name: Publish
+        env:
+          APT_PUBLISH_TOKEN: ${{ secrets.APT_PUBLISH_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          deb=$(ls dist-deb/*.deb)
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/$(basename "$deb")"
+          bash scripts/apt-publish.sh "$deb" "$url"
