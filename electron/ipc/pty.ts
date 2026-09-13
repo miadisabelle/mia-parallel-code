@@ -579,6 +579,24 @@ export function spawnAgent(win: BrowserWindow, args: SpawnAgentArgs): void {
 
   const spawnSpec = buildPtySpawnSpec({ ...args, args: launchArgs }, command, cwd, spawnEnv);
 
+  if (spawnSpec.containerName) {
+    // The container name comes from the persisted agent id, so a restore after
+    // a crash reuses it — and `--rm` only removes a container when its own
+    // process exits, not when the app that started it dies. A leftover under
+    // this name makes `docker run` fail with a name conflict, and the restored
+    // agent never starts. Clear it first; a missing name is the common case
+    // and costs one round-trip.
+    try {
+      execFileSync('docker', ['rm', '-f', spawnSpec.containerName], {
+        timeout: 5000,
+        stdio: 'pipe',
+      });
+    } catch {
+      // Nothing under that name, or docker is unreachable — the spawn below
+      // reports the latter on its own.
+    }
+  }
+
   logDebug('pty', `spawn command ${args.agentId}`, {
     taskId: args.taskId,
     command: spawnSpec.spawnCommand,
