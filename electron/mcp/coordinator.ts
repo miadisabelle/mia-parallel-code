@@ -32,7 +32,7 @@ import { truncateDiffForTool } from './diff-format.js';
 const execAsync = promisify(execFile);
 import type { BrowserWindow } from 'electron';
 import { createTask as createBackendTask, deleteTask } from '../ipc/tasks.js';
-import { getSkipPermissionsArgs } from '../ipc/agents.js';
+import { getSkipPermissionsArgs } from '../shared/skip-permissions.js';
 import {
   spawnAgent,
   writeToAgent,
@@ -1117,7 +1117,7 @@ export class Coordinator {
       // sub-task container, rather than killing processes inside the coordinator).
       const channelId = randomUUID();
 
-      spawnAgent(this.win, {
+      await spawnAgent(this.win, {
         taskId: task.id,
         agentId,
         command: agentCommand,

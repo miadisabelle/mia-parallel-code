@@ -22,6 +22,14 @@ describe('autosave snapshot includes new-task-default fields', () => {
     setStore('defaultSkipPermissions', false);
   });
 
+  it('canvasOwnershipBadges changes the snapshot', () => {
+    setStore('canvasOwnershipBadges', true);
+    const before = persistedSnapshot();
+    setStore('canvasOwnershipBadges', false);
+    expect(persistedSnapshot()).not.toBe(before);
+    setStore('canvasOwnershipBadges', true);
+  });
+
   it('defaultPropagateSkipPermissions changes the snapshot', () => {
     setStore('defaultPropagateSkipPermissions', false);
     const before = persistedSnapshot();
@@ -111,4 +119,37 @@ describe('autosave snapshot includes new-task-default fields', () => {
       setStore('tasks', taskId, undefined as unknown as Task);
     }
   });
+
+  it.each(['promptDraft', 'browserUrl', 'promptHistory'] as const)(
+    '%s changes the snapshot',
+    (field) => {
+      const taskId = 'autosave-draft-task';
+      const task: Task = {
+        id: taskId,
+        name: taskId,
+        projectId: 'p1',
+        branchName: 'feature/draft',
+        worktreePath: '/tmp/autosave-draft-task',
+        agentIds: [],
+        shellAgentIds: [],
+        notes: '',
+        lastPrompt: '',
+        gitIsolation: 'worktree',
+      };
+      setStore('tasks', taskId, task);
+      setStore('taskOrder', (order) => [...order, taskId]);
+      try {
+        const before = persistedSnapshot();
+        if (field === 'promptHistory') {
+          setStore('tasks', taskId, 'promptHistory', [{ text: 'Repeated prompt', sentAt: 1 }]);
+        } else {
+          setStore('tasks', taskId, field, 'changed persisted value');
+        }
+        expect(persistedSnapshot()).not.toBe(before);
+      } finally {
+        setStore('taskOrder', (order) => order.filter((id) => id !== taskId));
+        setStore('tasks', taskId, undefined as unknown as Task);
+      }
+    },
+  );
 });

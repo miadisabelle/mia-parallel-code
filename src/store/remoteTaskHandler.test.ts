@@ -1,7 +1,7 @@
 /* eslint-disable solid/reactivity -- these tests read the store proxy synchronously to exercise isKnownTask; no reactive tracking is involved. */
 import { describe, it, expect } from 'vitest';
 import { createStore } from 'solid-js/store';
-import { isKnownTask, remoteTaskSkipPermissions } from './remoteTaskHandler';
+import { isKnownTask, remoteSkipPermissions } from './remoteTaskHandler';
 
 // Guards the prototype-pollution fix: a mobile HTTP request supplies the task
 // id, and Solid's store proxy resolves inherited keys to prototype objects.
@@ -41,34 +41,30 @@ describe('isKnownTask', () => {
   });
 });
 
-// #7: handleCreateTask never passed skipPermissions, so every task created from
-// a phone launched its agent without --dangerously-skip-permissions even though
-// the profile defaulted the flag ON — the desktop dialog honoured the default
-// and the remote path did not.
-describe('remoteTaskSkipPermissions', () => {
+// handleCreateTask never passed skipPermissions at all, so a task created from
+// a paired phone launched bare no matter what the setting said. The decision
+// mirrors the New Task dialog: the stored default, but only for an agent that
+// actually takes such a flag.
+describe('remoteSkipPermissions', () => {
   const claude = { command: 'claude', skip_permissions_args: ['--dangerously-skip-permissions'] };
 
-  it('adopts the profile default for an agent that supports the flag', () => {
-    expect(remoteTaskSkipPermissions(claude, true)).toBe(true);
+  it('opts in when the setting is on and the agent takes the flag', () => {
+    expect(remoteSkipPermissions(true, claude)).toBe(true);
   });
 
-  it('honours an explicit opt-out', () => {
-    expect(remoteTaskSkipPermissions(claude, false)).toBe(false);
+  it('stays off when the setting is off', () => {
+    expect(remoteSkipPermissions(false, claude)).toBe(false);
   });
 
-  it('adopts the default for a def restored without its skip args', () => {
-    expect(remoteTaskSkipPermissions({ command: 'claude', skip_permissions_args: [] }, true)).toBe(
+  it('stays off for an agent that takes no such flag, even with the setting on', () => {
+    expect(remoteSkipPermissions(true, { command: 'opencode' })).toBe(false);
+  });
+
+  // The same degraded def the desktop paths have to cope with.
+  it('opts in for a def that carries no flags but whose command takes one', () => {
+    expect(remoteSkipPermissions(true, { command: 'claude', skip_permissions_args: [] })).toBe(
       true,
     );
-  });
-
-  it('stays off for an agent that has no skip-permissions flag', () => {
-    expect(
-      remoteTaskSkipPermissions({ command: 'opencode', skip_permissions_args: [] }, true),
-    ).toBe(false);
-  });
-
-  it('stays off for an unknown agent command', () => {
-    expect(remoteTaskSkipPermissions({ command: 'mystery-agent' }, true)).toBe(false);
+    expect(remoteSkipPermissions(true, { command: '/opt/homebrew/bin/claude' })).toBe(true);
   });
 });

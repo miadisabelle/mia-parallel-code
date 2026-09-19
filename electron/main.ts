@@ -1,15 +1,20 @@
+import { registerBrowserHandlers } from './ipc/browser.js';
+import { registerChatScheme, registerChatProtocol } from './chat/protocol.js';
 import { app, autoUpdater, BrowserWindow, Menu, ipcMain, session, shell } from 'electron';
 import { buildMenuTemplate } from './menu-template.js';
+import { restoreWindow } from './window-restore.js';
 import path from 'path';
 import fs from 'fs';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { execFileSync } from 'child_process';
 import { registerAllHandlers } from './ipc/register.js';
 import { registerLogHandler } from './log.js';
 import { installIpcTracing } from './ipc/trace.js';
 import { startAgentHookRuntime, stopAgentHookRuntime } from './agent-hooks/runtime.js';
 import { killAllAgents } from './ipc/pty.js';
+import { removeAllCanvasConfigs } from './mcp/canvas-config.js';
 import { stopAllPlanWatchers } from './ipc/plans.js';
+import { stopAllDocumentWork } from './documents/register.js';
 import { stopAllStepsWatchers } from './ipc/steps.js';
 import { verificationRunner } from './ipc/verify.js';
 import { IPC } from './ipc/channels.js';
@@ -17,6 +22,7 @@ import { resolveUserShell } from './user-shell.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+registerChatScheme();
 
 // When launched from a .desktop file (e.g. AppImage), the environment is
 // minimal — often just PATH=/usr/bin:/bin. Resolve the user's full
@@ -80,7 +86,28 @@ function fixEnv(): void {
   }
 }
 
-fixEnv();
+// One running copy per profile, and the lock is taken here rather than beside the
+// window wiring because Electron's guidance is to take it as early as possible and
+// this file gives that guidance teeth: fixEnv() above spawns an interactive login
+// shell, which on a normal rc file (nvm, conda, compinit) costs on the order of half
+// a second. A second launch is going to quit — spending that first would put the
+// delay squarely on the icon-relaunch path the lock exists to make instant.
+//
+// Dev runs skip the lock deliberately, so `npm run dev` still starts while an
+// installed build is running.
+const singleInstanceLockHeld = app.isPackaged && app.requestSingleInstanceLock();
+// Two questions, two names: whether this process holds the lock, and whether it
+// should boot at all. A dev run answers no to the first and yes to the second,
+// which is why one flag covering both would be wrong under either name.
+const shouldStartApp = !app.isPackaged || singleInstanceLockHeld;
+
+if (!shouldStartApp) {
+  app.quit();
+} else {
+  // Only the primary instance ever spawns a PTY, so it is the only one that needs
+  // the resolved login-shell environment.
+  fixEnv();
+}
 
 // Blink evicts the oldest WebGL context past 16 per renderer process, and every
 // mounted terminal pane holds one — hidden task/tab terminals included. Past 16
@@ -173,6 +200,8 @@ function createWindow() {
   registerLogHandler(ipcMain);
   installIpcTracing(ipcMain);
   registerAllHandlers(mainWindow);
+  registerChatProtocol(mainWindow);
+  registerBrowserHandlers(mainWindow);
 
   // Open links in external browser instead of inside Electron
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -192,9 +221,13 @@ function createWindow() {
     // Malformed dev URL — skip origin allowlist
   }
 
+  // The app's own page, and nothing else on the disk: a document's markup is
+  // rendered in this window, and a navigation away from index.html would hand
+  // the preload's IPC surface to whatever it landed on.
+  const appPage = pathToFileURL(path.join(__dirname, '../dist/index.html')).href;
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (allowedOrigin && url.startsWith(allowedOrigin)) return;
-    if (url.startsWith('file://')) return;
+    if (url.split(/[?#]/)[0] === appPage) return;
     event.preventDefault();
     if (url.startsWith('http:') || url.startsWith('https:')) {
       shell
@@ -226,25 +259,17 @@ function createWindow() {
   });
 }
 
-// A window hidden by "Keep in Background" must stay recoverable. Without the
-// single-instance lock, relaunching the app started a SECOND process that
-// respawned every persisted session on top of the hidden one still holding the
-// live PTYs — and the hidden window itself could never be brought back. The
-// first instance owns the profile; a second launch just re-shows its window.
-// Dev runs skip the lock so `npm run dev` can coexist with an installed build.
-const isPrimaryInstance = !app.isPackaged || app.requestSingleInstanceLock();
-
-function showMainWindow(): void {
-  if (!mainWindow) return;
-  if (!mainWindow.isVisible()) mainWindow.show();
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.focus();
-}
-
-if (!isPrimaryInstance) {
-  app.quit();
-} else {
-  app.on('second-instance', showMainWindow);
+// Why the lock matters here: "Keep them alive in the background" hides the window
+// instead of closing it, so a user who launches the app again is asking for the
+// window they already have. Without the lock a second process starts, restores
+// every persisted session from the same state file, and spawns a duplicate agent
+// for each one — on top of the PTYs the hidden instance is still holding. The
+// hidden window has no way back either, because nothing is listening for the
+// launch. With the lock, a second launch becomes "show the window".
+if (shouldStartApp) {
+  // A second launch (icon, CLI, file manager) reaches the instance that owns
+  // the lock as this event instead of starting a process of its own.
+  app.on('second-instance', () => restoreWindow(mainWindow));
 
   app.whenReady().then(async () => {
     // Grant microphone and clipboard access (deny camera/video)
@@ -295,27 +320,43 @@ if (!isPrimaryInstance) {
 app.on('before-quit', (event) => {
   if (!mainWindow || mainWindow.isDestroyed() || quittingForUpdate) return;
   event.preventDefault();
-  // The confirmation is a sheet on this window, and show() also focuses — a
-  // quit from the menu while the app sits hidden must not prompt invisibly.
-  mainWindow.show();
+  // The confirmation is a sheet on this window — a quit from the menu while the
+  // app sits hidden or minimized must not prompt somewhere the user cannot see.
+  restoreWindow(mainWindow);
   mainWindow.close();
 });
 
 // Runs only on a quit that got through the check above, so it cannot destroy
 // anything the user still had a chance to cancel.
 app.on('will-quit', () => {
+  // Hand the lock over before the blocking teardown below, not at process exit.
+  // electron-updater's AppImage path spawns the replacement *before* quitting
+  // (`doInstall` → `spawnLog(destination)`, then `setImmediate(() =>
+  // app.quit())`), so the incoming process is already booting while this one is
+  // still killing agents — and `killAllAgents()` blocks on a `docker kill` per
+  // session. Holding the lock through that can make the replacement fail it and
+  // quit: update applied, app never reappears. Releasing here also covers the
+  // plain case, where someone relaunching during a slow shutdown would
+  // otherwise be handed a window that is already going away.
+  //
+  // `will-quit` only runs on a quit that got past the veto above, so a
+  // cancelled quit correctly keeps the lock. A no-op when none is held.
+  app.releaseSingleInstanceLock();
   killAllAgents();
+  // Killed agents may not report exit before the process ends; drop their credential files now.
+  removeAllCanvasConfigs();
   // Detached process groups would outlive Electron otherwise.
   verificationRunner.cancelAll();
   stopAgentHookRuntime();
   stopAllPlanWatchers();
+  stopAllDocumentWork();
   stopAllStepsWatchers();
 });
 
 // "Keep them alive in the background" hides the window; without this the dock
-// icon is a dead end and the only way back is attempting to quit. Routed through
-// showMainWindow so a minimized or unfocused window comes back too.
-app.on('activate', showMainWindow);
+// icon is a dead end and the only way back is attempting to quit. `show()` alone
+// left a minimized or buried window where it was — see restoreWindow.
+app.on('activate', () => restoreWindow(mainWindow));
 
 app.on('window-all-closed', () => {
   app.quit();

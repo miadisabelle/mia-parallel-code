@@ -12,20 +12,18 @@ module.exports = {
         path: '^electron/',
         // Allow importing pure shared modules with no Node/Electron deps:
         //   - electron/ipc/channels.ts — IPC channel enum
-        //   - electron/ipc/agent-defaults.ts — built-in agent table + skip-permissions resolver;
-        //     both processes must resolve an agent's flags identically, and the renderer decides
-        //     launch args synchronously (no IPC round-trip available at spawn time)
         //   - electron/mcp/prompt-detect.ts — regex-only prompt detector reused by the renderer task-status pipeline
         //   - electron/mcp/validation.ts — string-only branch/UUID validators; the renderer
         //     shares them so it never offers a branch the IPC layer would reject
         //   - electron/shared/ — renderer-safe constants/pure helpers (no Node/Electron imports)
+        //   - electron/documents/shared.ts — agent ids/labels the document workspace shows
         pathNot: [
           '^electron/ipc/channels\\.ts',
-          '^electron/ipc/agent-defaults\\.ts',
           '^electron/mcp/prompt-detect\\.ts',
           '^electron/mcp/validation\\.ts',
           '^electron/agent-hooks/status\\.ts',
           '^electron/shared/',
+          '^electron/documents/shared\\.ts',
         ],
       },
     },

@@ -1,12 +1,32 @@
+import { restoreCanvasTaskLinks } from '../lib/canvas-task-links';
+import { restoreMindMap } from '../graph/model';
 import { produce } from 'solid-js/store';
 import { invoke } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
+import { isChatPermissionMode, restoreChatSessions } from '../../electron/shared/agent-chat-types';
+import { isSessionId } from '../../electron/shared/session-record';
 import { store, setStore } from './core';
 import { startRemoteAccess } from './remote';
 import { effectiveAgentId } from './agent-select';
 import { randomPastelColor } from './projects';
 import { markAgentSpawned } from './taskStatus';
 import { clampCoordinatorConcurrentTasks } from '../lib/coordinator-limits';
+import { MAX_PROMPT_HISTORY } from '../lib/prompt-history';
+import { normalizeReasoningProfile } from '../investigation/profiles';
+import { restoreReasoningWorkspaces } from '../investigation/editing';
+
+/** A map that fails validation is kept aside rather than crashing load or being overwritten
+ *  by the next save; the user is told once. */
+function restoreTaskMindMap(
+  pt: PersistedTask,
+  unreadable: string[],
+): Pick<Task, 'mindMap' | 'mindMapUnreadable'> {
+  if (pt.mindMap === undefined || pt.mindMap === null) return {};
+  const document = restoreMindMap(pt.mindMap);
+  if (document) return { mindMap: document };
+  unreadable.push(pt.name || 'a task');
+  return { mindMapUnreadable: pt.mindMap };
+}
 
 // Hand-edited state files may hold anything; the IPC layer rejects non-integers.
 function restoredMaxConcurrentTasks(value: unknown): number | undefined {
@@ -24,12 +44,30 @@ import type {
 import type { AgentDef } from '../ipc/types';
 import { inferDockerSource } from '../lib/docker';
 import { DEFAULT_TERMINAL_FONT } from '../lib/fonts';
-import { isLookPreset } from '../lib/look';
+import { defaultPresetForTone, isLookPreset } from '../lib/look';
 import { validateCustomTheme, parseThemeCss, themeToCss } from '../lib/custom-theme';
 import type { CustomTheme } from '../lib/custom-theme';
 import { syncTerminalCounter } from './terminals';
 import { showNotification, NOTIFICATION_ERROR_MS } from './notification';
-import { errMessage } from '../lib/log';
+import { errMessage, warn as logWarn } from '../lib/log';
+import { canvasTabKey } from '../lib/canvas-tabs';
+import { documentAgentTaskIds } from '../documents/task-id';
+
+function restoredCodexHandoff(value: unknown): Task['codexChatHandoff'] {
+  if (!value || typeof value !== 'object') return;
+  const session = value as Record<string, unknown>;
+  if (
+    typeof session.threadId !== 'string' ||
+    !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(session.threadId)
+  )
+    return;
+  return {
+    threadId: session.threadId,
+    model: typeof session.model === 'string' ? session.model : undefined,
+    reasoningEffort:
+      typeof session.reasoningEffort === 'string' ? session.reasoningEffort : undefined,
+  };
+}
 
 const RESTORED_AGENT_SPAWN_STAGGER_MS = 1_000;
 
@@ -100,12 +138,58 @@ function restoredPromptedAgentIds(pt: PersistedTask, agentIds: string[]): string
   return valid.length > 0 ? valid : undefined;
 }
 
+/**
+ * Session ids for the panes that actually came back.
+ *
+ * `restoredAgentIds` mints a replacement when a persisted agent id is missing
+ * or already taken, and an entry left keyed to the old id would attach that
+ * session to whichever pane later reused it. Dropping those costs the pane its
+ * exact resume and returns it to the positional default — the safe direction.
+ */
+function restoredAgentSessionIds(
+  pt: PersistedTask,
+  agentIds: string[],
+): Record<string, string> | undefined {
+  const raw: unknown = pt.agentSessionIds;
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const restored: Record<string, string> = {};
+  for (const agentId of agentIds) {
+    // Shape-checked, not merely non-empty: the profile is a file on disk and
+    // these ids end up as arguments to a spawned CLI.
+    const sessionId = (raw as Record<string, unknown>)[agentId];
+    if (isSessionId(sessionId)) restored[agentId] = sessionId;
+  }
+  return Object.keys(restored).length > 0 ? restored : undefined;
+}
+
 function validPromptedAgentIndexes(value: unknown): number[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const valid = value.filter(
     (index): index is number => Number.isInteger(index) && index >= 0 && index < 100,
   );
   return valid.length > 0 ? valid : undefined;
+}
+
+function restoredPromptHistory(value: unknown): Task['promptHistory'] {
+  if (!Array.isArray(value)) return undefined;
+  // Drop the malformed entries before capping, so junk at the tail of an old save cannot
+  // push out prompts the user can still read.
+  const entries = value.flatMap((entry: unknown) => {
+    if (!entry || typeof entry !== 'object' || !('text' in entry)) return [];
+    if (typeof entry.text !== 'string' || !entry.text.trim()) return [];
+    return [
+      {
+        text: entry.text,
+        sentAt:
+          'sentAt' in entry && typeof entry.sentAt === 'number' && Number.isFinite(entry.sentAt)
+            ? entry.sentAt
+            : undefined,
+        agentName:
+          'agentName' in entry && typeof entry.agentName === 'string' ? entry.agentName : undefined,
+      },
+    ];
+  });
+  return entries.slice(-MAX_PROMPT_HISTORY);
 }
 
 function validAgentId(value: unknown, agentIds: string[]): string | undefined {
@@ -121,6 +205,25 @@ function validAgentIndex(value: unknown): number | undefined {
 /** Branch names restored from JSON: only non-empty strings. `exclude` drops a
  *  value that would be nonsensical (e.g. an adopted-from equal to the branch
  *  itself, which would render an "adopted 'X' (was 'X')" banner). */
+/** The canvas tabs of a persisted task; a pre-tabs `canvasPath` becomes one tab. */
+function restoredCanvas(pt: PersistedTask): Pick<Task, 'canvasTabs' | 'canvasActiveTab'> {
+  const tabs = Array.isArray(pt.canvasTabs)
+    ? pt.canvasTabs.filter(
+        (t) =>
+          t?.kind === 'mindmap' ||
+          t?.kind === 'reasoning' ||
+          (t?.kind === 'markdown' && typeof t.path === 'string') ||
+          (t?.kind === 'browser' && t.path === 'preview'),
+      )
+    : typeof pt.canvasPath === 'string'
+      ? [{ kind: 'markdown' as const, path: pt.canvasPath }]
+      : [];
+  if (tabs.length === 0) return {};
+  const keys = tabs.map(canvasTabKey);
+  const active = keys.includes(pt.canvasActiveTab ?? '') ? pt.canvasActiveTab : keys[0];
+  return { canvasTabs: tabs, canvasActiveTab: active };
+}
+
 function validBranch(value: unknown, exclude?: string): string | undefined {
   return typeof value === 'string' && value.length > 0 && value !== exclude ? value : undefined;
 }
@@ -139,15 +242,24 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     branchName: task.branchName,
     worktreePath: task.worktreePath,
     notes: task.notes,
+    promptDraft: task.promptDraft,
     lastPrompt: task.lastPrompt,
+    promptHistory: task.promptHistory,
     promptedAgentIds: task.promptedAgentIds,
     initialPrompt: task.initialPrompt,
     shellCount: task.shellAgentIds.length,
     agentDef: agentDefs[0] ?? null,
     agentDefs: agentDefs.length > 1 ? agentDefs : undefined,
     agentIds: task.agentIds.length > 0 ? [...task.agentIds] : undefined,
+    agentSessionIds: task.agentSessionIds,
     selectedAgentId: task.selectedAgentId,
     aiTerminalLayout: task.aiTerminalLayout,
+    mainAgentView: task.mainAgentView,
+    codexChatThreadId: task.codexChatThreadId,
+    codexChatHandoff: task.codexChatHandoff,
+    claudeChatSessionId: task.claudeChatSessionId,
+    chatSessions: task.chatSessions,
+    chatPermissionMode: task.chatPermissionMode,
     gitIsolation: task.gitIsolation,
     baseBranch: task.baseBranch,
     externalWorktree: task.externalWorktree,
@@ -159,8 +271,16 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     prUrl: task.prUrl,
     savedInitialPrompt: task.savedInitialPrompt,
     savedSelectedAgentIndex: task.savedSelectedAgentIndex,
+    savedAgentSessionIds: task.savedAgentSessionIds,
     savedPromptedAgentIndexes: task.savedPromptedAgentIndexes,
     planFileName: task.planFileName,
+    canvasTabs: task.canvasTabs,
+    canvasActiveTab: task.canvasActiveTab,
+    browserUrl: task.browserUrl,
+    canvasTaskLinks: task.canvasTaskLinks,
+    mindMap: task.mindMap ?? task.mindMapUnreadable,
+    reasoningProfile: task.reasoningProfile,
+    reasoningWorkspaces: task.reasoningWorkspaces,
     stepsEnabled: task.stepsEnabled,
     branchAdoptedFrom: task.branchAdoptedFrom,
     branchOfferDismissed: task.branchOfferDismissed,
@@ -243,20 +363,25 @@ export async function saveState(): Promise<void> {
     lightThemePreset:
       store.lightThemePreset !== 'islands-light' ? store.lightThemePreset : undefined,
     lightThemeCustomId: store.lightThemeCustomId ?? undefined,
-    darkThemePreset: store.darkThemePreset !== 'islands-dark' ? store.darkThemePreset : undefined,
+    darkThemePreset: store.darkThemePreset,
     darkThemeCustomId: store.darkThemeCustomId ?? undefined,
     coordinatorModeEnabled: store.coordinatorModeEnabled || undefined,
+    documentWorkspacesEnabled: store.documentWorkspacesEnabled || undefined,
+    documentFullWidth: store.documentFullWidth || undefined,
     coordinatorControlHintDismissed: store.coordinatorControlHintDismissed || undefined,
     defaultStepsEnabled: store.defaultStepsEnabled || undefined,
     // Fork direction: these default ON, so an explicit `false` (opt-out) must be
     // written, not collapsed to `undefined` — load reads an absent value as the default.
     defaultSkipPermissions: store.defaultSkipPermissions,
     defaultPropagateSkipPermissions: store.defaultPropagateSkipPermissions,
+    // Default on: only an explicit opt-out is stored.
+    canvasOwnershipBadges: store.canvasOwnershipBadges ? undefined : false,
     autoStartRemoteAccess: store.autoStartRemoteAccess || undefined,
     autoResumeSessions: store.autoResumeSessions || undefined,
   };
 
-  for (const taskId of store.taskOrder) {
+  const documentTaskIds = documentAgentTaskIds(store.projects);
+  for (const taskId of new Set([...store.taskOrder, ...documentTaskIds])) {
     const task = store.tasks[taskId];
     if (!task) continue;
 
@@ -436,10 +561,13 @@ interface LegacyPersistedState {
   darkThemePreset?: unknown;
   darkThemeCustomId?: unknown;
   coordinatorModeEnabled?: unknown;
+  documentWorkspacesEnabled?: unknown;
+  documentFullWidth?: unknown;
   coordinatorControlHintDismissed?: unknown;
   defaultStepsEnabled?: unknown;
   defaultSkipPermissions?: unknown;
   defaultPropagateSkipPermissions?: unknown;
+  canvasOwnershipBadges?: unknown;
   autoStartRemoteAccess?: unknown;
   autoResumeSessions?: unknown;
 }
@@ -508,6 +636,7 @@ export async function loadState(): Promise<void> {
   }
 
   const restoredRunningAgentIds: string[] = [];
+  const unreadableMindMaps: string[] = [];
   const usedRestoredAgentIds = new Set<string>();
   const today = getLocalDateKey();
 
@@ -621,7 +750,13 @@ export async function loadState(): Promise<void> {
         savedMode === 'light' || savedMode === 'dark' || savedMode === 'system'
           ? savedMode
           : 'dark';
-      s.darkThemePreset = isLookPreset(raw.darkThemePreset) ? raw.darkThemePreset : 'islands-dark';
+      // Older saves omitted the Islands Dark slot. Preserve that preference;
+      // new saves write the slot explicitly so future defaults can change safely.
+      s.darkThemePreset = isLookPreset(raw.darkThemePreset)
+        ? raw.darkThemePreset
+        : raw.darkThemePreset === undefined && savedMode
+          ? 'islands-dark'
+          : defaultPresetForTone('dark');
       s.lightThemePreset = isLookPreset(raw.lightThemePreset)
         ? raw.lightThemePreset
         : 'islands-light';
@@ -647,6 +782,8 @@ export async function loadState(): Promise<void> {
       }
 
       s.coordinatorModeEnabled = raw.coordinatorModeEnabled === true;
+      s.documentWorkspacesEnabled = raw.documentWorkspacesEnabled === true;
+      s.documentFullWidth = raw.documentFullWidth === true;
 
       s.coordinatorControlHintDismissed = raw.coordinatorControlHintDismissed === true;
 
@@ -667,6 +804,7 @@ export async function loadState(): Promise<void> {
         typeof raw.defaultPropagateSkipPermissions === 'boolean'
           ? raw.defaultPropagateSkipPermissions
           : true;
+      s.canvasOwnershipBadges = raw.canvasOwnershipBadges !== false;
 
       s.autoStartRemoteAccess = raw.autoStartRemoteAccess === true;
 
@@ -712,7 +850,8 @@ export async function loadState(): Promise<void> {
         }
       }
 
-      for (const taskId of raw.taskOrder) {
+      const documentTaskIds = documentAgentTaskIds(projects);
+      for (const taskId of new Set([...raw.taskOrder, ...documentTaskIds])) {
         const pt = raw.tasks[taskId];
         if (!pt) continue;
 
@@ -736,13 +875,29 @@ export async function loadState(): Promise<void> {
                 : undefined,
           projectId: pt.projectId ?? '',
           branchName: pt.branchName,
-          worktreePath: pt.worktreePath,
+          worktreePath: documentTaskIds.includes(taskId)
+            ? (projects.find((project) => project.id === pt.projectId)?.path ?? pt.worktreePath)
+            : pt.worktreePath,
           agentIds,
+          agentSessionIds: restoredAgentSessionIds(pt, agentIds),
           selectedAgentId: validAgentId(pt.selectedAgentId, agentIds) ?? agentIds[0],
           aiTerminalLayout: pt.aiTerminalLayout === 'tabs' ? 'tabs' : undefined,
+          mainAgentView: pt.mainAgentView === 'chat' ? 'chat' : undefined,
+          codexChatThreadId:
+            typeof pt.codexChatThreadId === 'string' ? pt.codexChatThreadId : undefined,
+          codexChatHandoff: restoredCodexHandoff(pt.codexChatHandoff),
+          chatPermissionMode: isChatPermissionMode(pt.chatPermissionMode)
+            ? pt.chatPermissionMode
+            : undefined,
+          chatSessions: restoreChatSessions(pt.chatSessions),
+          claudeChatSessionId:
+            typeof pt.claudeChatSessionId === 'string' ? pt.claudeChatSessionId : undefined,
           shellAgentIds,
           notes: pt.notes,
+          promptDraft: typeof pt.promptDraft === 'string' ? pt.promptDraft : undefined,
+          browserUrl: typeof pt.browserUrl === 'string' ? pt.browserUrl : undefined,
           lastPrompt: pt.lastPrompt,
+          promptHistory: restoredPromptHistory(pt.promptHistory),
           promptedAgentIds: restoredPromptedAgentIds(pt, agentIds),
           initialPrompt: typeof pt.initialPrompt === 'string' ? pt.initialPrompt : undefined,
           gitIsolation: legacy.gitIsolation ?? (legacy.directMode ? 'direct' : 'worktree'),
@@ -762,6 +917,11 @@ export async function loadState(): Promise<void> {
           savedSelectedAgentIndex: validAgentIndex(pt.savedSelectedAgentIndex),
           savedPromptedAgentIndexes: validPromptedAgentIndexes(pt.savedPromptedAgentIndexes),
           planFileName: pt.planFileName,
+          ...restoredCanvas(pt),
+          ...restoreTaskMindMap(pt, unreadableMindMaps),
+          reasoningProfile: normalizeReasoningProfile(pt.reasoningProfile),
+          canvasTaskLinks: restoreCanvasTaskLinks(pt.canvasTaskLinks),
+          reasoningWorkspaces: restoreReasoningWorkspaces(pt.reasoningWorkspaces),
           stepsEnabled: pt.stepsEnabled,
           branchAdoptedFrom: validBranch(pt.branchAdoptedFrom, pt.branchName),
           branchOfferDismissed: validBranch(pt.branchOfferDismissed),
@@ -852,9 +1012,22 @@ export async function loadState(): Promise<void> {
           agentIds: [],
           selectedAgentId: undefined,
           aiTerminalLayout: pt.aiTerminalLayout === 'tabs' ? 'tabs' : undefined,
+          mainAgentView: pt.mainAgentView === 'chat' ? 'chat' : undefined,
+          codexChatThreadId:
+            typeof pt.codexChatThreadId === 'string' ? pt.codexChatThreadId : undefined,
+          codexChatHandoff: restoredCodexHandoff(pt.codexChatHandoff),
+          chatPermissionMode: isChatPermissionMode(pt.chatPermissionMode)
+            ? pt.chatPermissionMode
+            : undefined,
+          chatSessions: restoreChatSessions(pt.chatSessions),
+          claudeChatSessionId:
+            typeof pt.claudeChatSessionId === 'string' ? pt.claudeChatSessionId : undefined,
           shellAgentIds: [],
           notes: pt.notes,
+          promptDraft: typeof pt.promptDraft === 'string' ? pt.promptDraft : undefined,
+          browserUrl: typeof pt.browserUrl === 'string' ? pt.browserUrl : undefined,
           lastPrompt: pt.lastPrompt,
+          promptHistory: restoredPromptHistory(pt.promptHistory),
           promptedAgentIds: restoredPromptedAgentIds(pt, []),
           initialPrompt: typeof pt.initialPrompt === 'string' ? pt.initialPrompt : undefined,
           gitIsolation:
@@ -875,10 +1048,21 @@ export async function loadState(): Promise<void> {
           savedSelectedAgentIndex: validAgentIndex(pt.savedSelectedAgentIndex),
           savedPromptedAgentIndexes: validPromptedAgentIndexes(pt.savedPromptedAgentIndexes),
           planFileName: pt.planFileName,
+          ...restoredCanvas(pt),
+          ...restoreTaskMindMap(pt, unreadableMindMaps),
+          reasoningProfile: normalizeReasoningProfile(pt.reasoningProfile),
+          canvasTaskLinks: restoreCanvasTaskLinks(pt.canvasTaskLinks),
+          reasoningWorkspaces: restoreReasoningWorkspaces(pt.reasoningWorkspaces),
           stepsEnabled: pt.stepsEnabled,
           branchAdoptedFrom: validBranch(pt.branchAdoptedFrom, pt.branchName),
           branchOfferDismissed: validBranch(pt.branchOfferDismissed),
           collapsed: true,
+          savedAgentSessionIds: Array.isArray(pt.savedAgentSessionIds)
+            ? agentDefs.map((_, index) => {
+                const id = pt.savedAgentSessionIds?.[index];
+                return isSessionId(id) ? id : null;
+              })
+            : undefined,
           savedAgentDef: agentDefs[0],
           savedAgentDefs: agentDefs.length > 0 ? agentDefs : undefined,
           coordinatorMode: pt.coordinatorMode,
@@ -910,16 +1094,16 @@ export async function loadState(): Promise<void> {
       const activeSet = new Set(s.taskOrder);
       s.collapsedTaskOrder = s.collapsedTaskOrder.filter((id) => !activeSet.has(id));
 
-      // Focus mode requires a valid active panel; without one, every panel is
-      // hidden and the strip reads blank. Repair or drop focus mode.
-      if (s.focusMode) {
-        const activeValid =
-          s.activeTaskId !== null &&
-          (s.tasks[s.activeTaskId] !== undefined || s.terminals[s.activeTaskId] !== undefined);
-        if (!activeValid) {
-          s.activeTaskId = s.taskOrder[0] ?? null;
-          if (s.activeTaskId === null) s.focusMode = false;
-        }
+      // Only listed panels can be active before a document workspace opens.
+      // Otherwise focus mode hides every coding task after a restart.
+      const activeValid =
+        s.activeTaskId !== null &&
+        s.taskOrder.includes(s.activeTaskId) &&
+        (s.tasks[s.activeTaskId] !== undefined || s.terminals[s.activeTaskId] !== undefined);
+      if (!activeValid) s.activeTaskId = null;
+      if (s.focusMode && s.activeTaskId === null) {
+        s.activeTaskId = s.taskOrder[0] ?? null;
+        if (s.activeTaskId === null) s.focusMode = false;
       }
 
       // Set activeAgentId from the active task
@@ -971,5 +1155,12 @@ export async function loadState(): Promise<void> {
   // must not block app startup.
   if (store.autoStartRemoteAccess) {
     startRemoteAccess().catch((e) => console.warn('Failed to auto-start remote access:', e));
+  }
+  if (unreadableMindMaps.length) {
+    logWarn('persistence', 'Kept unreadable mind maps aside', { tasks: unreadableMindMaps });
+    showNotification(
+      `The saved mind map of ${unreadableMindMaps.join(', ')} could not be read; it is kept on disk but cannot be shown.`,
+      { durationMs: NOTIFICATION_ERROR_MS },
+    );
   }
 }

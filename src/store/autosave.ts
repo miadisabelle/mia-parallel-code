@@ -1,5 +1,6 @@
 import { createEffect } from 'solid-js';
 import { store, saveState } from './store';
+import { documentAgentTaskIds } from '../documents/task-id';
 
 /** Build a snapshot string of all persisted fields. Using JSON.stringify
  *  creates a single reactive dependency on the serialized form — the effect
@@ -30,6 +31,7 @@ export function persistedSnapshot(): string {
     defaultSkipPermissions: store.defaultSkipPermissions,
     defaultPropagateSkipPermissions: store.defaultPropagateSkipPermissions,
     autoResumeSessions: store.autoResumeSessions,
+    canvasOwnershipBadges: store.canvasOwnershipBadges,
     showSidebarTips: store.showSidebarTips,
     showSidebarProgress: store.showSidebarProgress,
     sidebarNeedsInputFirst: store.sidebarNeedsInputFirst,
@@ -42,6 +44,7 @@ export function persistedSnapshot(): string {
     focusMode: store.focusMode,
     coordinatorNotificationDelayMs: store.coordinatorNotificationDelayMs,
     coordinatorModeEnabled: store.coordinatorModeEnabled,
+    documentWorkspacesEnabled: store.documentWorkspacesEnabled,
     coordinatorControlHintDismissed: store.coordinatorControlHintDismissed,
     autoStartRemoteAccess: store.autoStartRemoteAccess,
     shareDockerAgentAuth: store.shareDockerAgentAuth,
@@ -51,7 +54,7 @@ export function persistedSnapshot(): string {
     darkThemePreset: store.darkThemePreset,
     darkThemeCustomId: store.darkThemeCustomId,
     tasks: Object.fromEntries(
-      [...store.taskOrder, ...store.collapsedTaskOrder]
+      [...store.taskOrder, ...store.collapsedTaskOrder, ...documentAgentTaskIds(store.projects)]
         .filter((id) => store.tasks[id])
         .map((id) => {
           const t = store.tasks[id];
@@ -59,7 +62,12 @@ export function persistedSnapshot(): string {
             id,
             {
               notes: t.notes,
+              promptDraft: t.promptDraft,
+              browserUrl: t.browserUrl,
+              mindMap: t.mindMap,
+              reasoningWorkspaces: t.reasoningWorkspaces,
               lastPrompt: t.lastPrompt,
+              promptHistory: t.promptHistory,
               name: t.name,
               gitIsolation: t.gitIsolation,
               baseBranch: t.baseBranch,
@@ -74,6 +82,8 @@ export function persistedSnapshot(): string {
               // and the change is lost on the next launch.
               skipPermissions: t.skipPermissions,
               propagateSkipPermissions: t.propagateSkipPermissions,
+              agentSessionIds: t.agentSessionIds,
+              savedAgentSessionIds: t.savedAgentSessionIds,
               coordinatedBy: t.coordinatedBy,
               coordinatorMode: t.coordinatorMode,
               mcpConfigPath: t.mcpConfigPath,

@@ -3,6 +3,7 @@ import { expectDefined, type MockStoreHarness } from './test-helpers';
 
 type MockStore = {
   activeTaskId: string | null;
+  activeDocumentProjectId: string | null;
   activeAgentId: string | null;
   tasks: Record<string, { id: string; agentIds: string[]; selectedAgentId?: string }>;
   terminals: Record<string, unknown>;
@@ -14,6 +15,7 @@ type MockStore = {
   sidebarFocusedProjectId: string | null;
   sidebarFocusedTaskId: string | null;
   placeholderFocused: boolean;
+  newTaskPanelFocused: boolean;
 };
 
 let mockStore: MockStore;
@@ -32,12 +34,14 @@ vi.mock('./notification', () => ({ showNotification: vi.fn() }));
 vi.mock('./projects', () => ({ pickAndAddProject: vi.fn() }));
 vi.mock('./tasks', () => ({ reorderTask: vi.fn() }));
 
-import { activateTaskFromPointer, jumpToTask } from './navigation';
+import { activateTaskFromPointer, jumpToTask, moveActiveTask } from './navigation';
+import { reorderTask } from './tasks';
 
 beforeEach(() => {
   const harness = expectDefined(core.harness, 'mock store harness');
   mockStore = harness.reset({
     activeTaskId: null,
+    activeDocumentProjectId: null,
     activeAgentId: null,
     tasks: {
       'task-1': { id: 'task-1', agentIds: ['agent-a'] },
@@ -53,6 +57,7 @@ beforeEach(() => {
     sidebarFocusedProjectId: null,
     sidebarFocusedTaskId: null,
     placeholderFocused: false,
+    newTaskPanelFocused: false,
   });
 });
 
@@ -60,7 +65,27 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('moveActiveTask', () => {
+  it('does not reorder the previous task while the new-task panel is focused', () => {
+    mockStore.activeTaskId = 'task-2';
+    mockStore.newTaskPanelFocused = true;
+
+    moveActiveTask('right');
+
+    expect(reorderTask).not.toHaveBeenCalled();
+  });
+});
+
 describe('jumpToTask', () => {
+  it('selects the document after coding panels even with no document agent installed', () => {
+    mockStore.activeDocumentProjectId = 'docs';
+    jumpToTask(3);
+    expect(mockStore.activeTaskId).toBe('doc-agent-docs');
+    expect(mockStore.activeAgentId).toBeNull();
+    jumpToTask(0);
+    expect(mockStore.activeTaskId).toBe('task-1');
+    expect(mockStore.activeDocumentProjectId).toBe('docs');
+  });
   it('switches to the task at the given 0-based index', () => {
     jumpToTask(1);
     expect(mockStore.activeTaskId).toBe('task-2');
@@ -168,6 +193,29 @@ describe('activateTaskFromPointer', () => {
 
     expect(mockStore.activeTaskId).toBe('task-2');
     expect(mockStore.placeholderFocused).toBe(false);
+  });
+
+  // The third gate `isPanelFocused` checks. Clearing only the other two leaves
+  // the column highlighted as active while no panel can take focus.
+  it('takes focus away from the new-task panel', () => {
+    mockStore.activeTaskId = 'task-1';
+    mockStore.newTaskPanelFocused = true;
+
+    activateTaskFromPointer('task-2');
+
+    expect(mockStore.activeTaskId).toBe('task-2');
+    expect(mockStore.newTaskPanelFocused).toBe(false);
+  });
+
+  // The idempotency guard must not short-circuit while this gate is set, or a
+  // click on the already-active column leaves the new-task panel owning focus.
+  it('claims focus on the active column while the new-task panel holds it', () => {
+    mockStore.activeTaskId = 'task-1';
+    mockStore.newTaskPanelFocused = true;
+
+    activateTaskFromPointer('task-1');
+
+    expect(mockStore.newTaskPanelFocused).toBe(false);
   });
 
   it('claims focus even when the clicked column is already the active one', () => {

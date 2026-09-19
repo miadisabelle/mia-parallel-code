@@ -8,6 +8,9 @@ export {
   getProjectPath,
   getProjectBranchPrefix,
   pickAndAddProject,
+  addDocumentProject,
+  codeProjects,
+  isDocumentProject,
   validateProjectPaths,
   relinkProject,
   isProjectMissing,
@@ -26,6 +29,23 @@ export {
   removeCustomAgent,
   setAgentEnvFile,
 } from './agents';
+export {
+  openCanvasDocument,
+  openCanvasBrowser,
+  setTaskBrowserUrl,
+  appendBrowserReference,
+  markBrowserFocused,
+  openCanvasReasoning,
+  openCanvasMindMap,
+  setTaskMindMap,
+  setTaskReasoningProfile,
+  setTaskReasoningWorkspace,
+  activateCanvasTab,
+  closeCanvasTab,
+  openTaskCanvas,
+  closeTaskCanvas,
+  isTaskCanvasVisible,
+} from './canvas';
 export {
   createTask,
   createImportedTask,
@@ -58,6 +78,7 @@ export {
   toggleAITerminalLayout,
   setTaskLastInputAt,
   markTaskUserActivity,
+  setTaskPromptDraft,
   setTaskPromptDraftActive,
   setTaskTerminalInputPending,
   initMCPListeners,
@@ -78,7 +99,7 @@ export {
   setActiveAgent,
   moveActiveTask,
   jumpToTask,
-  toggleNewTaskDialog,
+  toggleNewTaskPanel,
 } from './navigation';
 export {
   registerFocusFn,
@@ -92,6 +113,7 @@ export {
   aiTerminalPanelId,
   shellPanelId,
   isPanelFocused,
+  isPanelFocusedOrDefault,
   isPanelFocusedPrefix,
   focusSidebar,
   unfocusSidebar,
@@ -118,6 +140,7 @@ export {
   setTaskViewportVisibility,
   toggleSidebar,
   toggleArena,
+  setDocumentWorkspacesEnabled,
   toggleFocusMode,
   toggleTaskFocusMode,
   setTaskSplitMode,
@@ -154,6 +177,7 @@ export {
   setDefaultStepsEnabled,
   setAutoResumeSessions,
   setDefaultSkipPermissions,
+  setCanvasOwnershipBadges,
   setDefaultPropagateSkipPermissions,
 } from './ui';
 export {

@@ -1,6 +1,7 @@
 import { batch } from 'solid-js';
+import { documentAgentTaskId } from '../documents/task-id';
 import { store, setStore } from './core';
-import { getTaskFocusedPanel, setTaskFocusedPanel } from './focused-panel';
+import { getTaskFocusedPanel, setTaskFocusedPanel, triggerFocus } from './focused-panel';
 import { showNotification } from './notification';
 import { pickAndAddProject } from './projects';
 import { reorderTask } from './tasks';
@@ -23,10 +24,21 @@ function selectedAgentIdForTask(task: {
     : null;
 }
 
+/** Visible tile order; the single document workspace follows coding tasks. */
+export function openPanelOrder(): string[] {
+  return store.activeDocumentProjectId
+    ? [...store.taskOrder, documentAgentTaskId(store.activeDocumentProjectId)]
+    : store.taskOrder;
+}
+
 export function setActiveTask(id: string): void {
   const task = store.tasks[id];
   const terminal = store.terminals[id];
-  if (!task && !terminal) return;
+  const isDocument =
+    store.activeDocumentProjectId && id === documentAgentTaskId(store.activeDocumentProjectId);
+  if (!task && !terminal && !isDocument) return;
+  setStore('newTaskPanelFocused', false);
+  setStore('placeholderFocused', false);
   let activeAgentId: string | null = null;
   if (task) {
     activeAgentId =
@@ -52,8 +64,8 @@ export function setActiveTask(id: string): void {
  * Activate a task because the user pointed at its column.
  *
  * Distinct from `setActiveTask`, which keyboard jumps also use: pointing into
- * a column must additionally take focus away from the sidebar and the new-task
- * placeholder. Both flags are hard gates — `isPanelFocused` returns false for
+ * a column must additionally take focus away from the sidebar, the new-task
+ * placeholder and the new-task panel. All three flags are hard gates — `isPanelFocused` returns false for
  * every panel while either is set, and `navigateRow`/`navigateColumn` keep
  * routing the arrow keys to the sidebar — so activating without clearing them
  * leaves the column highlighted as active while the app still behaves as if
@@ -64,11 +76,19 @@ export function activateTaskFromPointer(id: string): void {
   if (!store.tasks[id] && !store.terminals[id]) return;
   // Idempotent: the same interaction can reach this twice (pointerdown on the
   // column, then a title-bar tap), and nothing below would change.
-  if (store.activeTaskId === id && !store.sidebarFocused && !store.placeholderFocused) return;
+  if (
+    store.activeTaskId === id &&
+    !store.sidebarFocused &&
+    !store.placeholderFocused &&
+    !store.newTaskPanelFocused
+  ) {
+    return;
+  }
   batch(() => {
     setActiveTask(id);
     setStore('sidebarFocused', false);
     setStore('placeholderFocused', false);
+    setStore('newTaskPanelFocused', false);
   });
 }
 
@@ -82,6 +102,7 @@ export function setActiveAgent(agentId: string): void {
 }
 
 export function moveActiveTask(direction: 'left' | 'right'): void {
+  if (store.newTaskPanelFocused) return;
   const { taskOrder, activeTaskId } = store;
   if (!activeTaskId || taskOrder.length < 2) return;
   const idx = taskOrder.indexOf(activeTaskId);
@@ -94,9 +115,9 @@ export function moveActiveTask(direction: 'left' | 'right'): void {
 }
 
 export function jumpToTask(index: number): void {
-  // Index against taskOrder so Cmd+N matches the left-to-right tile order
+  // Index against visible panels so Cmd+N matches the left-to-right tile order
   // shown in the main area (and the order Cmd+Left/Right cycles through).
-  const id = store.taskOrder[index];
+  const id = openPanelOrder()[index];
   if (!id) return;
   setActiveTask(id);
   if (store.sidebarFocused) {
@@ -105,16 +126,21 @@ export function jumpToTask(index: number): void {
   }
 }
 
-export function toggleNewTaskDialog(show?: boolean): void {
-  const shouldShow = show ?? !store.showNewTaskDialog;
+export function toggleNewTaskPanel(show?: boolean): void {
+  const shouldShow = show ?? !store.showNewTaskPanel;
   if (shouldShow && store.projects.length === 0) {
     showNotification('Add a project first');
     pickAndAddProject();
     return;
   }
-  if (!shouldShow) {
+  if (shouldShow) {
+    setStore('sidebarFocused', false);
+    setStore('placeholderFocused', false);
+  } else {
+    setStore('newTaskPanelFocused', false);
     setStore('newTaskDropUrl', null);
     setStore('newTaskPrefillPrompt', null);
   }
-  setStore('showNewTaskDialog', shouldShow);
+  setStore('showNewTaskPanel', shouldShow);
+  if (shouldShow) triggerFocus('new-task');
 }

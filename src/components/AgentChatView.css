@@ -1,0 +1,115 @@
+.codex-chat {
+  --chat-border: var(--border);
+  --chat-accent: var(--accent);
+  /* Every theme gives --bg-elevated the same value as the panel background, so
+     cards painted with it disappeared into the chat. Derive a nested ramp from
+     the actual backdrop instead; it stays right for light and custom themes. */
+  --chat-surface: color-mix(in srgb, var(--fg) 5%, var(--task-panel-bg, var(--bg-elevated)));
+  --chat-surface-strong: color-mix(
+    in srgb,
+    var(--fg) 10%,
+    var(--task-panel-bg, var(--bg-elevated))
+  );
+  /* Keep chat overlays below the surrounding panel's focus outline. */
+  isolation: isolate;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  color: var(--fg);
+  background: var(--task-panel-bg, var(--bg-elevated));
+  font-size: 13px;
+}
+.codex-chat-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12px;
+}
+.codex-chat-status {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--fg-muted);
+}
+.codex-chat-action {
+  flex-shrink: 0;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.codex-chat-tokens {
+  flex-shrink: 0;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.codex-chat-context {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.codex-chat-context-track {
+  width: 28px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--border);
+}
+.codex-chat-context-track > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+.codex-chat-context[data-level='high'] .codex-chat-context-track > span {
+  background: var(--warning);
+}
+.codex-chat-context[data-level='full'] .codex-chat-context-track > span {
+  background: var(--error);
+}
+.codex-chat-action:disabled {
+  color: var(--fg-muted);
+  cursor: default;
+}
+.codex-chat-note {
+  margin: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.codex-chat-island {
+  flex: 1;
+  min-height: 0;
+}
+.codex-chat-error {
+  padding: 8px 16px;
+  color: var(--error);
+  font-size: 12px;
+}
+.codex-chat-error button {
+  margin-left: 8px;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.codex-chat-header select {
+  flex: 1 1 110px;
+  min-width: 0;
+  max-width: 180px;
+  text-overflow: ellipsis;
+}

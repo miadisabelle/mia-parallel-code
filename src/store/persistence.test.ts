@@ -1,6 +1,8 @@
+import { createMindMap } from '../graph/model';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentDef } from '../ipc/types';
 import type { PersistedTask } from './types';
+import { emptyWorkspace, updateDraft } from '../investigation/editing';
 
 const { mockInvoke } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
@@ -331,6 +333,192 @@ describe('coordinator concurrency limit persistence', () => {
   });
 });
 
+describe('collapsed session ownership persistence', () => {
+  const session = 'fb4f2bc6-62d9-4b29-a795-240caf2fc459';
+  it.each([
+    { saved: [session, null, session], expected: [session, null, session] },
+    { saved: [session, '--unsafe-flag', 42, session], expected: [session, null, null] },
+    { saved: { 0: session }, expected: undefined },
+    { saved: undefined, expected: undefined },
+  ])('validates and round-trips saved sessions: $saved', async ({ saved, expected }) => {
+    const def = agentDef();
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+        taskOrder: [],
+        collapsedTaskOrder: ['task-1'],
+        tasks: {
+          'task-1': {
+            ...persistedTask(def),
+            collapsed: true,
+            agentDefs: [def, def, def],
+            savedAgentSessionIds: saved,
+          },
+        },
+      }),
+    );
+    await loadState();
+    expect(store.tasks['task-1'].savedAgentSessionIds).toEqual(expected);
+    mockInvoke.mockClear();
+    mockInvoke.mockResolvedValue(undefined);
+    await saveState();
+    const call = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+    const persisted = JSON.parse(call?.[1].json);
+    expect(persisted.tasks['task-1'].savedAgentSessionIds).toEqual(expected);
+  });
+});
+
+describe('reasoning profile persistence', () => {
+  it.each(['architecture', 'research', 'explanation', undefined, 'unknown'])(
+    'restores and saves %s for active and collapsed tasks',
+    async (profile) => {
+      mockInvoke.mockResolvedValueOnce(
+        JSON.stringify({
+          projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+          taskOrder: ['task-1'],
+          collapsedTaskOrder: ['task-2'],
+          activeTaskId: 'task-1',
+          tasks: {
+            'task-1': { ...persistedTask(agentDef()), reasoningProfile: profile },
+            'task-2': {
+              ...persistedTask(agentDef()),
+              id: 'task-2',
+              collapsed: true,
+              reasoningProfile: profile,
+            },
+          },
+        }),
+      );
+      await loadState();
+      const expected =
+        profile === 'architecture' || profile === 'research' || profile === 'explanation'
+          ? profile
+          : 'investigation';
+      expect(store.tasks['task-1'].reasoningProfile).toBe(expected);
+      expect(store.tasks['task-2'].reasoningProfile).toBe(expected);
+      mockInvoke.mockClear();
+      mockInvoke.mockResolvedValueOnce(undefined);
+      await saveState();
+      const call = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+      expect(call).toBeDefined();
+      const saved = JSON.parse(call?.[1].json);
+      expect(saved.tasks['task-1'].reasoningProfile).toBe(expected);
+      expect(saved.tasks['task-2'].reasoningProfile).toBe(expected);
+    },
+  );
+});
+
+describe('mind map persistence', () => {
+  it('keeps an unreadable map on disk, tells the user once, and keeps the task', async () => {
+    const broken = { version: 1, revision: 'x', records: 'nope' };
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+        taskOrder: ['task-1'],
+        tasks: { 'task-1': { ...persistedTask(agentDef()), name: 'Broken map', mindMap: broken } },
+      }),
+    );
+    await loadState();
+    expect(store.tasks['task-1'].mindMap).toBeUndefined();
+    expect(store.notification).toContain('Broken map');
+    expect(store.notification).toContain('kept on disk');
+    mockInvoke.mockClear();
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    const call = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+    expect(JSON.parse(call?.[1].json).tasks['task-1'].mindMap).toEqual(broken);
+  });
+
+  it('treats a null map as absent', async () => {
+    setStore('notification', null);
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+        taskOrder: ['task-1'],
+        tasks: { 'task-1': { ...persistedTask(agentDef()), mindMap: null } },
+      }),
+    );
+    await loadState();
+    expect(store.tasks['task-1'].mindMap).toBeUndefined();
+    expect(store.tasks['task-1'].mindMapUnreadable).toBeUndefined();
+    expect(store.notification ?? '').not.toContain('mind map');
+  });
+
+  it.each([false, true])(
+    'round-trips map documents and tabs (collapsed: %s)',
+    async (collapsed) => {
+      const document = createMindMap('Saved topic');
+      mockInvoke.mockResolvedValueOnce(
+        JSON.stringify({
+          projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+          taskOrder: collapsed ? [] : ['task-1'],
+          collapsedTaskOrder: collapsed ? ['task-1'] : [],
+          tasks: {
+            'task-1': {
+              ...persistedTask(agentDef()),
+              collapsed,
+              mindMap: document,
+              canvasTabs: [{ kind: 'mindmap' }],
+              canvasActiveTab: 'mindmap',
+            },
+          },
+        }),
+      );
+      await loadState();
+      expect(store.tasks['task-1'].mindMap).toEqual(document);
+      expect(store.tasks['task-1'].canvasActiveTab).toBe('mindmap');
+      mockInvoke.mockClear();
+      mockInvoke.mockResolvedValueOnce(undefined);
+      await saveState();
+      const call = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+      expect(JSON.parse(call?.[1].json).tasks['task-1'].mindMap).toEqual(document);
+    },
+  );
+});
+
+describe('reasoning workspace persistence', () => {
+  it('restores and saves user drafts for active and collapsed tasks, dropping malformed runs', async () => {
+    const workspace = updateDraft(emptyWorkspace(), 'goal', {
+      title: 'Unfinished edit',
+      detail: '',
+      base: { title: 'Goal', detail: '' },
+      question: 'Investigate this',
+    });
+    const workspaces = { 'task/agent/run': workspace };
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+        taskOrder: ['task-1'],
+        collapsedTaskOrder: ['task-2'],
+        activeTaskId: 'task-1',
+        tasks: {
+          'task-1': {
+            ...persistedTask(agentDef()),
+            reasoningWorkspaces: { ...workspaces, broken: { edits: false } },
+          },
+          'task-2': {
+            ...persistedTask(agentDef()),
+            id: 'task-2',
+            collapsed: true,
+            reasoningWorkspaces: workspaces,
+          },
+        },
+      }),
+    );
+    await loadState();
+    for (const id of ['task-1', 'task-2'])
+      expect(store.tasks[id].reasoningWorkspaces).toEqual(workspaces);
+    mockInvoke.mockClear();
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    const call = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+    expect(call).toBeDefined();
+    const saved = JSON.parse(call?.[1].json);
+    for (const id of ['task-1', 'task-2'])
+      expect(saved.tasks[id].reasoningWorkspaces).toEqual(workspaces);
+  });
+});
+
 describe('PR URL persistence', () => {
   it('persists task PR URLs', async () => {
     setStore('taskOrder', ['task-1']);
@@ -357,6 +545,46 @@ describe('PR URL persistence', () => {
     expect(saved.tasks['task-1'].prUrl).toBe('https://github.com/acme/app/pull/12');
   });
 
+  it('restores canvas tabs, turning a pre-tabs canvasPath into one tab', async () => {
+    const def = agentDef();
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'hsl(0, 70%, 75%)' }],
+        lastProjectId: 'project-1',
+        lastAgentId: null,
+        taskOrder: ['task-1', 'task-2'],
+        collapsedTaskOrder: [],
+        tasks: {
+          'task-1': { ...persistedTask(def), canvasPath: 'docs/old.md' },
+          'task-2': {
+            ...persistedTask(def),
+            id: 'task-2',
+            canvasTabs: [
+              { kind: 'reasoning' },
+              { kind: 'markdown', path: 'a.md' },
+              { kind: 'browser', url: 'x' },
+            ],
+            canvasActiveTab: 'markdown:gone.md',
+          },
+        },
+        activeTaskId: 'task-1',
+        sidebarVisible: true,
+      }),
+    );
+
+    await loadState();
+
+    expect(store.tasks['task-1']).toMatchObject({
+      canvasTabs: [{ kind: 'markdown', path: 'docs/old.md' }],
+      canvasActiveTab: 'markdown:docs/old.md',
+    });
+    // Unknown kinds are dropped and a stale active key falls back to the first tab.
+    expect(store.tasks['task-2']).toMatchObject({
+      canvasTabs: [{ kind: 'reasoning' }, { kind: 'markdown', path: 'a.md' }],
+      canvasActiveTab: 'reasoning',
+    });
+  });
+
   it('restores task PR URLs', async () => {
     const def = agentDef();
     mockInvoke.mockResolvedValueOnce(
@@ -380,6 +608,107 @@ describe('PR URL persistence', () => {
     await loadState();
 
     expect(store.tasks['task-1'].prUrl).toBe('https://github.com/acme/app/pull/12');
+  });
+});
+
+describe('prompt draft persistence', () => {
+  it('persists an unsent prompt draft on an active task', async () => {
+    setStore('taskOrder', ['task-1']);
+    setStore('collapsedTaskOrder', []);
+    setStore('tasks', {
+      'task-1': {
+        id: 'task-1',
+        name: 'Task',
+        projectId: 'project-1',
+        branchName: 'task/task-1',
+        worktreePath: '/repo/.worktrees/task-1',
+        agentIds: [],
+        shellAgentIds: [],
+        notes: '',
+        lastPrompt: '',
+        gitIsolation: 'worktree',
+        promptDraft: 'remember to check the migration',
+      },
+    });
+    mockInvoke.mockResolvedValueOnce(undefined);
+
+    await saveState();
+
+    const saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
+    expect(saved.tasks['task-1'].promptDraft).toBe('remember to check the migration');
+  });
+
+  it('restores an unsent prompt draft', async () => {
+    const def = agentDef();
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'hsl(0, 70%, 75%)' }],
+        lastProjectId: 'project-1',
+        lastAgentId: null,
+        taskOrder: ['task-1'],
+        collapsedTaskOrder: [],
+        tasks: {
+          'task-1': {
+            ...persistedTask(def),
+            promptDraft: 'remember to check the migration',
+          },
+        },
+        activeTaskId: 'task-1',
+        sidebarVisible: true,
+      }),
+    );
+
+    await loadState();
+
+    expect(store.tasks['task-1'].promptDraft).toBe('remember to check the migration');
+  });
+
+  it('restores an unsent prompt draft on a collapsed task', async () => {
+    const def = agentDef();
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'hsl(0, 70%, 75%)' }],
+        lastProjectId: 'project-1',
+        lastAgentId: null,
+        taskOrder: [],
+        collapsedTaskOrder: ['task-1'],
+        tasks: {
+          'task-1': {
+            ...persistedTask(def),
+            collapsed: true,
+            promptDraft: 'draft on a collapsed task',
+          },
+        },
+        activeTaskId: null,
+        sidebarVisible: true,
+      }),
+    );
+
+    await loadState();
+
+    expect(store.tasks['task-1'].promptDraft).toBe('draft on a collapsed task');
+  });
+
+  it('ignores a non-string promptDraft from a corrupt file', async () => {
+    const def = agentDef();
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'hsl(0, 70%, 75%)' }],
+        lastProjectId: 'project-1',
+        lastAgentId: null,
+        taskOrder: ['task-1'],
+        collapsedTaskOrder: [],
+        tasks: {
+          'task-1': { ...persistedTask(def), promptDraft: 42 },
+        },
+        activeTaskId: 'task-1',
+        sidebarVisible: true,
+      }),
+    );
+
+    await loadState();
+
+    expect(store.tasks['task-1'].promptDraft).toBeUndefined();
   });
 });
 
@@ -486,12 +815,12 @@ describe('loadState theme persistence', () => {
     setStore('customAgents', []);
   });
 
-  it('defaults to dark mode with islands-dark/islands-light when no theme fields saved', async () => {
+  it('defaults to dark mode with obsidian/islands-light when no theme fields saved', async () => {
     mockInvoke.mockResolvedValueOnce(basePayload());
     await loadState();
 
     expect(store.appearanceMode).toBe('dark');
-    expect(store.darkThemePreset).toBe('islands-dark');
+    expect(store.darkThemePreset).toBe('obsidian');
     expect(store.lightThemePreset).toBe('islands-light');
     expect(store.darkThemeCustomId).toBeNull();
     expect(store.lightThemeCustomId).toBeNull();
@@ -519,12 +848,36 @@ describe('loadState theme persistence', () => {
     expect(store.darkThemePreset).toBe('classic');
   });
 
-  it('falls back to islands-dark for an invalid darkThemePreset', async () => {
+  it('falls back to obsidian for an invalid darkThemePreset', async () => {
     mockInvoke.mockResolvedValueOnce(
       basePayload({ appearanceMode: 'dark', darkThemePreset: 'not-a-theme' }),
     );
     await loadState();
-    expect(store.darkThemePreset).toBe('islands-dark');
+    expect(store.darkThemePreset).toBe('obsidian');
+  });
+
+  it.each(['dark', 'light', 'system'])(
+    'preserves an omitted legacy dark slot in %s mode',
+    async (appearanceMode) => {
+      mockInvoke.mockResolvedValueOnce(basePayload({ appearanceMode }));
+      await loadState();
+      expect(store.darkThemePreset).toBe('islands-dark');
+    },
+  );
+
+  it('saves and restores Obsidian explicitly when using the new default', async () => {
+    setStore('darkThemePreset', 'obsidian');
+    setStore('themePreset', 'obsidian');
+    setStore('appearanceMode', 'dark');
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    const savedCall = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+    const json = (savedCall?.[1] as { json: string }).json;
+    expect(JSON.parse(json).darkThemePreset).toBe('obsidian');
+    setStore('darkThemePreset', 'classic');
+    mockInvoke.mockResolvedValueOnce(json);
+    await loadState();
+    expect(store.darkThemePreset).toBe('obsidian');
   });
 
   it('restores a valid lightThemePreset', async () => {
@@ -570,11 +923,11 @@ describe('loadState theme persistence', () => {
     expect(store.darkThemePreset).toBe('classic');
   });
 
-  it('backward compat: invalid old themePreset leaves dark mode with islands-dark', async () => {
+  it('backward compat: invalid old themePreset leaves dark mode with obsidian', async () => {
     mockInvoke.mockResolvedValueOnce(basePayload({ themePreset: 'legacy-unknown' }));
     await loadState();
     expect(store.appearanceMode).toBe('dark');
-    expect(store.darkThemePreset).toBe('islands-dark');
+    expect(store.darkThemePreset).toBe('obsidian');
   });
 });
 
@@ -1069,6 +1422,291 @@ describe('showSteps → defaultStepsEnabled migration', () => {
   });
 });
 
+describe('document full width persistence', () => {
+  function stateJson(extra: Record<string, unknown>): string {
+    return JSON.stringify({
+      projects: [],
+      lastProjectId: null,
+      lastAgentId: null,
+      taskOrder: [],
+      collapsedTaskOrder: [],
+      tasks: {},
+      activeTaskId: null,
+      sidebarVisible: true,
+      ...extra,
+    });
+  }
+
+  async function lastSaved(): Promise<Record<string, unknown>> {
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    const lastCall = mockInvoke.mock.calls[mockInvoke.mock.calls.length - 1];
+    return JSON.parse(lastCall[1].json) as Record<string, unknown>;
+  }
+
+  it('round-trips the preference and leaves the default out of the file', async () => {
+    mockInvoke.mockResolvedValueOnce(stateJson({ documentFullWidth: true }));
+    await loadState();
+    expect(store.documentFullWidth).toBe(true);
+    expect((await lastSaved()).documentFullWidth).toBe(true);
+
+    mockInvoke.mockResolvedValueOnce(stateJson({ documentFullWidth: 'yes' }));
+    await loadState();
+    expect(store.documentFullWidth).toBe(false);
+    expect((await lastSaved()).documentFullWidth).toBeUndefined();
+  });
+});
+
+describe('active task repair', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setStore('tasks', {});
+    setStore('taskOrder', []);
+    setStore('activeTaskId', 'stale');
+    setStore('focusMode', false);
+  });
+
+  it('drops an active id that names nothing, such as a workspace agent task', async () => {
+    mockInvoke.mockResolvedValueOnce(basePayload({ activeTaskId: 'doc-agent-docs' }));
+
+    await loadState();
+
+    expect(store.activeTaskId).toBeNull();
+  });
+});
+
+describe('document terminal persistence', () => {
+  it('restores the terminal in the current project folder after a relink', async () => {
+    const id = 'doc-agent-docs';
+    mockInvoke.mockResolvedValueOnce(
+      basePayload({
+        projects: [
+          {
+            id: 'docs',
+            name: 'Docs',
+            path: '/new/docs',
+            color: '',
+            kind: 'document',
+            documentPath: 'notes.md',
+          },
+        ],
+        tasks: {
+          [id]: {
+            ...persistedTask(agentDef()),
+            id,
+            projectId: 'docs',
+            worktreePath: '/old/docs',
+            agentIds: [id],
+          },
+        },
+        taskOrder: [],
+      }),
+    );
+    await loadState();
+    expect(store.tasks[id]?.worktreePath).toBe('/new/docs');
+  });
+
+  it('restores document agents and drafts without adding them to the coding task list', async () => {
+    const id = 'doc-agent-docs';
+    const task = {
+      ...persistedTask(agentDef()),
+      id,
+      projectId: 'docs',
+      worktreePath: '/docs',
+      gitIsolation: 'none',
+      agentIds: [id],
+      promptDraft: 'Continue the introduction',
+      lastPrompt: 'Revise the introduction',
+    };
+    mockInvoke.mockResolvedValueOnce(
+      basePayload({
+        projects: [
+          {
+            id: 'docs',
+            name: 'Docs',
+            path: '/docs',
+            color: '',
+            kind: 'document',
+            documentPath: 'notes.md',
+          },
+        ],
+        tasks: { [id]: task },
+        taskOrder: [],
+        activeTaskId: id,
+        focusMode: true,
+      }),
+    );
+
+    await loadState();
+
+    expect(store.tasks[id]?.promptDraft).toBe(task.promptDraft);
+    expect(store.agents[id]?.resumed).toBe(true);
+    expect(store.agents[id]?.attachExisting).toBe(true);
+    expect(store.taskOrder).toEqual([]);
+    expect(store.activeTaskId).toBeNull();
+    expect(store.focusMode).toBe(false);
+
+    mockInvoke.mockResolvedValue(undefined);
+    await saveState();
+    const saved = mockInvoke.mock.calls.findLast(([channel]) => channel === IPC.SaveAppState);
+    expect(JSON.parse(saved?.[1].json).tasks[id]).toMatchObject(task);
+  });
+});
+
+describe('saveState failure reporting', () => {
+  it('tells the user when the state file could not be written', async () => {
+    vi.useFakeTimers();
+    try {
+      setStore('notification', null);
+      mockInvoke.mockImplementation((channel: string) =>
+        channel === IPC.SaveAppState
+          ? Promise.reject(new Error('ENOSPC: no space left on device'))
+          : Promise.resolve(undefined),
+      );
+      await saveState();
+      expect(store.notification).toContain("Couldn't save app state");
+      expect(store.notification).toContain('ENOSPC');
+      // Rate-limited: a second failure right away does not re-toast...
+      setStore('notification', null);
+      await saveState();
+      expect(store.notification).toBeNull();
+      // ...but the reminder returns once the interval has passed.
+      vi.advanceTimersByTime(60_000);
+      await saveState();
+      expect(store.notification).toContain("Couldn't save app state");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('browser preview persistence', () => {
+  it('restores browser tabs and URLs for active and collapsed tasks', async () => {
+    const tab = { kind: 'browser', path: 'preview' };
+    const task = {
+      ...persistedTask(agentDef()),
+      canvasTabs: [tab],
+      canvasActiveTab: 'browser:preview',
+      browserUrl: 'http://localhost:5173/',
+    };
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+        taskOrder: ['task-1'],
+        collapsedTaskOrder: ['task-2'],
+        tasks: { 'task-1': task, 'task-2': { ...task, id: 'task-2', collapsed: true } },
+      }),
+    );
+    await loadState();
+    for (const id of ['task-1', 'task-2']) {
+      expect(store.tasks[id]).toMatchObject({
+        canvasTabs: [tab],
+        canvasActiveTab: 'browser:preview',
+        browserUrl: task.browserUrl,
+      });
+    }
+    mockInvoke.mockClear();
+    await saveState();
+    const saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
+    expect(saved.tasks['task-1'].browserUrl).toBe(task.browserUrl);
+    expect(saved.tasks['task-2'].browserUrl).toBe(task.browserUrl);
+  });
+});
+
+describe('prompt history persistence', () => {
+  it.each([false, true])('restores and saves history for collapsed=%s', async (collapsed) => {
+    const history = [
+      { text: 'First prompt' },
+      { text: 'Second\nmultiline prompt', sentAt: 1700000000000, agentName: 'Codex' },
+    ];
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: '#abc' }],
+        taskOrder: collapsed ? [] : ['task-1'],
+        collapsedTaskOrder: collapsed ? ['task-1'] : [],
+        tasks: {
+          'task-1': {
+            ...persistedTask(agentDef()),
+            collapsed,
+            promptHistory: [...history, null, { text: 123 }, { text: ' ' }],
+          },
+        },
+        activeTaskId: collapsed ? null : 'task-1',
+        sidebarVisible: true,
+      }),
+    );
+    await loadState();
+    expect(store.tasks['task-1'].promptHistory).toEqual(history);
+    mockInvoke.mockClear();
+    await saveState();
+    const savedCall = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+    expect(savedCall).toBeDefined();
+    const saved = JSON.parse((savedCall?.[1] as { json: string }).json);
+    expect(saved.tasks['task-1'].promptHistory).toEqual(history);
+  });
+});
+
+it.each([false, true])('round-trips the chat session index (collapsed: %s)', async (collapsed) => {
+  const sessions = [
+    { threadId: 'saved-chat', provider: 'claude', title: 'Fix search', updatedAt: 1 },
+  ];
+  mockInvoke.mockResolvedValueOnce(
+    JSON.stringify({
+      projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'hsl(0, 70%, 75%)' }],
+      taskOrder: collapsed ? [] : ['task-1'],
+      collapsedTaskOrder: collapsed ? ['task-1'] : [],
+      tasks: { 'task-1': { ...persistedTask(agentDef()), chatSessions: sessions } },
+      activeTaskId: collapsed ? null : 'task-1',
+    }),
+  );
+  await loadState();
+  expect(store.tasks['task-1'].chatSessions).toEqual(sessions);
+  mockInvoke.mockClear();
+  await saveState();
+  const saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
+  expect(saved.tasks['task-1'].chatSessions).toEqual(sessions);
+});
+
+it('round-trips canvas task links for active and collapsed tasks without reviving closed targets', async () => {
+  const links = [
+    { canvas: 'mindmap', nodeId: 'node', taskId: 'closed-task', taskName: 'Original task' },
+    {
+      canvas: 'reasoning',
+      agentId: 'owner-agent',
+      runId: 'run',
+      nodeId: 'node',
+      taskId: 'target',
+      taskName: 'Work',
+    },
+  ];
+  mockInvoke.mockResolvedValueOnce(
+    JSON.stringify({
+      projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+      taskOrder: ['task-1'],
+      collapsedTaskOrder: ['task-2'],
+      activeTaskId: 'task-1',
+      tasks: {
+        'task-1': { ...persistedTask(agentDef()), canvasTaskLinks: [...links, { broken: true }] },
+        'task-2': {
+          ...persistedTask(agentDef()),
+          id: 'task-2',
+          collapsed: true,
+          canvasTaskLinks: links,
+        },
+      },
+    }),
+  );
+  await loadState();
+  for (const id of ['task-1', 'task-2']) expect(store.tasks[id].canvasTaskLinks).toEqual(links);
+  expect(store.tasks['closed-task']).toBeUndefined();
+  mockInvoke.mockClear();
+  mockInvoke.mockResolvedValueOnce(undefined);
+  await saveState();
+  const call = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+  const saved = JSON.parse(call?.[1].json);
+  for (const id of ['task-1', 'task-2']) expect(saved.tasks[id].canvasTaskLinks).toEqual(links);
+});
+
 // Fork direction: restoring the app must not respawn every persisted session with
 // resume args — that re-enters each agent's previous conversation and can trigger
 // automatic context compaction across all of them at once. Auto-resume is opt-in;
@@ -1135,32 +1773,5 @@ describe('session auto-resume (fork)', () => {
     await saveState();
     saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
     expect(saved.autoResumeSessions).toBe(true);
-  });
-});
-
-describe('saveState failure reporting', () => {
-  it('tells the user when the state file could not be written', async () => {
-    vi.useFakeTimers();
-    try {
-      setStore('notification', null);
-      mockInvoke.mockImplementation((channel: string) =>
-        channel === IPC.SaveAppState
-          ? Promise.reject(new Error('ENOSPC: no space left on device'))
-          : Promise.resolve(undefined),
-      );
-      await saveState();
-      expect(store.notification).toContain("Couldn't save app state");
-      expect(store.notification).toContain('ENOSPC');
-      // Rate-limited: a second failure right away does not re-toast...
-      setStore('notification', null);
-      await saveState();
-      expect(store.notification).toBeNull();
-      // ...but the reminder returns once the interval has passed.
-      vi.advanceTimersByTime(60_000);
-      await saveState();
-      expect(store.notification).toContain("Couldn't save app state");
-    } finally {
-      vi.useRealTimers();
-    }
   });
 });

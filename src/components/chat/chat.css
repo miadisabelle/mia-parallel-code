@@ -1,0 +1,839 @@
+:host {
+  display: block;
+  height: 100%;
+  min-height: 0;
+}
+.chat-root,
+.chat-ui {
+  container-type: size;
+  height: 100%;
+  min-height: 0;
+}
+/* CopilotKit resets these tokens on every nested data-copilotkit boundary. */
+.chat-ui,
+.chat-ui [data-copilotkit] {
+  --background: var(--task-panel-bg, var(--bg-elevated));
+  --foreground: var(--fg);
+  --card: var(--chat-surface);
+  --card-foreground: var(--fg);
+  --popover: var(--chat-surface);
+  --popover-foreground: var(--fg);
+  --primary: var(--chat-accent);
+  --primary-foreground: var(--accent-text);
+  --secondary: var(--chat-surface);
+  --secondary-foreground: var(--fg);
+  --muted: var(--chat-surface);
+  --muted-foreground: var(--fg-muted);
+  --accent: var(--bg-hover);
+  --accent-foreground: var(--fg);
+  --border: var(--chat-border);
+  --input: var(--chat-border);
+  --ring: var(--border-focus);
+  --destructive: var(--error);
+}
+.chat-ui {
+  --cpk-font-sans: var(--font-ui);
+  --cpk-font-mono: var(--font-mono);
+  --cpk-default-font-family: var(--font-ui);
+  --cpk-default-mono-font-family: var(--font-mono);
+  --cpk-text-xs: 11px;
+  --cpk-text-sm: 12px;
+  --cpk-text-base: 13px;
+  --cpk-text-lg: 15px;
+  --cpk-text-xl: 18px;
+  --cpk-text-2xl: 20px;
+  --cpk-text-3xl: 22px;
+  display: flex;
+  flex-direction: column;
+  color: var(--fg);
+  background: var(--background);
+  font: 13px/1.5 var(--font-ui);
+  color-scheme: light;
+}
+.chat-ui.dark {
+  color-scheme: dark;
+}
+.chat-view {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Conversation text carries the meaning, so it reads a step larger and looser
+   than the surrounding chrome, which stays at 11–13px. */
+.chat-ui [class*='prose'] {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--fg);
+  --tw-prose-body: var(--fg);
+  --tw-prose-headings: var(--fg);
+  --tw-prose-bold: var(--fg);
+  --tw-prose-links: var(--link);
+  --tw-prose-code: var(--fg);
+  --tw-prose-pre-bg: var(--chat-surface);
+}
+.chat-ui [class*='prose'] > :is(p, ul, ol, pre, blockquote) {
+  margin-block: 10px;
+}
+.chat-ui [class*='prose'] :is(h1, h2, h3, h4, h5, h6) {
+  margin-block: 18px 6px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+.chat-ui [class*='prose'] h1 {
+  font-size: 17px;
+}
+.chat-ui [class*='prose'] h2 {
+  font-size: 15px;
+}
+.chat-ui [class*='prose'] :is(h3, h4, h5, h6) {
+  font-size: 14px;
+}
+.chat-ui [class*='prose'] > :first-child {
+  margin-top: 0;
+}
+.chat-ui [class*='prose'] > :last-child {
+  margin-bottom: 0;
+}
+.chat-ui [class*='prose'] :not(pre) > code {
+  background: var(--chat-surface-strong);
+  border-radius: var(--radius-xs);
+  padding: 1px 4px;
+  font-size: 0.92em;
+}
+/* Tailwind prose wraps inline code in literal backticks; the surface says it. */
+.chat-ui [class*='prose'] :not(pre) > code::before,
+.chat-ui [class*='prose'] :not(pre) > code::after {
+  content: none;
+}
+
+/* A hairline above each user turn: without it a long log has no scannable
+   boundary between "what I asked" and "what the agent did". */
+.chat-ui .copilotKitUserMessage {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-subtle);
+}
+.chat-ui .copilotKitUserMessage:first-child {
+  margin-top: 0;
+  border-top: none;
+}
+.chat-ui .copilotKitUserMessage [class*='prose'] {
+  border-radius: var(--radius-lg);
+}
+
+.chat-ui textarea {
+  color: var(--fg);
+  font-size: 13px;
+}
+.chat-ui textarea::placeholder {
+  color: var(--fg-muted);
+}
+.chat-ui [data-testid='copilot-send-button'] {
+  background: var(--chat-accent);
+  color: var(--accent-text);
+}
+.chat-ui [data-testid='copilot-send-button']:enabled:hover {
+  background: var(--accent-hover);
+}
+.chat-ui [data-testid='copilot-scroll-to-bottom'] {
+  background: var(--chat-surface);
+  border-color: var(--chat-border);
+  color: var(--fg);
+}
+.chat-ui [data-testid='copilot-scroll-to-bottom'] svg {
+  color: inherit;
+}
+.chat-ui button:focus-visible,
+.chat-ui summary:focus-visible,
+.chat-ui input:focus-visible,
+.chat-ui select:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* Tool activity reads as one timeline rail rather than a stack of cards — a turn
+   with a dozen reads should not outweigh the prose around it. */
+.chat-tool {
+  border-left: 2px solid var(--chat-border);
+  margin: 0;
+  font-size: 12px;
+}
+.chat-tool summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  padding: 4px 8px 4px 10px;
+}
+.chat-tool summary:hover {
+  background: var(--chat-surface);
+}
+.chat-tool summary::before {
+  content: '›';
+  flex: none;
+  color: var(--fg-muted);
+  transition: transform 120ms ease;
+}
+.chat-tool[open] summary::before {
+  transform: rotate(90deg);
+}
+.chat-tool-type,
+.chat-tool-status {
+  color: var(--fg-muted);
+  font-size: 11px;
+  flex: none;
+}
+.chat-tool-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.chat-tool[data-status='running'] {
+  border-left-color: var(--chat-accent);
+}
+.chat-tool[data-status='running'] .chat-tool-status {
+  color: var(--chat-accent);
+}
+.chat-tool[data-status='failed'] {
+  border-left-color: var(--error);
+}
+.chat-tool[data-status='failed'] .chat-tool-status {
+  color: var(--error);
+}
+.chat-tool pre {
+  margin: 0 8px 8px 10px;
+  padding: 10px 12px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  border-radius: var(--radius-sm);
+  background: var(--chat-surface);
+}
+
+.chat-requests {
+  max-height: min(240px, 40cqh);
+  overflow: auto;
+  background: var(--chat-surface);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-md);
+  margin-bottom: 8px;
+}
+.chat-request {
+  padding: 12px;
+  border-left: 2px solid var(--chat-accent);
+  font-size: 13px;
+}
+/* A card that opens on Decline is the one worth a warning colour. */
+.chat-request[data-default='decline'] {
+  border-left-color: var(--warning);
+}
+.chat-request pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--chat-surface-strong);
+  font-size: 12px;
+}
+/* Monospace because this line often is a shell command: proportional spacing hides
+   the whitespace tricks an approval exists to catch. */
+.chat-request-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  margin: 8px 0;
+}
+.chat-request-note {
+  margin: 0 0 4px;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.chat-request-details > summary {
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.chat-request-details pre {
+  font-size: 11px;
+  max-height: 160px;
+  overflow: auto;
+}
+.chat-request label {
+  display: block;
+  margin: 12px 0 0;
+}
+.chat-request input {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  background: var(--chat-surface-strong);
+  color: var(--fg);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font: inherit;
+}
+.chat-request input::placeholder {
+  color: var(--fg-muted);
+}
+.chat-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+.chat-options button {
+  background: var(--chat-surface-strong);
+  color: var(--fg);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-sm);
+  padding: 5px 10px;
+  cursor: pointer;
+  font: inherit;
+}
+.chat-options button:enabled:hover {
+  border-color: var(--chat-accent);
+}
+.chat-options button[aria-pressed='true'] {
+  border-color: var(--chat-accent);
+}
+.chat-options button.chat-request-default {
+  background: var(--chat-accent);
+  border-color: var(--chat-accent);
+  color: var(--accent-text);
+}
+/* Only true while the card holds the keyboard — hidden otherwise, because Enter
+   then belongs to whatever does have focus (usually the composer). */
+.chat-request-hint {
+  display: none;
+  margin: 8px 0 0;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.chat-request:focus-within .chat-request-hint {
+  display: block;
+}
+.chat-ui button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.chat-error,
+.chat-request [role='alert'] {
+  color: var(--error);
+  padding: 8px 14px;
+}
+
+.chat-composer-dock {
+  pointer-events: auto;
+  width: 100%;
+  max-width: 768px;
+  margin: 0 auto;
+  /* The hint row below the composer carries the bottom gap. */
+  padding: 8px 12px 6px;
+}
+.chat-ui [data-testid='copilot-input-overlay'] {
+  background: var(--background);
+}
+.chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  background: var(--chat-surface);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-lg);
+}
+.chat-composer:focus-within {
+  border-color: var(--border-focus);
+}
+.chat-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+.chat-composer textarea {
+  field-sizing: content;
+  flex: 1;
+  min-width: 0;
+  min-height: 34px;
+  max-height: min(140px, 25cqh);
+  padding: 6px 8px;
+  line-height: 22px;
+}
+.chat-composer [data-testid='copilot-send-button'] {
+  min-width: 32px;
+  height: 32px;
+  margin: 1px;
+  flex: none;
+}
+/* Worth reading only while the user is about to type into an empty composer, but
+   its row is reserved either way: toggling `display` here moved the whole dock on
+   focus and again on the first keystroke. Fades instead, and never wraps. */
+.chat-composer-hint {
+  height: 16px;
+  margin-top: 4px;
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+.chat-composer:focus-within:has(textarea:placeholder-shown) + .chat-composer-hint {
+  opacity: 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-composer-hint {
+    transition: none;
+  }
+}
+
+.chat-ui [data-streamdown='code-block'] {
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.chat-ui [data-streamdown='code-block-header'],
+.chat-ui [data-streamdown='code-block-body'] {
+  background: var(--chat-surface) !important;
+}
+.chat-ui [data-streamdown='code-block-header'] {
+  border-bottom: 1px solid var(--chat-border);
+}
+.chat-ui [data-streamdown='code-block-body'] {
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.chat-ui.dark [data-streamdown='code-block-body'] span[style] {
+  color: var(--shiki-dark, var(--fg)) !important;
+}
+.chat-ui [data-streamdown='table-wrapper'] {
+  overflow-x: auto;
+}
+.chat-ui table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+}
+.chat-ui th,
+.chat-ui td {
+  border: 1px solid var(--chat-border);
+  padding: 6px 10px;
+  text-align: left;
+}
+.chat-ui th {
+  background: var(--chat-surface);
+}
+
+/* The model and reasoning pickers ride the composer's bottom edge as ghost
+   controls: present, legible, and not a form to fill in before typing. */
+.chat-model-settings {
+  padding: 0 2px 2px;
+}
+.chat-model-selectors {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+.chat-model-selectors select {
+  min-width: 0;
+  max-width: 180px;
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font: 11px/1.5 var(--font-ui);
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.chat-model-selectors select:enabled:hover {
+  background: var(--chat-surface-strong);
+  color: var(--fg);
+}
+.chat-model-selectors select:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.chat-model-selectors option {
+  background: var(--bg-elevated);
+  color: var(--fg);
+}
+.chat-model-error {
+  color: var(--error);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  padding: 2px;
+}
+.chat-model-error button {
+  margin-left: 8px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* Keep completed turns mounted: search, selections, and disclosure state belong
+   to the reader, even while the next turn streams. */
+.chat-transcript {
+  width: 100%;
+  max-width: 768px;
+  margin-inline: auto;
+  padding: 20px 20px 8px;
+  overflow-wrap: anywhere;
+}
+.chat-answer {
+  margin-block: 16px;
+}
+.chat-user-turn {
+  margin-top: 28px;
+}
+.chat-user-turn:first-child {
+  margin-top: 0;
+}
+.chat-speaker {
+  display: block;
+  text-align: right;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.chat-user-turn .copilotKitUserMessage {
+  margin-top: 4px;
+  padding-top: 0;
+  border-top: 0;
+}
+.chat-ui button {
+  font: inherit;
+}
+.chat-toolbar,
+.chat-context-actions,
+.chat-composer-settings {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.chat-toolbar {
+  flex: none;
+  justify-content: space-between;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--chat-border);
+}
+.chat-toolbar button,
+.chat-context-actions button,
+.chat-interrupt,
+.chat-review,
+.chat-file button,
+.chat-queue button {
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid transparent;
+}
+.chat-ui button:enabled:hover {
+  background-color: var(--chat-surface-strong);
+  color: var(--fg);
+}
+.chat-search {
+  position: relative;
+}
+.chat-search-panel {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  width: min(440px, 85cqw);
+  padding: 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px #0003;
+}
+.chat-search-results {
+  max-height: 35cqh;
+  overflow: auto;
+}
+.chat-search-results button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.chat-search input,
+.chat-file-picker input {
+  width: 100%;
+  padding: 6px 8px;
+  color: var(--fg);
+  background: var(--chat-surface);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-sm);
+  font: inherit;
+}
+.chat-search [role='status'] {
+  display: block;
+  margin-block: 6px;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.chat-activity-group {
+  margin-block: 8px;
+}
+.chat-activity-summary {
+  cursor: pointer;
+  padding: 6px 8px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--chat-surface);
+}
+.chat-activity-summary strong {
+  color: var(--error);
+  margin-left: 8px;
+}
+.chat-current-operation {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--chat-accent);
+  margin-top: 3px;
+}
+.chat-file {
+  display: flex;
+  gap: 8px;
+  padding: 4px 10px;
+}
+.chat-file button:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: left;
+  color: var(--link);
+}
+.chat-file button:last-child {
+  flex-shrink: 0;
+}
+.chat-plan {
+  font-size: 12px;
+  margin-bottom: 6px;
+  max-height: 22cqh;
+  overflow: auto;
+}
+.chat-plan summary {
+  cursor: pointer;
+  color: var(--fg-muted);
+}
+.chat-plan ol {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+.chat-plan li {
+  padding: 3px 0;
+}
+.chat-plan li[data-status='completed'] {
+  color: var(--fg-muted);
+}
+.chat-plan li[data-status='in_progress'] {
+  color: var(--chat-accent);
+}
+.chat-progress {
+  display: flex;
+  gap: 10px;
+  padding: 3px 4px 7px;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.chat-progress span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-progress time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.chat-composer textarea {
+  max-height: min(200px, 28cqh);
+}
+.chat-send {
+  border-radius: var(--radius-md);
+  padding: 4px 8px;
+  cursor: pointer;
+  border: 0;
+}
+.chat-stop {
+  flex: none;
+  padding: 6px;
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+.chat-composer-settings {
+  justify-content: space-between;
+}
+.chat-model-selectors {
+  flex-wrap: wrap;
+}
+.chat-composer-settings > select {
+  max-width: 150px;
+  font: 11px var(--font-ui);
+  color: var(--fg-muted);
+  background: transparent;
+  border: 0;
+  padding: 4px;
+}
+.chat-composer-settings option {
+  background: var(--bg-elevated);
+  color: var(--fg);
+}
+.chat-context-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 100px;
+  overflow: auto;
+}
+.chat-context-chips button {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 3px 6px;
+  color: var(--fg);
+  background: var(--chat-surface-strong);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  cursor: pointer;
+}
+.chat-context-chips img {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 3px;
+}
+.chat-image {
+  max-width: min(240px, 100%);
+  max-height: 180px;
+  object-fit: contain;
+  border-radius: var(--radius-md);
+  margin: 6px;
+}
+.chat-file-picker {
+  padding: 8px;
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-sm);
+}
+.chat-file-picker > div {
+  max-height: 20cqh;
+  overflow: auto;
+}
+.chat-file-picker button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.chat-file-picker button[aria-pressed='true'] {
+  color: var(--chat-accent);
+}
+.chat-queue {
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  max-height: 20cqh;
+  overflow: auto;
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.chat-queue > div {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.chat-queue span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chat-composer-dock {
+  max-height: 65cqh;
+  overflow-y: auto;
+}
+@container (max-width: 440px) {
+  .chat-transcript {
+    padding: 12px 10px 4px;
+  }
+  .chat-composer-dock {
+    padding-inline: 6px;
+  }
+  .chat-toolbar {
+    padding-inline: 8px;
+  }
+  .chat-model-selectors select {
+    max-width: 130px;
+  }
+}
+
+.chat-empty {
+  padding: 32px 8px;
+  color: var(--fg-muted);
+}
+.chat-empty strong {
+  font-size: 17px;
+  color: var(--fg);
+}
+.chat-empty p {
+  margin-top: 8px;
+}
+.chat-scroll-container {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.chat-scroll {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  overflow-anchor: none;
+}
+.chat-jump {
+  position: absolute;
+  z-index: 30;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 2px 8px #0003;
+  cursor: pointer;
+  font-size: 12px;
+}

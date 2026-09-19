@@ -4,11 +4,15 @@
 // and reply with the resulting task id. See electron/ipc/register.ts for the
 // main-side bridge.
 
+import { getTaskMindMap, openCanvasViewFromAgent, updateTaskMindMapFromAgent } from './canvas';
+import { getTaskReasoning, updateTaskReasoningFromAgent } from './reasoning';
 import { store } from './core';
+import { codeProjects } from './projects';
 import { createTask, updateTaskNotes } from './tasks';
 import { invoke } from '../lib/ipc';
+import { errMessage } from '../lib/log';
 import { IPC } from '../../electron/ipc/channels';
-import { resolveSkipPermissionsArgs } from '../../electron/ipc/agent-defaults';
+import { resolveSkipPermissionsArgs } from '../../electron/shared/skip-permissions';
 import type { AgentDef, GitIgnoredEntry } from '../ipc/types';
 
 interface RendererRequest {
@@ -30,22 +34,6 @@ interface SetNotesRequest extends RendererRequest {
   notes: string;
 }
 
-/**
- * Whether a task created from a phone launches its agent with skip-permissions.
- *
- * Mirrors the desktop New Task dialog: adopt the profile default, but only for
- * an agent that actually has a skip-permissions flag.  Without this the remote
- * path left skipPermissions undefined on every task it created, so a profile
- * with the flag defaulted ON still launched agents that prompt on every tool
- * call (#7) — the desktop dialog honoured the default and the phone did not.
- */
-export function remoteTaskSkipPermissions(
-  agentDef: Pick<AgentDef, 'command'> & Partial<Pick<AgentDef, 'skip_permissions_args'>>,
-  defaultSkipPermissions: boolean,
-): boolean {
-  return defaultSkipPermissions && resolveSkipPermissionsArgs(agentDef).length > 0;
-}
-
 function reply(reqId: string, ok: boolean, data?: unknown, error?: string): void {
   // Fire-and-forget: main resolves/rejects the pending HTTP response by reqId.
   invoke(IPC.Remote_RendererReply, { reqId, ok, data, error }).catch(() => {});
@@ -55,8 +43,30 @@ function handleGetProjects(req: RendererRequest): void {
   reply(
     req.reqId,
     true,
-    store.projects.map((p) => ({ id: p.id, name: p.name })),
+    codeProjects().map((p) => ({
+      id: p.id,
+      name: p.name,
+      agentName:
+        (store.availableAgents.find((a) => a.id === store.lastAgentId) ?? store.availableAgents[0])
+          ?.name ?? '',
+    })),
   );
+}
+
+/**
+ * Whether a task created from a paired phone should launch with the agent's
+ * skip-permissions flag.
+ *
+ * Mirrors the New Task dialog, which pre-ticks its checkbox from
+ * `defaultSkipPermissions` and only offers it for an agent that takes such a
+ * flag. Resolved by command too, so an agent restored from an older profile is
+ * treated the same as a freshly probed one.
+ */
+export function remoteSkipPermissions(
+  defaultSkipPermissions: boolean,
+  agentDef: Pick<AgentDef, 'command'> & Partial<Pick<AgentDef, 'skip_permissions_args'>>,
+): boolean {
+  return defaultSkipPermissions && resolveSkipPermissionsArgs(agentDef).length > 0;
 }
 
 async function handleCreateTask(req: CreateTaskRequest): Promise<void> {
@@ -95,7 +105,9 @@ async function handleCreateTask(req: CreateTaskRequest): Promise<void> {
       baseBranch,
       symlinkDirs,
       initialPrompt: req.prompt,
-      skipPermissions: remoteTaskSkipPermissions(agentDef, store.defaultSkipPermissions),
+      // Without this the flag was simply never passed, so every task created
+      // from a phone launched bare regardless of the setting.
+      skipPermissions: remoteSkipPermissions(store.defaultSkipPermissions, agentDef),
       // A task created from a phone must not move the desktop's selection: the
       // person at the desktop may be mid-sentence in another column, and the
       // jump would scroll the strip and re-target keyboard focus under them.
@@ -105,7 +117,7 @@ async function handleCreateTask(req: CreateTaskRequest): Promise<void> {
     });
     reply(req.reqId, true, { taskId });
   } catch (err) {
-    reply(req.reqId, false, undefined, err instanceof Error ? err.message : String(err));
+    reply(req.reqId, false, undefined, errMessage(err));
   }
 }
 
@@ -142,6 +154,28 @@ function handleSetNotes(req: SetNotesRequest): void {
 
 /** Subscribe to mobile task-creation requests. Returns an unsubscribe fn. */
 export function startRemoteTaskHandlers(): () => void {
+  const offReadReasoning = window.electron.ipcRenderer.on(
+    IPC.MCP_ReadReasoningRequest,
+    (data: unknown) => {
+      if (!data || typeof data !== 'object') return;
+      const req = data as GetNotesRequest;
+      void getTaskReasoning(req.taskId).then(
+        (document) => reply(req.reqId, true, document),
+        (error: unknown) => reply(req.reqId, false, undefined, errMessage(error)),
+      );
+    },
+  );
+  const offUpdateReasoning = window.electron.ipcRenderer.on(
+    IPC.MCP_UpdateReasoningRequest,
+    (data: unknown) => {
+      if (!data || typeof data !== 'object') return;
+      const req = data as GetNotesRequest & { update: unknown };
+      void updateTaskReasoningFromAgent(req.taskId, req.update).then(
+        (document) => reply(req.reqId, true, document),
+        (error: unknown) => reply(req.reqId, false, undefined, errMessage(error)),
+      );
+    },
+  );
   const offProjects = window.electron.ipcRenderer.on(
     IPC.Remote_GetProjectsRequest,
     (data: unknown) => {
@@ -166,7 +200,45 @@ export function startRemoteTaskHandlers(): () => void {
       if (data && typeof data === 'object') handleSetNotes(data as SetNotesRequest);
     },
   );
+  const offReadMap = window.electron.ipcRenderer.on(IPC.MCP_ReadMindMapRequest, (data: unknown) => {
+    if (!data || typeof data !== 'object') return;
+    const req = data as GetNotesRequest;
+    try {
+      reply(req.reqId, true, getTaskMindMap(req.taskId));
+    } catch (error) {
+      reply(req.reqId, false, undefined, errMessage(error));
+    }
+  });
+  const offUpdateMap = window.electron.ipcRenderer.on(
+    IPC.MCP_UpdateMindMapRequest,
+    (data: unknown) => {
+      if (!data || typeof data !== 'object') return;
+      const req = data as GetNotesRequest & { update: unknown };
+      void updateTaskMindMapFromAgent(req.taskId, req.update).then(
+        (map) => reply(req.reqId, true, map),
+        (error: unknown) => reply(req.reqId, false, undefined, errMessage(error)),
+      );
+    },
+  );
+  const offOpenCanvas = window.electron.ipcRenderer.on(
+    IPC.MCP_OpenCanvasRequest,
+    (data: unknown) => {
+      if (!data || typeof data !== 'object') return;
+      const req = data as GetNotesRequest & { view: unknown };
+      try {
+        openCanvasViewFromAgent(req.taskId, req);
+        reply(req.reqId, true, { ok: true });
+      } catch (error) {
+        reply(req.reqId, false, undefined, errMessage(error));
+      }
+    },
+  );
   return () => {
+    offReadReasoning();
+    offUpdateReasoning();
+    offReadMap();
+    offUpdateMap();
+    offOpenCanvas();
     offProjects();
     offCreate();
     offGetNotes();

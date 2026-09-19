@@ -1,4 +1,5 @@
 import { createSignal, untrack } from 'solid-js';
+import { isAgentChat } from './agent-chat';
 import { invoke } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
 import { store, setStore } from './core';
@@ -16,6 +17,7 @@ import { adoptTaskBranch } from './task-branch';
 import { clearAgentHookStatus, getAgentHookStatus } from './agentHookStatus';
 import {
   chunkContainsAgentPrompt,
+  getAgentPromptReadiness,
   PROMPT_PATTERNS,
   stripAnsi,
 } from '../../electron/mcp/prompt-detect';
@@ -128,6 +130,8 @@ export type TaskAttentionState = 'idle' | 'active' | 'needs_input' | 'error' | '
 // re-exported here for the store barrel and existing call sites.
 export { stripAnsi };
 
+const CODEX_STATUS_FOOTER_PATTERN = /^gpt-\S+[ \t]+[^\r\n]*[·•][ \t]+(?:\/|~\/)[^\r\n]*$/;
+
 /** Returns true if `line` looks like a prompt waiting for input. */
 function looksLikePrompt(line: string): boolean {
   const stripped = stripAnsi(line).trimEnd();
@@ -207,6 +211,20 @@ export function normalizeForComparison(text: string): string {
  * found (regular line-oriented terminal output).
  */
 export function normalizeCurrentFrame(rawTail: string): string {
+  const frameStart = findLastFrameStart(rawTail);
+  if (frameStart >= 0) {
+    return normalizeForComparison(rawTail.slice(frameStart));
+  }
+  // No frame-start marker found (e.g. cursor-up redraws).  Each redraw appends
+  // identical visible content so the full normalized string grows without bound.
+  // Taking a fixed-size suffix stabilises the comparison: once two consecutive
+  // frames have accumulated the last SUFFIX_LEN chars are always the same
+  // repeating frame content.
+  const SUFFIX_LEN = 1000;
+  return normalizeForComparison(rawTail).slice(-SUFFIX_LEN);
+}
+
+function findLastFrameStart(rawTail: string): number {
   // Matches the beginning of a new render cycle:
   //   \x1b[H        — cursor home (row 1, col 1)
   //   \x1b[1;NNH    — cursor to row 1, any column
@@ -219,16 +237,7 @@ export function normalizeCurrentFrame(rawTail: string): string {
   while ((m = frameStartRe.exec(rawTail)) !== null) {
     frameStart = m.index;
   }
-  if (frameStart >= 0) {
-    return normalizeForComparison(rawTail.slice(frameStart));
-  }
-  // No frame-start marker found (e.g. cursor-up redraws).  Each redraw appends
-  // identical visible content so the full normalized string grows without bound.
-  // Taking a fixed-size suffix stabilises the comparison: once two consecutive
-  // frames have accumulated the last SUFFIX_LEN chars are always the same
-  // repeating frame content.
-  const SUFFIX_LEN = 1000;
-  return normalizeForComparison(rawTail).slice(-SUFFIX_LEN);
+  return frameStart;
 }
 
 /** Patterns indicating the terminal is asking a question — do NOT auto-send.
@@ -447,6 +456,9 @@ const [questionAgents, setQuestionAgents] = createSignal<Set<string>>(new Set())
 
 /** True when the agent's terminal is showing a question or confirmation dialog. */
 export function isAgentAskingQuestion(agentId: string): boolean {
+  const agent = store.agents[agentId];
+  if (agent && isAgentChat(store.tasks[agent.taskId], agentId))
+    return !!agent.chatState?.requests.length;
   return questionAgents().has(agentId);
 }
 
@@ -497,7 +509,9 @@ export function getTaskOpenQuestion(taskId: string): TaskOpenQuestion | null {
   if (!task) return null;
 
   let newest: TaskOpenQuestion | null = null;
-  const runningAgentIds = task.agentIds.filter((id) => store.agents[id]?.status === 'running');
+  const runningAgentIds = task.agentIds.filter(
+    (id) => store.agents[id]?.status === 'running' || isAgentChat(task, id),
+  );
   for (const agentId of [...runningAgentIds, ...task.shellAgentIds]) {
     const since = agentQuestionSince(agentId, asking);
     if (since === undefined) continue;
@@ -507,6 +521,9 @@ export function getTaskOpenQuestion(taskId: string): TaskOpenQuestion | null {
 }
 
 function agentQuestionSince(agentId: string, asking: ReadonlySet<string>): number | undefined {
+  const agent = store.agents[agentId];
+  if (agent && isAgentChat(store.tasks[agent.taskId], agentId))
+    return agent.chatState?.requests.at(-1)?.since;
   const hook = getAgentHookStatus(agentId);
   if (hook?.state === 'waiting') return hook.since;
   if (hook?.state === 'working' || !asking.has(agentId)) return undefined;
@@ -774,23 +791,29 @@ export function markAgentOutput(agentId: string, data: Uint8Array, taskId?: stri
     now,
   );
 
-  // Extract last non-empty line from recent output for prompt matching.
-  // This check is UNTHROTTLED — it's cheap (single line, 6 patterns) and
-  // important for responsive idle detection.
-  const tail = combined.slice(-200);
-  let lastLine = '';
-  let searchEnd = tail.length;
-  while (searchEnd > 0) {
-    const nlIdx = tail.lastIndexOf('\n', searchEnd - 1);
-    const candidate = tail.slice(nlIdx + 1, searchEnd).trim();
-    if (candidate.length > 0) {
-      lastLine = candidate;
-      break;
-    }
-    searchEnd = nlIdx >= 0 ? nlIdx : 0;
-  }
+  // Focus, cursor and mode updates are terminal housekeeping, not agent work.
+  // Keep tracking their raw bytes above, but do not change or extend activity.
+  if (!normalizeForComparison(text)) return;
 
-  if (looksLikePrompt(lastLine)) {
+  const latestOutput = stripAnsi(text.slice(Math.max(0, findLastFrameStart(text))));
+  // A separately delivered footer says nothing about the turn. Preserve both
+  // activity and its timer instead of reinterpreting a prompt from older output.
+  if (CODEX_STATUS_FOOTER_PATTERN.test(latestOutput.trim())) return;
+
+  // A payload can contain multiple redraws; only the latest frame is current.
+  // Strip controls before splitting so a cursor-only line cannot hide a prompt.
+  const frame = combined.slice(Math.max(0, findLastFrameStart(combined)));
+  const lines = stripAnsi(frame)
+    .slice(-1000)
+    .split(/\r\n?|\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  // Codex renders its model/worktree footer below the input. Only skip this
+  // known footer, never arbitrary output that followed an earlier prompt.
+  if (CODEX_STATUS_FOOTER_PATTERN.test(lines.at(-1) ?? '')) lines.pop();
+  const lastLine = lines.at(-1) ?? '';
+  const readiness = getAgentPromptReadiness(latestOutput);
+  if ((readiness.ready || readiness.reason === 'no_prompt') && looksLikePrompt(lastLine)) {
     // Prompt detected — agent is idle. Remove from active set immediately.
     //
     // NOTE: do NOT cancel pendingAnalysis here.  TUI agents (Copilot CLI,
@@ -841,6 +864,9 @@ export function getAgentOutputTail(agentId: string): string {
 
 /** True when the agent is NOT producing output (e.g. sitting at a prompt). */
 export function isAgentIdle(agentId: string): boolean {
+  const agent = store.agents[agentId];
+  if (agent && isAgentChat(store.tasks[agent.taskId], agentId))
+    return agent.chatState?.status === 'ready';
   return !activeAgents().has(agentId);
 }
 
@@ -880,6 +906,7 @@ function hasTaskAgentError(taskId: string): boolean {
   if (!task) return false;
   return task.agentIds.some((id) => {
     const agent = store.agents[id];
+    if (agent && isAgentChat(task, id)) return !!agent.chatState?.error;
     if (agent?.status !== 'exited') return false;
     return agent.exitCode !== 0 || agent.signal !== null;
   });
@@ -889,6 +916,9 @@ function hasTaskAgentError(taskId: string): boolean {
  *  however much the screen looks like one. Only once the turn has ended do the
  *  heuristics get a say — login and trust prompts arrive with no hook at all. */
 function isAgentBlockedOnInput(agentId: string): boolean {
+  const agent = store.agents[agentId];
+  if (agent && isAgentChat(store.tasks[agent.taskId], agentId))
+    return !!agent.chatState?.requests.length;
   const hook = getAgentHookStatus(agentId);
   if (hook?.state === 'waiting') return true;
   if (hook?.state === 'working') return false;
@@ -898,6 +928,9 @@ function isAgentBlockedOnInput(agentId: string): boolean {
 /** Same precedence for activity: output still streaming after `Stop` is the
  *  agent redrawing its prompt, not work, and must not hold the task busy. */
 function isAgentWorking(agentId: string, active: ReadonlySet<string>): boolean {
+  const agent = store.agents[agentId];
+  if (agent && isAgentChat(store.tasks[agent.taskId], agentId))
+    return agent.chatState?.status === 'working' || agent.chatState?.status === 'starting';
   const hook = getAgentHookStatus(agentId);
   return hook ? hook.state === 'working' : active.has(agentId);
 }
@@ -909,7 +942,7 @@ function hasRunningTaskActivity(taskId: string, predicate: (id: string) => boole
   return (
     task.agentIds.some((id) => {
       const agent = store.agents[id];
-      return agent?.status === 'running' && predicate(id);
+      return (agent?.status === 'running' || isAgentChat(task, id)) && predicate(id);
     }) || task.shellAgentIds.some((id) => predicate(id))
   );
 }

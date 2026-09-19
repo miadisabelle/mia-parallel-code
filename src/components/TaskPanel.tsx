@@ -1,3 +1,4 @@
+import { TaskMindMap } from './TaskMindMap';
 import { Show, createSignal, createEffect, createMemo, onMount, onCleanup, batch } from 'solid-js';
 import {
   store,
@@ -8,13 +9,15 @@ import {
   clearPrefillPrompt,
   getProject,
   setTaskFocusedPanel,
-  triggerFocus,
   clearPendingAction,
   showNotification,
   setTaskSplitMode,
+  isTaskCanvasVisible,
 } from '../store/store';
 import { useFocusRegistration } from '../lib/focus-registration';
+import { scheduleTaskFocus } from '../store/focused-panel';
 import { ResizablePanel, type PanelChild } from './ResizablePanel';
+import { CANVAS_DEFAULT_WIDTH, CANVAS_MIN_WIDTH } from '../lib/layout-sizes';
 import type { EditableTextHandle } from './EditableText';
 import { PromptInput, type PromptInputHandle } from './PromptInput';
 import { CloseTaskDialog } from './CloseTaskDialog';
@@ -30,9 +33,11 @@ import { TaskNotesBody } from './TaskNotesBody';
 import { TaskChangedFilesSection } from './TaskChangedFilesSection';
 import { isCommitHashSelection, type CommitSelection } from './CommitNavBar';
 import { TaskShellSection } from './TaskShellSection';
+import { TaskCanvasPanel } from './TaskCanvasPanel';
 import { TaskStepsSection } from './TaskStepsSection';
 import { TaskCurrentStateLine } from './TaskCurrentStateLine';
 import { TaskAITerminal } from './TaskAITerminal';
+import { isAgentChat } from '../store/agent-chat';
 import { TaskClosingOverlay } from './TaskClosingOverlay';
 import { invoke } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
@@ -41,10 +46,14 @@ import { theme } from '../lib/theme';
 import { isMac } from '../lib/platform';
 import type { Task } from '../store/types';
 import type { CommitInfo } from '../ipc/types';
+import { TaskReasoningGraphHost } from './TaskReasoningGraphHost';
+import type { TranscriptMarks } from '../investigation/transcript';
 import { isLandedTaskState } from '../store/landing';
 import { shouldPollTaskCommits } from './task-commit-polling';
 import { devQualityFindingProvider } from './dev-quality-finding-fixture';
 import { createEslintQualityFindingProvider } from '../lib/eslint-quality-findings';
+import { createChangeTour } from '../lib/create-change-tour';
+import { getTaskDiffBaseBranch } from '../lib/load-task-diff';
 
 interface TaskPanelProps {
   task: Task;
@@ -94,6 +103,28 @@ export function TaskPanel(props: TaskPanelProps) {
   const [diffScrollTarget, setDiffScrollTarget] = createSignal<string | null>(null);
   const [commitList, setCommitList] = createSignal<CommitInfo[]>([]);
   const [selectedCommit, setSelectedCommit] = createSignal<CommitSelection>(null);
+  const tour = createChangeTour();
+  const tourBranchName = () =>
+    store.taskGitStatus[props.task.id]?.current_branch ?? props.task.branchName;
+  const diffBaseBranch = () =>
+    getTaskDiffBaseBranch(props.task.gitIsolation, props.task.baseBranch);
+  const [startTour, setStartTour] = createSignal(false);
+  const tourIdentity = createMemo(() =>
+    JSON.stringify([
+      props.task.id,
+      props.task.projectId,
+      props.task.worktreePath,
+      props.task.branchName,
+      diffBaseBranch(),
+      tourBranchName(),
+      selectedCommit(),
+    ]),
+  );
+  createEffect(() => {
+    void tourIdentity();
+    tour.reset();
+    setStartTour(false);
+  });
   const [editingProjectId, setEditingProjectId] = createSignal<string | null>(null);
   // Jump-to-step state is a single signal so ↗ can be hidden entirely before
   // TerminalView is ready (otherwise firstIndex would default to 0, showing ↗
@@ -101,15 +132,38 @@ export function TaskPanel(props: TaskPanelProps) {
   const [stepNav, setStepNav] = createSignal<
     { jump: (stepIndex: number) => boolean; firstIndex: number } | undefined
   >();
+  // Per-agent scrollback markers; jumping also brings the terminal into focus.
+  const [transcriptMarks, setTranscriptMarks] = createSignal<ReadonlyMap<string, TranscriptMarks>>(
+    new Map(),
+  );
+  function handleTranscriptMarks(agentId: string, api: TranscriptMarks | undefined) {
+    setTranscriptMarks((prev) => {
+      const next = new Map(prev);
+      if (!api) next.delete(agentId);
+      else
+        next.set(agentId, {
+          mark: api.mark,
+          jump: (key) => {
+            const ok = api.jump(key);
+            if (ok) setTaskFocusedPanel(props.task.id, 'ai-terminal');
+            return ok;
+          },
+        });
+      return next;
+    });
+  }
   let panelRef!: HTMLDivElement;
+  // The area left of the canvas column: what the split-mode threshold measures.
+  let mainRef!: HTMLDivElement;
   let promptRef: HTMLTextAreaElement | undefined;
   let titleEditHandle: EditableTextHandle | undefined;
   let promptHandle: PromptInputHandle | undefined;
 
-  // Two-column focus-mode layout kicks in once the task panel is wide enough.
-  // Hysteresis: enter at >=1200, leave at <1150. A single threshold flickers
+  // Two-column focus-mode layout kicks in once the main column is wide enough.
+  // Hysteresis: enter at >=1080, leave at <1030. A single threshold flickers
   // when the user drags the window edge across it, and every flip remounts the
-  // xterm terminal inside the left column.
+  // xterm terminal inside the left column. With a graph tab primary the main
+  // column is about a third of the tile, so the split stays off by design.
   const SPLIT_ENTER_WIDTH = 1080;
   const SPLIT_EXIT_WIDTH = 1030;
   const [panelWidth, setPanelWidth] = createSignal(0);
@@ -145,8 +199,8 @@ export function TaskPanel(props: TaskPanelProps) {
       const w = entries[0]?.contentRect.width ?? 0;
       setPanelWidth(w);
     });
-    ro.observe(panelRef);
-    setPanelWidth(panelRef.clientWidth);
+    ro.observe(mainRef);
+    setPanelWidth(mainRef.clientWidth);
     onCleanup(() => ro.disconnect());
   });
 
@@ -155,7 +209,7 @@ export function TaskPanel(props: TaskPanelProps) {
     if (!props.isActive) return;
     const panel = store.focusedPanel[props.task.id];
     if (panel) {
-      triggerFocus(`${props.task.id}:${panel}`);
+      scheduleTaskFocus(props.task.id, panel);
     }
   });
 
@@ -181,14 +235,13 @@ export function TaskPanel(props: TaskPanelProps) {
       if (focused && focused !== document.body) return;
       const remembered = store.focusedPanel[id];
       if (remembered) {
-        triggerFocus(`${id}:${remembered}`);
+        scheduleTaskFocus(id, remembered);
         return;
       }
-      if (store.showPromptInput) {
+      if (store.showPromptInput && !isAgentChat(props.task, firstAgentId())) {
         promptRef?.focus();
       } else {
         setTaskFocusedPanel(id, 'ai-terminal');
-        triggerFocus(`${id}:ai-terminal`);
       }
     }, 0);
   });
@@ -281,10 +334,7 @@ export function TaskPanel(props: TaskPanelProps) {
   // column. Until either has content the strip stays thin and the AI terminal
   // takes the space; a user drag on the divider pins a size as usual.
   const topStripEmpty = createMemo(
-    () =>
-      !props.task.notes?.trim() &&
-      !(store.showPlans && props.task.planContent) &&
-      (isGitUnavailable() || changedFileCount() === 0),
+    () => !props.task.notes?.trim() && (isGitUnavailable() || changedFileCount() === 0),
   );
 
   // Heavy components are created once and reused in both stack and split
@@ -295,6 +345,17 @@ export function TaskPanel(props: TaskPanelProps) {
   const aiTerminalEl = (
     <div style={{ position: 'relative', height: '100%' }}>
       <TaskAITerminal
+        onReview={
+          props.task.gitIsolation === 'none'
+            ? undefined
+            : (path) => {
+                batch(() => {
+                  setSelectedCommit(null);
+                  setStartTour(false);
+                  setDiffScrollTarget(path ?? '');
+                });
+              }
+        }
         task={props.task}
         isActive={props.isActive}
         selectedAgentId={selectedAgentId()}
@@ -303,10 +364,65 @@ export function TaskPanel(props: TaskPanelProps) {
         onStepJumpReady={(fn, fromIdx) => {
           setStepNav(fn ? { jump: fn, firstIndex: fromIdx } : undefined);
         }}
+        onTranscriptMarksReady={handleTranscriptMarks}
       />
     </div>
   );
   const shellSectionEl = <TaskShellSection task={props.task} isActive={props.isActive} />;
+  const canvasVisible = () => isTaskCanvasVisible(props.task);
+  const mindMapActive = () => props.task.canvasActiveTab === 'mindmap';
+  const graphActive = () => mindMapActive() || props.task.canvasActiveTab === 'reasoning';
+  // A focused tile is the whole window, so a graph tab gets about two thirds
+  // of it. The layout keeps its own pins, leaving the tiling canvas width alone.
+  const graphPrimary = () =>
+    store.focusMode &&
+    props.isActive &&
+    !store.showNewTaskPanel &&
+    canvasVisible() &&
+    graphActive();
+  // Graph hosts mount on first use and then stay, so switching tabs keeps
+  // their held state.
+  const canvasMounted = (kind: 'mindmap' | 'reasoning') => {
+    const [mounted, setMounted] = createSignal(false);
+    createEffect(() => {
+      if (props.task.canvasTabs?.some((tab) => tab.kind === kind)) setMounted(true);
+    });
+    return mounted;
+  };
+  const mindMapMounted = canvasMounted('mindmap');
+  const reasoningMounted = canvasMounted('reasoning');
+  const mindMapEl = createMemo(() =>
+    mindMapMounted() ? (
+      <TaskMindMap
+        task={props.task}
+        visible={mindMapActive() && canvasVisible() && (!store.focusMode || props.isActive)}
+        wide={graphPrimary()}
+      />
+    ) : undefined,
+  );
+  const reasoningGraphEl = createMemo(() =>
+    reasoningMounted() ? (
+      <TaskReasoningGraphHost
+        taskId={props.task.id}
+        transcriptMarks={(agentId) => transcriptMarks().get(agentId)}
+        visible={
+          canvasVisible() &&
+          props.task.canvasActiveTab === 'reasoning' &&
+          (!store.focusMode || props.isActive)
+        }
+        wide={graphPrimary()}
+      />
+    ) : undefined,
+  );
+  const canvasEl = (
+    <TaskCanvasPanel
+      task={props.task}
+      agentId={firstAgentId()}
+      isActive={props.isActive}
+      reasoning={reasoningGraphEl()}
+      mindmap={mindMapEl()}
+    />
+  );
   const notesBodyEl = (
     <TaskNotesBody
       task={props.task}
@@ -321,7 +437,27 @@ export function TaskPanel(props: TaskPanelProps) {
       commitList={commitList()}
       selectedCommit={selectedCommit()}
       onCommitNavigate={setSelectedCommit}
-      onDiffFileClick={(path) => setDiffScrollTarget(path)}
+      onDiffFileClick={(path) => {
+        setStartTour(false);
+        setDiffScrollTarget(path);
+      }}
+      tour={tour}
+      onTourClick={() => {
+        if (tour.stops().length > 0) {
+          setStartTour(true);
+          setDiffScrollTarget('__tour__');
+        } else {
+          void tour.generateForTask({
+            taskName: props.task.name,
+            worktreePath: props.task.worktreePath,
+            projectRoot: getProject(props.task.projectId)?.path,
+            branchName: tourBranchName(),
+            baseBranch: diffBaseBranch(),
+            selectedCommit: selectedCommit(),
+          });
+        }
+      }}
+      tourDisabled={changedFileCount() === 0}
       compact={topStripEmpty()}
       onFileCountChange={setChangedFileCount}
     />
@@ -385,12 +521,12 @@ export function TaskPanel(props: TaskPanelProps) {
     content: () => stepsSectionEl,
   };
 
-  // With no terminals open the shell section collapses to its 28 px toolbar.
+  // With no terminals open the shell section collapses to its 35 px toolbar.
   // Mark it noPin so dragging an adjacent handle can't pin it past content
   // size and leave a visible band of empty space above the AI terminal.
   const shellSectionChild: PanelChild = {
     id: 'shell-section',
-    minSize: 28,
+    minSize: 35,
     noPin: () => props.task.shellAgentIds.length === 0,
     content: () => shellSectionEl,
   };
@@ -431,9 +567,9 @@ export function TaskPanel(props: TaskPanelProps) {
   const notesAndFilesChild: PanelChild = {
     id: 'notes-files',
     minSize: 60,
-    absorberWeight: 0.5,
+    absorberWeight: 0.25,
     content: () => (
-      <div style={{ height: '100%', 'min-height': topStripEmpty() ? '64px' : '200px' }}>
+      <div style={{ height: '100%', 'min-height': topStripEmpty() ? '64px' : '140px' }}>
         {isGitUnavailable() ? (
           notesBodyEl
         ) : (
@@ -448,6 +584,93 @@ export function TaskPanel(props: TaskPanelProps) {
     ),
   };
 
+  // The task body left of the canvas. Created once so toggling the canvas
+  // column reparents it instead of remounting the terminal.
+  const mainEl = (
+    <div ref={mainRef} style={{ height: '100%', 'min-height': '0' }}>
+      {/* Layout flips swap containers; the terminal, composer, notes, and canvas stay mounted. */}
+      <Show
+        when={useSplit()}
+        fallback={
+          <ResizablePanel
+            direction="vertical"
+            persistKey={`task:${props.task.id}`}
+            absorberIds={topStripEmpty() ? ['ai-terminal'] : ['notes-files', 'ai-terminal']}
+            children={[
+              notesAndFilesChild,
+              shellSectionChild,
+              aiTerminalChild,
+              ...(props.task.stepsEnabled ? [stepsSectionChild] : []),
+              ...(!isAgentChat(props.task, firstAgentId()) &&
+              (store.showPromptInput || props.task.coordinatorMode)
+                ? [promptInputChild]
+                : []),
+            ]}
+          />
+        }
+      >
+        <ResizablePanel
+          direction="horizontal"
+          persistKey={`task:${props.task.id}:split-cols`}
+          absorberIds={['left-col']}
+          children={[
+            {
+              id: 'left-col',
+              minSize: 420,
+              content: () => (
+                <ResizablePanel
+                  direction="vertical"
+                  persistKey={`task:${props.task.id}:split-left`}
+                  absorberIds={['ai-terminal']}
+                  children={[
+                    aiTerminalChild,
+                    ...(!isAgentChat(props.task, firstAgentId()) &&
+                    (store.showPromptInput || props.task.coordinatorMode)
+                      ? [promptInputChild]
+                      : []),
+                  ]}
+                />
+              ),
+            },
+            {
+              id: 'right-col',
+              minSize: 360,
+              defaultSize: 420,
+              content: () => (
+                <ResizablePanel
+                  direction="vertical"
+                  persistKey={`task:${props.task.id}:split-right`}
+                  absorberIds={['shell-section']}
+                  children={[
+                    ...(isGitUnavailable() ? [] : [changedFilesChild]),
+                    notesChild,
+                    ...(props.task.stepsEnabled ? [stepsSectionChild] : []),
+                    shellSectionChild,
+                  ]}
+                />
+              ),
+            },
+          ]}
+        />
+      </Show>
+    </div>
+  );
+  const mainChild: PanelChild = {
+    id: 'main',
+    // The canvas needs a usable neighbor; a lone body must fit a 300px task tile.
+    get minSize() {
+      return canvasVisible() ? 360 : 0;
+    },
+    content: () => mainEl,
+  };
+  const canvasChild: PanelChild = {
+    id: 'canvas',
+    minSize: CANVAS_MIN_WIDTH,
+    defaultSize: CANVAS_DEFAULT_WIDTH,
+    absorberWeight: 2,
+    content: () => canvasEl,
+  };
+
   return (
     <div
       ref={panelRef}
@@ -459,6 +682,7 @@ export function TaskPanel(props: TaskPanelProps) {
         background: theme.taskContainerBg,
         'border-radius': 'var(--radius-lg)',
         border: `1px solid ${theme.border}`,
+        'border-left': `3px solid ${getProject(props.task.projectId)?.color ?? theme.border}`,
         overflow: 'clip',
         position: 'relative',
       }}
@@ -548,14 +772,18 @@ export function TaskPanel(props: TaskPanelProps) {
       <div
         class="task-header-stack"
         style={{
-          flex: `0 0 ${props.task.stepsEnabled ? 88 : 64}px`,
+          flex: `0 0 ${props.task.stepsEnabled ? 120 : 96}px`,
           display: 'flex',
           'flex-direction': 'column',
           overflow: 'hidden',
         }}
       >
         {/* Title + branch bars live outside <Show> so they don't remount on layout flips. */}
-        <div style={{ flex: '0 0 36px', overflow: 'hidden' }}>
+        {/* 68px fits the title bar's two rows: a 30px icon-button row, the 2px
+            row gap, a ~21px badge row, and the bar's 12px vertical padding.
+            The stack totals above are this plus the 28px branch bar (and the
+            24px steps line when enabled). */}
+        <div style={{ flex: '0 0 68px', overflow: 'hidden' }}>
           <TaskTitleBar
             task={props.task}
             isActive={props.isActive}
@@ -575,66 +803,12 @@ export function TaskPanel(props: TaskPanelProps) {
         </div>
       </div>
       <div style={{ flex: '1', 'min-height': '0' }}>
-        <Show
-          when={useSplit()}
-          fallback={
-            <ResizablePanel
-              direction="vertical"
-              persistKey={`task:${props.task.id}`}
-              absorberIds={topStripEmpty() ? ['ai-terminal'] : ['notes-files', 'ai-terminal']}
-              children={[
-                notesAndFilesChild,
-                shellSectionChild,
-                aiTerminalChild,
-                ...(props.task.stepsEnabled ? [stepsSectionChild] : []),
-                ...(store.showPromptInput || props.task.coordinatorMode ? [promptInputChild] : []),
-              ]}
-            />
-          }
-        >
-          <ResizablePanel
-            direction="horizontal"
-            persistKey={`task:${props.task.id}:split-cols`}
-            absorberIds={['left-col']}
-            children={[
-              {
-                id: 'left-col',
-                minSize: 420,
-                content: () => (
-                  <ResizablePanel
-                    direction="vertical"
-                    persistKey={`task:${props.task.id}:split-left`}
-                    absorberIds={['ai-terminal']}
-                    children={[
-                      aiTerminalChild,
-                      ...(store.showPromptInput || props.task.coordinatorMode
-                        ? [promptInputChild]
-                        : []),
-                    ]}
-                  />
-                ),
-              },
-              {
-                id: 'right-col',
-                minSize: 360,
-                defaultSize: 420,
-                content: () => (
-                  <ResizablePanel
-                    direction="vertical"
-                    persistKey={`task:${props.task.id}:split-right`}
-                    absorberIds={['shell-section']}
-                    children={[
-                      ...(isGitUnavailable() ? [] : [changedFilesChild]),
-                      notesChild,
-                      ...(props.task.stepsEnabled ? [stepsSectionChild] : []),
-                      shellSectionChild,
-                    ]}
-                  />
-                ),
-              },
-            ]}
-          />
-        </Show>
+        <ResizablePanel
+          direction="horizontal"
+          persistKey={`task:${props.task.id}:${graphPrimary() ? 'canvas-cols-graph' : 'canvas-cols'}`}
+          absorberIds={graphPrimary() ? ['main', 'canvas'] : ['main']}
+          children={canvasVisible() ? [mainChild, canvasChild] : [mainChild]}
+        />
       </div>
       <CloseTaskDialog
         open={showCloseConfirm()}
@@ -677,20 +851,30 @@ export function TaskPanel(props: TaskPanelProps) {
             }
           }}
         />
+      </Show>
+      <Show when={props.task.gitIsolation !== 'none'}>
         <DiffViewerDialog
+          tour={tour}
+          startTour={startTour()}
           scrollToFile={diffScrollTarget()}
           taskName={props.task.name}
           worktreePath={props.task.worktreePath}
           coverageReportPath={getProject(props.task.projectId)?.coverageReportPath}
           projectRoot={getProject(props.task.projectId)?.path}
           branchName={props.task.branchName}
-          baseBranch={props.task.baseBranch}
-          onClose={() => setDiffScrollTarget(null)}
+          baseBranch={diffBaseBranch()}
+          onClose={() => {
+            setDiffScrollTarget(null);
+            setStartTour(false);
+          }}
           taskId={props.task.id}
           agentId={selectedAgentId()}
           commitList={commitList()}
           selectedCommit={selectedCommit()}
-          onCommitNavigate={setSelectedCommit}
+          onCommitNavigate={(selection) => {
+            setStartTour(false);
+            setSelectedCommit(selection);
+          }}
           gitIsolation={props.task.gitIsolation}
           findingProvider={devQualityFindingProvider ?? eslintQualityFindingProvider}
         />

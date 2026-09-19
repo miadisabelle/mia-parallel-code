@@ -1,11 +1,15 @@
 import { produce } from 'solid-js/store';
+import { isAgentChat } from './agent-chat';
 import { invoke, Channel } from '../lib/ipc';
 import { asStoreVerificationRun } from '../lib/verification-run';
 import { IPC } from '../../electron/ipc/channels';
-import { getSkipPermissionsArgs } from '../../electron/ipc/agent-defaults';
+import { getSkipPermissionsArgs } from '../../electron/shared/skip-permissions';
+import { CANVAS_INSTRUCTIONS } from '../../electron/shared/canvas-view';
 import { store, setStore, cleanupPanelEntries } from './core';
+import { assignFreshSessionId } from './session-ids';
 import { effectiveAgentId } from './agent-select';
 import { saveState } from './persistence';
+import { MAX_PROMPT_HISTORY } from '../lib/prompt-history';
 import { setTaskFocusedPanel, shellPanelId } from './focused-panel';
 import { getProject, getProjectPath, getProjectBranchPrefix, isProjectMissing } from './projects';
 import { setPendingShellCommand } from '../lib/bookmarks';
@@ -38,6 +42,7 @@ import {
 } from '../lib/coordinator-limits';
 import { computeSidebarDraggableTaskOrder, getCoordinatorChildren } from './sidebar-order';
 import { isLandedTaskState } from './landing';
+import { forgetAgentPublication } from './reasoning-activity';
 
 export function createAgentRecord(args: {
   id: string;
@@ -137,6 +142,11 @@ function initTaskInStore(
     produce((s) => {
       s.tasks[taskId] = task;
       s.agents[agent.id] = agent;
+      // The task's own first pane needs an id as much as any pane added later.
+      // Without this it launches with the positional default, and once a second
+      // pane exists that default means "the newest session in this worktree" —
+      // the second pane's — so pane one comes back with the wrong conversation.
+      assignFreshSessionId(s, taskId, agent.id, agent.def.command);
       s.taskOrder.push(taskId);
       if (activate || s.activeTaskId === null) {
         s.activeTaskId = taskId;
@@ -519,7 +529,14 @@ export async function closeTask(taskId: string): Promise<void> {
     }
 
     // Skip git cleanup for direct mode (no worktree/branch) and imported worktrees (user-owned).
-    if (task.gitIsolation === 'worktree' && !task.externalWorktree) {
+    // Their checkout stays, so the task's reasoning reports must be removed on their own.
+    if (task.gitIsolation !== 'worktree' || task.externalWorktree) {
+      if (task.worktreePath)
+        await invoke(IPC.RemoveReasoningFeeds, { worktreePath: task.worktreePath, taskId }).catch(
+          (err: unknown) =>
+            logWarn('tasks', 'Failed to remove reasoning reports', { taskId, err: String(err) }),
+        );
+    } else {
       // Remove worktree + branch
       await invoke(IPC.DeleteTask, {
         taskId,
@@ -608,6 +625,7 @@ function removeTaskFromStore(taskId: string, agentIds: string[]): void {
     clearTimeout(activityTimer);
     activityReleaseTimers.delete(taskId);
   }
+  forgetAgentPublication(taskId);
 
   // Phase 1: mark as removing so UI can animate
   setStore('tasks', taskId, 'closingStatus', 'removing');
@@ -623,6 +641,19 @@ function removeTaskFromStore(taskId: string, agentIds: string[]): void {
 
     rescheduleTaskStatusPolling();
   }, REMOVE_ANIMATION_MS);
+}
+
+/** Drops a task and its agents from the store at once, with no closing
+ *  animation: for a task that was never listed, such as a document
+ *  workspace's agent task. The caller has killed the agents already. */
+export function forgetTask(taskId: string, agentIds: readonly string[]): void {
+  for (const agentId of agentIds) clearAgentActivity(agentId);
+  clearTaskGitStatusTracking(taskId);
+  setStore(
+    produce((s) => {
+      removeTaskDraftEntries(s, taskId, agentIds, effectiveAgentId);
+    }),
+  );
 }
 
 export async function mergeTask(
@@ -724,7 +755,26 @@ export function updateTaskNotes(taskId: string, notes: string): void {
   setStore('tasks', taskId, 'notes', notes);
 }
 
-export async function sendPrompt(taskId: string, agentId: string, text: string): Promise<void> {
+/** Canvas guidance goes out once per agent session; later mentions would only repeat it. */
+function canvasGuidanceDue(agentId: string, text: string): boolean {
+  const agent = store.agents[agentId];
+  if (!agent?.canvasTools || !/\b(?:reasoning\s+graph|mind\s*map|live\s+map)\b/i.test(text))
+    return false;
+  const sent = agent.canvasGuidanceGeneration;
+  return sent === undefined || sent !== agent.generation;
+}
+
+export async function sendPrompt(
+  taskId: string,
+  agentId: string,
+  text: string,
+  options: {
+    /** App-composed prompts carry their own canvas contract, so none is appended. */
+    appPrompt?: boolean;
+    /** Chat delivery, so the chat view streams the prompt through its own runtime. */
+    sendChat?: (text: string) => Promise<void>;
+  } = {},
+): Promise<void> {
   const task = store.tasks[taskId];
   assertTaskCanReceiveInput(taskId, agentId);
   const promptedAgentIds = task?.promptedAgentIds ?? [];
@@ -735,14 +785,38 @@ export async function sendPrompt(taskId: string, agentId: string, text: string):
   // When steps tracking is enabled but no initial prompt was provided in the dialog,
   // the steps instruction was never injected in createTask. Append it to each
   // agent's first manual prompt so newly added agents also maintain steps.json.
-  const injectSteps = !!(task?.stepsEnabled && !hasPromptedAgent && !isQueuedInitialPrompt);
-  const effectiveText = injectSteps ? `${text}\n\n---\n${STEPS_INSTRUCTION}` : text;
+  const hasPromptedConversation = isAgentChat(task, agentId)
+    ? !!store.agents[agentId]?.chatState?.items.some((item) => item.kind === 'user')
+    : hasPromptedAgent;
+  const injectSteps = !!(task?.stepsEnabled && !hasPromptedConversation && !isQueuedInitialPrompt);
+  let effectiveText = injectSteps ? `${text}\n\n---\n${STEPS_INSTRUCTION}` : text;
+
+  if (isAgentChat(task, agentId)) {
+    if (!options.appPrompt && !hasPromptedConversation && store.agents[agentId]?.canvasTools)
+      effectiveText += `\n\n---\n${CANVAS_INSTRUCTIONS}`;
+    if (options.sendChat) await options.sendChat(effectiveText);
+    else await invoke(IPC.AgentChat, { action: 'send', agentId, text: effectiveText });
+    setTaskLastInputAt(taskId);
+    setLastPrompt(taskId, text, agentId);
+    if (task && !hasPromptedAgent)
+      setStore('tasks', taskId, 'promptedAgentIds', [...promptedAgentIds, agentId]);
+    if (isQueuedInitialPrompt) setStore('tasks', taskId, 'initialPrompt', undefined);
+    void saveState();
+    return;
+  }
 
   // Send a Focus In escape sequence before the prompt text.  When the user focuses
   // the PromptInput textarea, the xterm.js terminal loses DOM focus.  For agents
   // that enable focus tracking (\x1b[?1004h), xterm.js sends \x1b[O (Focus Out)
   // to the PTY, which may suspend readline input processing; \x1b[I re-activates it.
   await writeToAgentWhenReady(taskId, agentId, '\x1b[I');
+  // MCP server instructions are not always surfaced by the CLI. Include the
+  // canvas contract with the first explicit mention of a session, including resumes.
+  // Check availability after waiting for startup to finish.
+  const withGuidance = !options.appPrompt && canvasGuidanceDue(agentId, text);
+  // The session the guidance is written to; a restart mid-send spawns one that never saw it.
+  const guidedGeneration = store.agents[agentId]?.generation;
+  if (withGuidance) effectiveText += `\n\n---\n${CANVAS_INSTRUCTIONS}`;
   // Send text and Enter separately so TUI apps (Claude Code, Codex)
   // don't treat the \r as part of a pasted block.  When the agent has enabled
   // bracketed paste, wrap only the prompt text; this avoids Codex's paste-burst
@@ -756,7 +830,12 @@ export async function sendPrompt(taskId: string, agentId: string, text: string):
   );
   await new Promise((r) => setTimeout(r, pasteDelayMs(effectiveText)));
   await writeToAgentWhenReady(taskId, agentId, '\r');
-  setStore('tasks', taskId, 'lastPrompt', text);
+  // App sends bypass xterm's onData handler, which normally clears this flag on Enter.
+  if (agentId === task?.agentIds[0]) setTaskTerminalInputPending(taskId, false);
+  // Recorded only after delivery, so a failed write does not silence the guidance.
+  if (withGuidance && store.agents[agentId]?.generation === guidedGeneration)
+    setStore('agents', agentId, 'canvasGuidanceGeneration', guidedGeneration);
+  setLastPrompt(taskId, text, agentId);
   if (task && !hasPromptedAgent) {
     setStore('tasks', taskId, 'promptedAgentIds', [...promptedAgentIds, agentId]);
     if (isQueuedInitialPrompt) setStore('tasks', taskId, 'initialPrompt', undefined);
@@ -764,7 +843,24 @@ export async function sendPrompt(taskId: string, agentId: string, text: string):
   }
 }
 
-export function setLastPrompt(taskId: string, text: string): void {
+export function setLastPrompt(taskId: string, text: string, agentId?: string): void {
+  const task = store.tasks[taskId];
+  if (!task || !text.trim()) return;
+  // Preserve the one prompt available in saves made before history was recorded.
+  const history = task.promptHistory ?? (task.lastPrompt ? [{ text: task.lastPrompt }] : []);
+  setStore(
+    'tasks',
+    taskId,
+    'promptHistory',
+    [
+      ...history,
+      {
+        text,
+        sentAt: Date.now(),
+        agentName: agentId ? store.agents[agentId]?.def?.name : undefined,
+      },
+    ].slice(-MAX_PROMPT_HISTORY),
+  );
   setStore('tasks', taskId, 'lastPrompt', text);
 }
 
@@ -971,7 +1067,8 @@ export async function collapseTask(taskId: string): Promise<void> {
   // so agents must be killed explicitly to avoid orphaned PTY processes.
   const agentIds = [...task.agentIds];
   const shellAgentIds = [...task.shellAgentIds];
-  const agentDefs = agentIds
+  const savedAgentIds = agentIds.filter((id) => store.agents[id]);
+  const agentDefs = savedAgentIds
     .map((id) => store.agents[id]?.def)
     .filter((def): def is AgentDef => Boolean(def));
   const promptedAgentIds = new Set(task.promptedAgentIds ?? []);
@@ -991,6 +1088,10 @@ export async function collapseTask(taskId: string): Promise<void> {
       s.tasks[taskId].collapsed = true;
       s.tasks[taskId].savedAgentDef = agentDefs[0];
       s.tasks[taskId].savedAgentDefs = agentDefs.length > 0 ? agentDefs : undefined;
+      s.tasks[taskId].savedAgentSessionIds = savedAgentIds.map(
+        (id) => task.agentSessionIds?.[id] ?? null,
+      );
+      s.tasks[taskId].agentSessionIds = undefined;
       s.tasks[taskId].savedSelectedAgentIndex =
         selectedAgentIndex >= 0 ? selectedAgentIndex : undefined;
       s.tasks[taskId].savedPromptedAgentIndexes =
@@ -1058,6 +1159,12 @@ export function uncollapseTask(taskId: string): void {
       }
 
       t.agentIds = restoredAgents.map((agent) => agent.id);
+      const sessions: Record<string, string> = {};
+      restoredAgents.forEach((agent, index) => {
+        const sessionId = t.savedAgentSessionIds?.[index];
+        if (sessionId) sessions[agent.id] = sessionId;
+      });
+      t.agentSessionIds = Object.keys(sessions).length > 0 ? sessions : undefined;
       const promptedAgentIds = promptedAgentIndexes
         .map((index) => t.agentIds[index])
         .filter((id): id is string => Boolean(id));
@@ -1065,6 +1172,7 @@ export function uncollapseTask(taskId: string): void {
       t.selectedAgentId = t.agentIds[selectedAgentIndex] ?? t.agentIds[0];
       t.savedAgentDef = undefined;
       t.savedAgentDefs = undefined;
+      t.savedAgentSessionIds = undefined;
       t.savedSelectedAgentIndex = undefined;
       t.savedPromptedAgentIndexes = undefined;
       s.activeAgentId = t.selectedAgentId ?? null;
@@ -1172,8 +1280,8 @@ export function initMCPListeners(): () => void {
         args: evt.agentArgs ?? [],
         resume_args: [],
         // Resolved, not empty: this def is synthesised when availableAgents has
-        // no entry for the coordinator's command, and an empty list here would
-        // strand a sub-task carrying skipPermissions: true on a bare launch (#7).
+        // no entry for the coordinator's command, and an empty list here strands
+        // a sub-task carrying skipPermissions: true on a bare launch.
         skip_permissions_args: getSkipPermissionsArgs(cmd),
         description: '',
       };
@@ -1571,9 +1679,11 @@ export function setPlanContent(
   taskId: string,
   content: string | null,
   fileName: string | null,
+  planPath: string | null = null,
 ): void {
   setStore('tasks', taskId, 'planContent', content ?? undefined);
   setStore('tasks', taskId, 'planFileName', fileName ?? undefined);
+  setStore('tasks', taskId, 'planPath', planPath ?? undefined);
 }
 
 export function setStepsContent(taskId: string, steps: unknown[] | null): void {
@@ -1584,6 +1694,9 @@ export function setStepsContent(taskId: string, steps: unknown[] | null): void {
 }
 
 export function setTaskLastInputAt(taskId: string): void {
+  // Terminals outside the task flow (the document workspace's agent) pass an
+  // id no task owns; writing through it would create a half-made task.
+  if (!store.tasks[taskId]) return;
   setStore('tasks', taskId, 'lastInputAt', new Date().toISOString());
 }
 
@@ -1635,6 +1748,13 @@ export function markTaskUserActivity(taskId: string): void {
     setTaskControl(taskId, 'human');
   }
   scheduleTaskAutomationRelease(taskId);
+}
+
+/** Store the unsent contents of the task's prompt box so a restart restores it.
+ *  Empty text is stored as `undefined` to keep the persisted file free of noise. */
+export function setTaskPromptDraft(taskId: string, text: string): void {
+  if (!store.tasks[taskId]) return;
+  setStore('tasks', taskId, 'promptDraft', text || undefined);
 }
 
 export function setTaskPromptDraftActive(taskId: string, active: boolean): void {

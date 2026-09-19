@@ -14,7 +14,8 @@ type MockStore = {
   sidebarFocusedTaskId: string | null;
   placeholderFocused: boolean;
   placeholderFocusedButton: 'add-task' | 'add-terminal';
-  showNewTaskDialog: boolean;
+  showNewTaskPanel: boolean;
+  newTaskPanelFocused: boolean;
   showHelpDialog: boolean;
   showSettingsDialog: boolean;
   showPromptInput: boolean;
@@ -40,7 +41,8 @@ const core = vi.hoisted(() => ({
   harness: undefined as MockStoreHarness<MockStore> | undefined,
 }));
 
-vi.mock('solid-js', () => ({
+vi.mock('solid-js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('solid-js')>()),
   batch: (fn: () => void) => fn(),
 }));
 
@@ -51,6 +53,7 @@ vi.mock('./core', async () => {
 });
 
 vi.mock('./navigation', () => ({
+  openPanelOrder: () => mockStore.taskOrder,
   setActiveTask: vi.fn((id: string) => {
     mockStore.activeTaskId = id;
     mockStore.activeAgentId = mockStore.tasks[id]?.agentIds?.[0] ?? null;
@@ -74,9 +77,17 @@ vi.mock('./tasks', () => ({
 import {
   navigateColumn,
   navigateRow,
+  navigateTask,
+  isPanelFocused,
+  registerAction,
+  registerFocusFn,
   scrollTaskElementIntoView,
   setPendingAction,
   setTaskFocusedPanel,
+  triggerAction,
+  triggerFocus,
+  unregisterAction,
+  unregisterFocusFn,
 } from './focus';
 import { showNotification } from './notification';
 
@@ -109,7 +120,8 @@ beforeEach(() => {
     sidebarFocusedTaskId: null,
     placeholderFocused: false,
     placeholderFocusedButton: 'add-task',
-    showNewTaskDialog: false,
+    showNewTaskPanel: false,
+    newTaskPanelFocused: false,
     showHelpDialog: false,
     showSettingsDialog: false,
     showPromptInput: true,
@@ -127,10 +139,154 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  unregisterFocusFn('new-task');
   vi.unstubAllGlobals();
 });
 
+describe('focus and action registries', () => {
+  it('lets a replacement keep the key when the component it replaced cleans up', () => {
+    const oldFocus = vi.fn();
+    const newFocus = vi.fn();
+    const oldSend = vi.fn();
+    const newSend = vi.fn();
+    registerFocusFn('task-1:prompt', oldFocus);
+    registerAction('task-1:send-prompt', oldSend);
+    // Two composers share a task's keys; whichever registers last is the visible one.
+    registerFocusFn('task-1:prompt', newFocus);
+    registerAction('task-1:send-prompt', newSend);
+
+    unregisterFocusFn('task-1:prompt', oldFocus);
+    unregisterAction('task-1:send-prompt', oldSend);
+
+    triggerFocus('task-1:prompt');
+    triggerAction('task-1:send-prompt');
+    expect(newFocus).toHaveBeenCalledOnce();
+    expect(newSend).toHaveBeenCalledOnce();
+    expect(oldFocus).not.toHaveBeenCalled();
+    expect(oldSend).not.toHaveBeenCalled();
+
+    unregisterFocusFn('task-1:prompt', newFocus);
+    unregisterAction('task-1:send-prompt', newSend);
+    triggerFocus('task-1:prompt');
+    triggerAction('task-1:send-prompt');
+    expect(newFocus).toHaveBeenCalledOnce();
+    expect(newSend).toHaveBeenCalledOnce();
+  });
+});
+
 describe('focus navigation neighbor map', () => {
+  it('includes an open new-task panel after the last task', () => {
+    setTask('task-1');
+    mockStore.showNewTaskPanel = true;
+    const focusDraft = vi.fn();
+    registerFocusFn('new-task', focusDraft);
+
+    navigateColumn('right');
+
+    expect(focusDraft).toHaveBeenCalledOnce();
+    expect(mockStore.placeholderFocused).toBe(false);
+    expect(mockStore.newTaskPanelFocused).toBe(true);
+    expect(isPanelFocused('task-1', 'ai-terminal:agent-1')).toBe(false);
+  });
+
+  it('returns from the new-task panel to the last task', () => {
+    setTask('task-1');
+    setTask('task-2');
+    mockStore.taskOrder = ['task-1', 'task-2'];
+    mockStore.showNewTaskPanel = true;
+    mockStore.newTaskPanelFocused = true;
+
+    navigateTask('left');
+
+    expect(mockStore.activeTaskId).toBe('task-2');
+    expect(mockStore.focusedPanel['task-2']).toBe('ai-terminal:agent-1');
+  });
+
+  it('keeps row navigation inside the new-task draft', () => {
+    setTask('task-1');
+    mockStore.focusedPanel['task-1'] = 'notes';
+    mockStore.showNewTaskPanel = true;
+    mockStore.newTaskPanelFocused = true;
+
+    navigateRow('down');
+    navigateRow('up');
+
+    // Row keys are global, so without a guard they reach the background task and
+    // pull focus out of the half-typed prompt.
+    expect(mockStore.newTaskPanelFocused).toBe(true);
+    expect(mockStore.focusedPanel['task-1']).toBe('notes');
+  });
+
+  it('includes an open new-task panel in direct next-task navigation', () => {
+    setTask('task-1');
+    mockStore.showNewTaskPanel = true;
+    const focusDraft = vi.fn();
+    registerFocusFn('new-task', focusDraft);
+
+    navigateTask('right');
+
+    expect(focusDraft).toHaveBeenCalledOnce();
+  });
+
+  describe.each([false, true])('canvas navigation (split: %s)', (split) => {
+    beforeEach(() => {
+      setTask('task-1', { canvasOpen: true });
+      mockStore.taskSplitMode['task-1'] = split;
+    });
+
+    it('enters the visible canvas from the right edge and returns left', () => {
+      mockStore.focusedPanel['task-1'] = 'changed-files';
+      navigateColumn('right');
+      expect(mockStore.focusedPanel['task-1']).toBe('canvas');
+      expect(mockStore.placeholderFocused).toBe(false);
+      navigateColumn('left');
+      expect(mockStore.focusedPanel['task-1']).toBe('changed-files');
+    });
+
+    it('enters the canvas from a lower row before crossing to the next task', () => {
+      setTask('task-2');
+      mockStore.taskOrder.push('task-2');
+      mockStore.focusedPanel['task-1'] = split ? 'shell-toolbar:0' : 'prompt';
+      navigateColumn('right');
+      expect(mockStore.focusedPanel['task-1']).toBe('canvas');
+      expect(mockStore.activeTaskId).toBe('task-1');
+      navigateColumn('right');
+      expect(mockStore.activeTaskId).toBe('task-2');
+    });
+
+    it('keeps down in the full-height canvas and moves up to the title', () => {
+      mockStore.focusedPanel['task-1'] = 'canvas';
+      navigateRow('down');
+      expect(mockStore.focusedPanel['task-1']).toBe('canvas');
+      navigateRow('up');
+      expect(mockStore.focusedPanel['task-1']).toBe('title');
+    });
+
+    it('keeps vertical navigation in the main panels', () => {
+      mockStore.focusedPanel['task-1'] = 'changed-files';
+      navigateRow('down');
+      expect(mockStore.focusedPanel['task-1']).toBe(split ? 'notes' : 'shell-toolbar:0');
+    });
+
+    it('includes restored tabs even without the explicit open flag', () => {
+      setTask('task-1', { canvasTabs: [{ kind: 'markdown', path: 'README.md' }] });
+      mockStore.focusedPanel['task-1'] = 'changed-files';
+      navigateColumn('right');
+      expect(mockStore.focusedPanel['task-1']).toBe('canvas');
+    });
+
+    it('skips a closed canvas and recovers stale canvas focus', () => {
+      setTask('task-1');
+      mockStore.focusedPanel['task-1'] = 'changed-files';
+      navigateColumn('right');
+      expect(mockStore.placeholderFocused).toBe(true);
+      mockStore.placeholderFocused = false;
+      mockStore.focusedPanel['task-1'] = 'canvas';
+      navigateRow('up');
+      expect(mockStore.focusedPanel['task-1']).not.toBe('canvas');
+    });
+  });
+
   it('moves down through stacked layout using explicit neighbors', () => {
     setTask('task-1');
     mockStore.focusedPanel['task-1'] = 'notes';
@@ -366,6 +522,7 @@ describe('scrollTaskElementIntoView', () => {
     setTask('task-1');
     setTask('task-2');
     mockStore.taskOrder = ['task-1', 'task-2'];
+    mockStore.activeTaskId = 'task-2';
     const scroller = createScroller();
     const el = createItem({ closest: vi.fn(() => scroller) } as Partial<HTMLElement>);
     vi.stubGlobal('document', {

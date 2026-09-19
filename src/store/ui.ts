@@ -1,3 +1,4 @@
+import { documentAgentTaskId } from '../documents/task-id';
 import { batch } from 'solid-js';
 import { produce } from 'solid-js/store';
 import { store, setStore } from './core';
@@ -231,6 +232,10 @@ export function setDefaultSkipPermissions(enabled: boolean): void {
   setStore('defaultSkipPermissions', enabled);
 }
 
+export function setCanvasOwnershipBadges(enabled: boolean): void {
+  setStore('canvasOwnershipBadges', enabled);
+}
+
 export function setDefaultPropagateSkipPermissions(enabled: boolean): void {
   setStore('defaultPropagateSkipPermissions', enabled);
 }
@@ -274,6 +279,15 @@ export function setShareDockerAgentAuth(enabled: boolean): void {
   setStore('shareDockerAgentAuth', enabled);
 }
 
+export function setDocumentWorkspacesEnabled(enabled: boolean): void {
+  setStore('documentWorkspacesEnabled', enabled);
+  if (!enabled) setStore('activeDocumentProjectId', null);
+}
+
+export function setDocumentFullWidth(fullWidth: boolean): void {
+  setStore('documentFullWidth', fullWidth);
+}
+
 export function toggleArena(show?: boolean): void {
   setStore('showArena', show ?? !store.showArena);
 }
@@ -283,7 +297,9 @@ export function toggleFocusMode(on?: boolean): void {
 }
 
 export function toggleTaskFocusMode(taskId: string | null = store.activeTaskId): void {
-  if (!taskId || !store.tasks[taskId]) return;
+  const isDocument =
+    store.activeDocumentProjectId && taskId === documentAgentTaskId(store.activeDocumentProjectId);
+  if (!taskId || (!store.tasks[taskId] && !isDocument)) return;
   const enteringFocusMode = !store.focusMode;
   if (store.activeTaskId !== taskId) setActiveTask(taskId);
   toggleFocusMode();

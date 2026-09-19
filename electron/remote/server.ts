@@ -1,11 +1,13 @@
 // electron/remote/server.ts
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
-import { existsSync, createReadStream } from 'fs';
+import { existsSync, createReadStream, readFileSync, rmSync } from 'fs';
 import { join, resolve, relative, extname, isAbsolute } from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { randomBytes, randomInt, timingSafeEqual } from 'crypto';
+import { randomBytes, randomInt, timingSafeEqual, createHash } from 'crypto';
 import { networkInterfaces } from 'os';
+import { atomicWriteFileSync } from '../mcp/atomic.js';
+import { warn } from '../log.js';
 import {
   writeToAgent,
   resizeAgent,
@@ -16,6 +18,7 @@ import {
   getActiveAgentIds,
   getAgentMeta,
   getAgentCols,
+  getAgentRows,
   onPtyEvent,
 } from '../ipc/pty.js';
 import {
@@ -24,6 +27,11 @@ import {
   type RemoteAgent,
   type RemoteAttentionState,
 } from './protocol.js';
+import { parseMindMapUpdate, type MindMapDocument, type MindMapUpdate } from '../shared/mindmap.js';
+import { parseReasoningUpdate } from '../shared/reasoning-feed.js';
+import { parseCanvasView, type CanvasView } from '../shared/canvas-view.js';
+import type { ReasoningDocument } from '../shared/reasoning.js';
+import type { ReasoningUpdate } from '../shared/reasoning-state.js';
 import type { Coordinator } from '../mcp/coordinator.js';
 import { validateBranchName } from '../mcp/validation.js';
 import type { ApiTaskDetail, LandSelfInput, SubtaskVerification } from '../mcp/types.js';
@@ -39,6 +47,8 @@ const MAX_LOG_ENTRIES = 200;
 const REST_COORDINATOR_SENTINEL = 'api';
 const MAX_REST_PROMPT_BYTES = 16 * 1024;
 const MAX_NOTES_BYTES = 100 * 1024;
+/** Give the TUI a read of its own for a prefix keystroke before the paste lands. */
+const PREFIX_KEY_DELAY_MS = 50;
 // Device pairing: a mobile client proves it can see the desktop by entering a
 // short-lived PIN, which elevates it to a "paired" token allowed to create tasks.
 const PAIRING_PIN_TTL_MS = 5 * 60_000;
@@ -229,7 +239,20 @@ const MIME: Record<string, string> = {
 };
 
 interface RemoteServer {
-  stop: () => Promise<void>;
+  /** Stop transport; explicit desktop disconnect also revokes remembered phones. */
+  stop: (forgetDevices?: boolean) => Promise<void>;
+  registerCanvasAgent: (taskId: string, agentId: string, isActive?: () => boolean) => string;
+  unregisterCanvasAgent: (agentId: string) => void;
+  hasCanvasAgents: () => boolean;
+  /** Move the listener to another interface; rejects and keeps the old one when the new
+   *  bind fails, or rejects with a dead handle (`listening` false) when neither binds. */
+  rebind: (host: string) => Promise<void>;
+  /** False once the handle has nothing listening and must be dropped by its owner. */
+  readonly listening: boolean;
+  /** Enable remembered phones only when the desktop explicitly enables remote access. */
+  enableRememberedDevices: (filePath: string) => void;
+  /** Revoke remembered phones while the server keeps running for canvas agents. */
+  forgetRememberedDevices: () => void;
   token: string;
   subtaskToken: string;
   mobileToken: string;
@@ -279,6 +302,9 @@ function buildAgentList(
     lastLine: string;
   },
   getTaskAttention: (taskId: string) => RemoteAttentionState,
+  getTaskContext?: (
+    taskId: string,
+  ) => Pick<RemoteAgent, 'projectName' | 'agentName' | 'lastLine'> | undefined,
 ): RemoteAgent[] {
   const byTask = new Map<string, RemoteAgent>();
   for (const agentId of getActiveAgentIds()) {
@@ -295,6 +321,7 @@ function buildAgentList(
       exitCode: info.exitCode,
       lastLine: info.lastLine,
       attention: getTaskAttention(meta.taskId),
+      ...getTaskContext?.(meta.taskId),
     };
     // Prefer running agents over exited ones for the same task
     const existing = byTask.get(meta.taskId);
@@ -306,6 +333,70 @@ function buildAgentList(
 }
 
 /** Read and JSON-parse a request body with a hard size cap. */
+type CanvasOps = Pick<
+  Parameters<typeof startRemoteServer>[0],
+  'readMindMap' | 'updateMindMap' | 'readReasoning' | 'updateReasoning' | 'openCanvas'
+>;
+type CanvasRoute = 'mindmaps' | 'reasoning' | 'canvas';
+const CANVAS_MAX_IN_FLIGHT = 4;
+// The renderer reports failures as plain messages; 409 tells the agent to read again, 400 to fix its input.
+const CANVAS_CONFLICT =
+  /read (it )?again|has changed|changed during|no longer available|still being written|revision changed|publish sequence 0/i;
+const CANVAS_UNAVAILABLE = /not available|did not respond|unavailable/i;
+
+function httpError(status: number, message: string): Error & { status: number } {
+  return Object.assign(new Error(message), { status });
+}
+
+function canvasErrorStatus(err: unknown): number {
+  const status = (err as { status?: unknown }).status;
+  if (typeof status === 'number') return status;
+  const message = String(err);
+  if (message.includes('Body too large')) return 413;
+  if (CANVAS_CONFLICT.test(message)) return 409;
+  return CANVAS_UNAVAILABLE.test(message) ? 503 : 400;
+}
+
+async function canvasRequest(
+  ops: CanvasOps,
+  req: IncomingMessage,
+  taskId: string,
+  route: CanvasRoute,
+): Promise<unknown> {
+  if (route === 'canvas') {
+    if (req.method !== 'POST') throw httpError(405, 'Method not allowed');
+    if (!ops.openCanvas) throw httpError(503, 'Canvas unavailable');
+    const view = parseCanvasView(await readJsonBody(req));
+    await ops.openCanvas(taskId, view);
+    return { ok: true, view };
+  }
+  const reasoning = route === 'reasoning';
+  if (req.method === 'GET') {
+    const read = reasoning ? ops.readReasoning : ops.readMindMap;
+    if (!read) throw httpError(503, 'Canvas unavailable');
+    return read(taskId);
+  }
+  if (reasoning) {
+    if (!ops.updateReasoning) throw httpError(503, 'Reasoning unavailable');
+    const body = await readJsonBody(req, 1024 * 1024);
+    return ops.updateReasoning(taskId, parseReasoningUpdate(body));
+  }
+  if (!ops.updateMindMap) throw httpError(503, 'Mind maps unavailable');
+  const body = await readJsonBody(req, 8 * 1024 * 1024);
+  return ops.updateMindMap(taskId, parseMindMapUpdate(body));
+}
+
+/** Sub-task ownership proof: the per-task done token must match exactly. */
+function doneTokenMatches(req: IncomingMessage, expected: string | null | undefined): boolean {
+  const incoming = req.headers['x-done-token'];
+  return Boolean(
+    expected &&
+    typeof incoming === 'string' &&
+    Buffer.byteLength(incoming) === Buffer.byteLength(expected) &&
+    timingSafeEqual(Buffer.from(incoming), Buffer.from(expected)),
+  );
+}
+
 function readJsonBody(
   req: IncomingMessage,
   maxBytes = 64 * 1024,
@@ -344,7 +435,7 @@ function readJsonBody(
 
 export type JsonReply = (status: number, body: unknown) => void;
 
-type TokenClass = 'coordinator' | 'subtask' | 'mobile' | 'paired';
+type TokenClass = 'coordinator' | 'subtask' | 'mobile' | 'paired' | 'canvas';
 
 export function createJsonReply(
   res: ServerResponse,
@@ -734,12 +825,21 @@ export function startRemoteServer(opts: {
     name: string;
     prompt: string;
   }) => Promise<{ taskId: string }>;
+  readMindMap?: (taskId: string) => Promise<MindMapDocument>;
+  readReasoning?: (taskId: string) => Promise<ReasoningDocument>;
+  updateReasoning?: (taskId: string, update: ReasoningUpdate) => Promise<ReasoningDocument>;
+  updateMindMap?: (taskId: string, update: MindMapUpdate) => Promise<MindMapDocument>;
+  /** Open or focus a canvas view for the agent's own task (renderer-backed). */
+  openCanvas?: (taskId: string, view: CanvasView) => Promise<void>;
   /** Read a task's notes (renderer-backed). */
   getTaskNotes?: (taskId: string) => Promise<string>;
   /** Persist a task's notes (renderer-backed). */
   setTaskNotes?: (taskId: string, notes: string) => Promise<void>;
   /** Renderer-derived task attention state (needs input, working, ready, …). */
   getTaskAttention?: (taskId: string) => RemoteAttentionState;
+  getTaskContext?: (
+    taskId: string,
+  ) => Pick<RemoteAgent, 'projectName' | 'agentName' | 'lastLine'> | undefined;
 }): Promise<RemoteServer> {
   // Defensive default for the optional signature: every real caller wires
   // attention via mobileTaskBridge, so 'idle' is only used if a future caller
@@ -751,21 +851,110 @@ export function startRemoteServer(opts: {
   const mobileToken = randomBytes(24).toString('base64url');
   const ips = getNetworkIps();
 
+  const canvasAgents = new Map<
+    string,
+    { taskId: string; token: Buffer; isActive?: () => boolean }
+  >();
+  const canvasActive = ([agentId, owner]: [
+    string,
+    { taskId: string; isActive?: () => boolean },
+  ]) => (owner.isActive ? owner.isActive() : getAgentMeta(agentId)?.taskId === owner.taskId);
+  // Renderer round-trips wait up to 120 s each; a small per-task cap keeps one agent from pinning memory.
+  const canvasInFlight = new Map<string, number>();
+  function acquireCanvasSlot(key: string): (() => void) | undefined {
+    const count = canvasInFlight.get(key) ?? 0;
+    if (count >= CANVAS_MAX_IN_FLIGHT) return;
+    canvasInFlight.set(key, count + 1);
+    return () => {
+      const remaining = (canvasInFlight.get(key) ?? 1) - 1;
+      if (remaining > 0) canvasInFlight.set(key, remaining);
+      else canvasInFlight.delete(key);
+    };
+  }
+  const canvasOwner = (candidate: string | null) =>
+    [...canvasAgents].find(([, owner]) => {
+      const incoming = Buffer.from(candidate ?? '');
+      return incoming.length === owner.token.length && timingSafeEqual(incoming, owner.token);
+    });
   const tokenBuf = Buffer.from(token);
   const subtaskTokenBuf = Buffer.from(subtaskToken);
   const mobileTokenBuf = Buffer.from(mobileToken);
 
-  // Tokens minted by successful device pairing. In-memory only: they die with
-  // the server, consistent with the mobile/coordinator tokens above. One entry
-  // per paired phone.
-  const pairedTokenBufs: Buffer[] = [];
-  // Bound the credential set: pairing is a user action on the desktop, so a
-  // handful covers every phone a person owns; beyond that the oldest is
-  // dropped. Eviction only stops future authentication with that token — a
-  // socket it already opened stays authenticated until it reconnects.
+  // Keep at most eight phones. Only hashes persist; bearer credentials stay on the phones.
+  // Eviction rejects future authentication; existing sockets stay open until reconnect.
   const MAX_PAIRED_TOKENS = 8;
+  let rememberedHashes: string[] = [];
+  let pairedTokenBufs: Buffer[] = [];
+  let pairedDevicesPath: string | undefined;
+
+  function enableRememberedDevices(filePath: string): void {
+    if (pairedDevicesPath === filePath) return;
+    let hashes: string[] = [];
+    try {
+      if (existsSync(filePath)) {
+        const stored: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
+        if (
+          !Array.isArray(stored) ||
+          !stored.every((v) => typeof v === 'string' && /^[a-f0-9]{64}$/.test(v))
+        ) {
+          throw new Error('Invalid remembered phone credentials');
+        }
+        hashes = stored.slice(-MAX_PAIRED_TOKENS);
+      }
+    } catch {
+      // A damaged/unreadable credential file must not strand a running server.
+      // Reject old credentials, but allow fresh PIN pairing to recover access.
+      warn(
+        'Remote',
+        'Could not restore remembered phones. Pair this phone again to restore access.',
+      );
+    }
+    pairedDevicesPath = filePath;
+    rememberedHashes = hashes;
+    pairedTokenBufs = [...hashes.map((hash) => Buffer.from(hash, 'hex')), ...pairedTokenBufs].slice(
+      -MAX_PAIRED_TOKENS,
+    );
+  }
+
+  function saveRememberedDevices(hashes: string[]): void {
+    if (!pairedDevicesPath) throw new Error('Remembering devices is unavailable');
+    atomicWriteFileSync(pairedDevicesPath, JSON.stringify(hashes), { mode: 0o600 });
+    rememberedHashes = hashes;
+  }
+
+  const describe = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+  /** Disconnect every paired phone, session-only ones included. Clearing the credential file
+   *  alone would not revoke anything: `isPairedToken` authenticates against `pairedTokenBufs`,
+   *  and re-enabling the same file is a no-op, so the file is never re-read. Sockets authenticate
+   *  once on connect, so an open one keeps reading output and sending input until it is closed. */
+  function revokePairedDevices(): void {
+    // Revoke before persisting. A credential file that cannot be written — read-only directory,
+    // full disk — must not leave every paired phone holding a working token.
+    pairedTokenBufs = [];
+    rememberedHashes = [];
+    for (const [client, type] of clientTokenTypes) if (type === 'paired') client.terminate();
+    if (!pairedDevicesPath) return;
+    try {
+      saveRememberedDevices([]);
+    } catch (error) {
+      // Rewriting the file failed, so delete it instead: a stale file the next run reads back is
+      // the whole problem, and an absent one pairs from scratch. Deleting needs a writable
+      // directory, which a full disk still has even when the atomic write's temp file does not.
+      try {
+        rmSync(pairedDevicesPath, { force: true });
+      } catch (removeError) {
+        warn(
+          'remote',
+          `Could not clear the remembered devices file; phones are revoked for this run but the next start will accept them again: ${describe(error)}; ${describe(removeError)}`,
+        );
+      }
+    }
+  }
+
   // At most one pending PIN at a time — a fresh mint replaces any prior one.
   let pairing: { pinBuf: Buffer; expiresAt: number; attemptsLeft: number } | null = null;
+  let stopping = false;
 
   function isPairedToken(buf: Buffer): boolean {
     // Timing-safe membership check; length guard avoids timingSafeEqual throwing.
@@ -780,7 +969,8 @@ export function startRemoteServer(opts: {
       return 'subtask';
     if (buf.length === mobileTokenBuf.length && timingSafeEqual(buf, mobileTokenBuf))
       return 'mobile';
-    if (isPairedToken(buf)) return 'paired';
+    if (isPairedToken(createHash('sha256').update(buf).digest())) return 'paired';
+    if (canvasOwner(candidate)) return 'canvas';
     return null;
   }
 
@@ -796,6 +986,7 @@ export function startRemoteServer(opts: {
   }
 
   function generatePairingPin(): { pin: string; expiresAt: number } {
+    if (stopping) throw new Error('Remote server is stopping');
     // 6-digit zero-padded PIN; single active PIN, short TTL, capped attempts.
     const pin = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const expiresAt = Date.now() + PAIRING_PIN_TTL_MS;
@@ -804,8 +995,11 @@ export function startRemoteServer(opts: {
   }
 
   /** Verify a submitted PIN; on success mints and returns a paired token. */
-  function verifyPairingPin(submitted: string): { ok: true; token: string } | { ok: false } {
-    if (!pairing || Date.now() > pairing.expiresAt) {
+  function verifyPairingPin(
+    submitted: string,
+    remember: boolean,
+  ): { ok: true; token: string } | { ok: false } {
+    if (stopping || !pairing || Date.now() > pairing.expiresAt) {
       pairing = null;
       return { ok: false };
     }
@@ -821,10 +1015,16 @@ export function startRemoteServer(opts: {
     }
     pairing = null; // single-use
     const pairedToken = randomBytes(24).toString('base64url');
-    pairedTokenBufs.push(Buffer.from(pairedToken));
-    if (pairedTokenBufs.length > MAX_PAIRED_TOKENS) {
-      pairedTokenBufs.splice(0, pairedTokenBufs.length - MAX_PAIRED_TOKENS);
+    const hash = createHash('sha256').update(pairedToken).digest();
+    const nextTokens = [...pairedTokenBufs, hash].slice(-MAX_PAIRED_TOKENS);
+    const nextRemembered = rememberedHashes.filter((h) =>
+      nextTokens.some((t) => t.toString('hex') === h),
+    );
+    if (remember) nextRemembered.push(hash.toString('hex'));
+    if (remember || nextRemembered.length !== rememberedHashes.length) {
+      saveRememberedDevices(nextRemembered);
     }
+    pairedTokenBufs = nextTokens;
     return { ok: true, token: pairedToken };
   }
 
@@ -857,6 +1057,45 @@ export function startRemoteServer(opts: {
         res.end(JSON.stringify(body));
       };
 
+      const mapMatch = url.pathname.match(/^\/api\/(mindmaps|reasoning|canvas)\/([^/]+)$/);
+      if (mapMatch) {
+        const route = mapMatch[1] as CanvasRoute;
+        let taskId: string;
+        try {
+          taskId = decodeURIComponent(mapMatch[2]);
+        } catch {
+          return jsonEnd(400, { error: 'Invalid task ID' });
+        }
+        if (!/^[a-zA-Z0-9_-]{1,128}$/.test(taskId))
+          return jsonEnd(400, { error: 'Invalid task ID' });
+        const orch = opts.getCoordinator();
+        const rawToken = extractRawToken(req);
+        const canvas = canvasOwner(rawToken);
+        const authorized =
+          (tokenClass === 'canvas' && canvas?.[1].taskId === taskId && canvasActive(canvas)) ||
+          (tokenClass === 'coordinator' &&
+            req.headers['x-coordinator-id'] === taskId &&
+            orch?.isRegisteredCoordinator(taskId)) ||
+          (tokenClass === 'subtask' && doneTokenMatches(req, orch?.getTaskDoneToken(taskId)));
+        if (!authorized)
+          return jsonEnd(403, { error: 'This session can only access its own task’s canvas.' });
+        if (req.method !== 'GET' && req.method !== 'POST')
+          return jsonEnd(405, { error: 'Method not allowed' });
+        // Coordinator sub-tasks share one token; cap per task so they do not starve each other.
+        const release = acquireCanvasSlot(`${tokenClass}:${taskId}`);
+        if (!release)
+          return jsonEnd(429, {
+            error: 'Too many concurrent canvas requests. Wait for earlier ones to finish.',
+          });
+        void canvasRequest(opts, req, taskId, route)
+          .then((result) => jsonEnd(200, result))
+          .catch((err) => jsonEnd(canvasErrorStatus(err), { error: String(err) }))
+          .finally(release);
+        return;
+      }
+      // Canvas credentials have no access to task control, terminals or device pairing.
+      if (tokenClass === 'canvas') return jsonEnd(403, { error: 'forbidden' });
+
       // --- Device pairing (mobile → paired elevation) ---
       // A phone holding the read-only mobile token submits the PIN shown on the
       // desktop to obtain a "paired" token allowed to create tasks. Proving the
@@ -868,7 +1107,18 @@ export function startRemoteServer(opts: {
           .then((body) => {
             const pin = typeof body.pin === 'string' ? body.pin.trim() : '';
             if (!/^\d{6}$/.test(pin)) return jsonEnd(400, { error: 'pin must be 6 digits' });
-            const outcome = verifyPairingPin(pin);
+            if (body.remember !== undefined && typeof body.remember !== 'boolean') {
+              return jsonEnd(400, { error: 'remember must be a boolean' });
+            }
+            let outcome;
+            try {
+              outcome = verifyPairingPin(pin, body.remember === true);
+            } catch {
+              return jsonEnd(500, {
+                error:
+                  'Could not remember this device. Try a new code or uncheck Keep this device authenticated.',
+              });
+            }
             if (!outcome.ok) return jsonEnd(401, { error: 'invalid or expired code' });
             jsonEnd(201, { token: outcome.token });
           })
@@ -1007,7 +1257,12 @@ export function startRemoteServer(opts: {
       }
 
       if (url.pathname === '/api/agents' && req.method === 'GET') {
-        const list = buildAgentList(opts.getTaskName, opts.getAgentStatus, getTaskAttention);
+        const list = buildAgentList(
+          opts.getTaskName,
+          opts.getAgentStatus,
+          getTaskAttention,
+          opts.getTaskContext,
+        );
         res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
         res.end(JSON.stringify(list));
         return;
@@ -1072,16 +1327,8 @@ export function startRemoteServer(opts: {
         const requireTask = (taskId: string) =>
           requireOwnedTask(orch, taskId, callerCoordinatorId, jsonReply);
 
-        const hasMatchingDoneToken = (taskId: string): boolean => {
-          const expected = orch.getTaskDoneToken(taskId);
-          const incoming = req.headers['x-done-token'];
-          return Boolean(
-            expected &&
-            typeof incoming === 'string' &&
-            incoming.length === expected.length &&
-            timingSafeEqual(Buffer.from(incoming), Buffer.from(expected)),
-          );
-        };
+        const hasMatchingDoneToken = (taskId: string): boolean =>
+          doneTokenMatches(req, orch.getTaskDoneToken(taskId));
 
         const taskIdMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(.+))?$/);
 
@@ -1201,6 +1448,7 @@ export function startRemoteServer(opts: {
   const clientSubs = new WeakMap<WebSocket, Map<string, (data: string) => void>>();
   const authenticatedClients = new Set<WebSocket>();
   const clientTokenTypes = new Map<WebSocket, 'coordinator' | 'mobile' | 'paired'>();
+  const pendingSubmissions = new Map<string, ReturnType<typeof setTimeout>>();
   const authTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
 
   function broadcast(msg: ServerMessage): void {
@@ -1213,16 +1461,27 @@ export function startRemoteServer(opts: {
   }
 
   const unsubSpawn = onPtyEvent('spawn', () => {
-    const list = buildAgentList(opts.getTaskName, opts.getAgentStatus, getTaskAttention);
+    const list = buildAgentList(
+      opts.getTaskName,
+      opts.getAgentStatus,
+      getTaskAttention,
+      opts.getTaskContext,
+    );
     broadcast({ type: 'agents', list });
   });
 
   const unsubListChanged = onPtyEvent('list-changed', () => {
-    const list = buildAgentList(opts.getTaskName, opts.getAgentStatus, getTaskAttention);
+    const list = buildAgentList(
+      opts.getTaskName,
+      opts.getAgentStatus,
+      getTaskAttention,
+      opts.getTaskContext,
+    );
     broadcast({ type: 'agents', list });
   });
 
   const unsubExit = onPtyEvent('exit', (agentId, data) => {
+    canvasAgents.delete(agentId);
     const { exitCode } = (data ?? {}) as { exitCode?: number };
     broadcast({ type: 'status', agentId, status: 'exited', exitCode: exitCode ?? null });
     // Clean stale subscription entries from all connected clients
@@ -1230,7 +1489,12 @@ export function startRemoteServer(opts: {
       clientSubs.get(client)?.delete(agentId);
     }
     setTimeout(() => {
-      const list = buildAgentList(opts.getTaskName, opts.getAgentStatus, getTaskAttention);
+      const list = buildAgentList(
+        opts.getTaskName,
+        opts.getAgentStatus,
+        getTaskAttention,
+        opts.getTaskContext,
+      );
       broadcast({ type: 'agents', list });
     }, 100);
   });
@@ -1243,7 +1507,12 @@ export function startRemoteServer(opts: {
     if (classifyToken(req) === 'coordinator') {
       authenticatedClients.add(ws);
       clientTokenTypes.set(ws, 'coordinator');
-      const list = buildAgentList(opts.getTaskName, opts.getAgentStatus, getTaskAttention);
+      const list = buildAgentList(
+        opts.getTaskName,
+        opts.getAgentStatus,
+        getTaskAttention,
+        opts.getTaskContext,
+      );
       ws.send(JSON.stringify({ type: 'agents', list } satisfies ServerMessage));
     } else {
       // Close unauthenticated connections after 5 seconds. Distinct code from
@@ -1271,7 +1540,12 @@ export function startRemoteServer(opts: {
           clientTokenTypes.set(ws, tokenType);
           const timer = authTimers.get(ws);
           if (timer) clearTimeout(timer);
-          const list = buildAgentList(opts.getTaskName, opts.getAgentStatus, getTaskAttention);
+          const list = buildAgentList(
+            opts.getTaskName,
+            opts.getAgentStatus,
+            getTaskAttention,
+            opts.getTaskContext,
+          );
           ws.send(JSON.stringify({ type: 'agents', list } satisfies ServerMessage));
         } else {
           ws.close(4001, 'Unauthorized');
@@ -1302,13 +1576,74 @@ export function startRemoteServer(opts: {
       }
 
       switch (msg.type) {
-        case 'input':
-          try {
-            writeToAgent(msg.agentId, msg.data);
-          } catch {
-            /* agent gone */
+        case 'input': {
+          const reply = (ok: boolean, error?: string) => {
+            if (msg.requestId && ws.readyState === WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: 'input-result',
+                  requestId: msg.requestId,
+                  ok,
+                  error,
+                } satisfies ServerMessage),
+              );
+            }
+          };
+          if (pendingSubmissions.has(msg.agentId)) {
+            reply(false, 'Another message is being submitted. Try again in a moment.');
+            break;
           }
+          const writeText = () => {
+            try {
+              writeToAgent(msg.agentId, msg.data);
+            } catch {
+              reply(false, 'This agent is no longer available. Your draft has been kept.');
+              return;
+            }
+            if (!msg.submit) {
+              reply(true);
+              return;
+            }
+            // Let the TUI finish processing pasted text before submitting it.
+            const delay = Math.min(500, Math.max(50, msg.data.split('\n').length * 15));
+            pendingSubmissions.set(
+              msg.agentId,
+              setTimeout(() => {
+                pendingSubmissions.delete(msg.agentId);
+                try {
+                  writeToAgent(msg.agentId, String.fromCharCode(13));
+                  reply(true);
+                } catch {
+                  reply(
+                    false,
+                    'Text reached the terminal, but submission failed. Check the terminal before retrying.',
+                  );
+                }
+              }, delay),
+            );
+          };
+          if (!msg.prefixKey) {
+            writeText();
+            break;
+          }
+          try {
+            writeToAgent(msg.agentId, msg.prefixKey);
+          } catch {
+            reply(false, 'This agent is no longer available. Your draft has been kept.');
+            break;
+          }
+          // Keep holding the agent across the gap: the prefix needs its own
+          // terminal read to register as a keystroke, and another phone
+          // submitting into the shell prompt it opens would run as a command.
+          pendingSubmissions.set(
+            msg.agentId,
+            setTimeout(() => {
+              pendingSubmissions.delete(msg.agentId);
+              writeText();
+            }, PREFIX_KEY_DELAY_MS),
+          );
           break;
+        }
 
         case 'resize':
           try {
@@ -1338,6 +1673,7 @@ export function startRemoteServer(opts: {
                 agentId: msg.agentId,
                 data: scrollback,
                 cols: getAgentCols(msg.agentId),
+                rows: getAgentRows(msg.agentId),
               } satisfies ServerMessage),
             );
           }
@@ -1385,9 +1721,13 @@ export function startRemoteServer(opts: {
     });
   });
 
-  const bindHost = opts.host ?? '0.0.0.0';
+  let bindHost = opts.host ?? '0.0.0.0';
+  let rebinding: Promise<void> | undefined;
 
-  server.on('error', (err) => {
+  // ws forwards HTTP server errors to itself before the HTTP startup listener
+  // runs. Handle that event so a port collision can reject startup and let the
+  // caller try the next port, instead of throwing and leaving startup pending.
+  wss.on('error', (err) => {
     console.error('[remote] Server error:', err.message);
   });
 
@@ -1398,11 +1738,70 @@ export function startRemoteServer(opts: {
   const url = `http://${primaryIp}:${opts.port}?token=${mobileToken}`;
 
   const result: RemoteServer = {
+    unregisterCanvasAgent: (agentId) => {
+      canvasAgents.delete(agentId);
+    },
+    registerCanvasAgent: (taskId, agentId, isActive) => {
+      const existing = canvasAgents.get(agentId);
+      if (existing?.taskId === taskId) return existing.token.toString();
+      const secret = randomBytes(24).toString('base64url');
+      canvasAgents.set(agentId, { taskId, token: Buffer.from(secret), isActive });
+      return secret;
+    },
+    hasCanvasAgents: () => [...canvasAgents].some(canvasActive),
     token,
     subtaskToken,
     mobileToken,
     port: opts.port,
-    bindHost,
+    get bindHost() {
+      return bindHost;
+    },
+    get listening() {
+      return server.listening;
+    },
+    rebind: async (host) => {
+      if (rebinding) await rebinding;
+      if (bindHost === host) return;
+      const previous = bindHost;
+      // Keep the HTTP handler, credentials and WebSocket server when changing interfaces.
+      rebinding = new Promise<void>((resolve, reject) => {
+        // close() releases the listener at once but its callback waits for every socket,
+        // including upgraded WebSockets, so drop them all and listen again immediately.
+        for (const client of wss.clients) client.terminate();
+        server.close();
+        server.closeAllConnections();
+        const listenOn = (target: string, done: (error?: Error) => void) => {
+          const onListening = () => {
+            server.off('error', onError);
+            bindHost = target;
+            done();
+          };
+          const onError = (error: Error) => {
+            // listen() keeps its callback as a once('listening') handler after a failed
+            // bind; drop ours so a fallback's success cannot resolve for the failed target.
+            server.off('listening', onListening);
+            done(error);
+          };
+          server.once('listening', onListening);
+          server.once('error', onError);
+          server.listen(result.port, target);
+        };
+        listenOn(host, (error) => {
+          if (!error) return resolve();
+          // The previous listener is already closed; get it back so the handle stays usable.
+          listenOn(previous, (restoreError) => {
+            if (!restoreError) return reject(error);
+            // Nothing listens any more: release what stop() would, then hand back the failure.
+            void result.stop().finally(() => reject(restoreError));
+          });
+        });
+      });
+      try {
+        await rebinding;
+      } finally {
+        rebinding = undefined;
+      }
+    },
     url,
     /** Re-detect network IPs so newly connected interfaces (e.g. Tailscale) are picked up. */
     get wifiUrl() {
@@ -1415,8 +1814,17 @@ export function startRemoteServer(opts: {
     },
     connectedClients: () => authenticatedClients.size,
     generatePairingPin,
-    stop: () =>
-      new Promise<void>((resolve) => {
+    enableRememberedDevices,
+    forgetRememberedDevices: revokePairedDevices,
+    stop: (forgetDevices = false) => {
+      if (forgetDevices) revokePairedDevices();
+      // server.close() drains pending HTTP bodies. They must not mint new
+      // credentials after explicit disconnect has revoked remembered phones.
+      stopping = true;
+      pairing = null;
+      return new Promise<void>((resolve) => {
+        for (const timer of pendingSubmissions.values()) clearTimeout(timer);
+        pendingSubmissions.clear();
         unsubSpawn();
         unsubExit();
         unsubListChanged();
@@ -1427,11 +1835,18 @@ export function startRemoteServer(opts: {
           clearTimeout(timeout);
           resolve();
         });
-      }),
+      });
+    },
   };
 
   return new Promise<RemoteServer>((resolve, reject) => {
-    const onError = (err: NodeJS.ErrnoException) => reject(toFriendlyListenError(err, opts.port));
+    const onError = (err: NodeJS.ErrnoException) => {
+      unsubSpawn();
+      unsubExit();
+      unsubListChanged();
+      wss.close();
+      reject(toFriendlyListenError(err, opts.port));
+    };
     server.once('error', onError);
     server.listen(opts.port, bindHost, () => {
       server.removeListener('error', onError);

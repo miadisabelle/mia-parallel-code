@@ -1,6 +1,7 @@
 import path from 'path';
 import { defineConfig, type Plugin } from 'vite';
 import solid from 'vite-plugin-solid';
+import react from '@vitejs/plugin-react';
 
 const rootDir = path.resolve(process.cwd());
 const parentDir = path.resolve(rootDir, '..');
@@ -26,7 +27,7 @@ export const RENDERER_CSP = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob: http: https:",
   "font-src 'self' data:",
-  "connect-src 'self'",
+  "connect-src 'self' parallel-chat:",
   "worker-src 'self' blob:",
   "media-src 'self' blob:",
   "object-src 'none'",
@@ -52,7 +53,11 @@ function rendererCspPlugin(): Plugin {
 
 export default defineConfig({
   base: './',
-  plugins: [solid(), rendererCspPlugin()],
+  plugins: [
+    solid({ exclude: /\.react\.tsx$/ }),
+    react({ include: /\.react\.tsx$/ }),
+    rendererCspPlugin(),
+  ],
   clearScreen: false,
   server: {
     port: 1421,
@@ -62,13 +67,14 @@ export default defineConfig({
       // source-tree change to Vite in dev mode, causing the renderer to reload
       // right when Parallel Code creates a task for itself. The function ignores
       // anything resolving outside the project root (e.g. host parent dirs).
-      ignored: [
-        '**/.worktrees/**',
-        (watchedPath: string) => {
-          const resolvedPath = path.resolve(watchedPath);
-          return resolvedPath.startsWith(parentDir) && !resolvedPath.startsWith(rootDir);
-        },
-      ],
+      ignored: (watchedPath: string) => {
+        const resolvedPath = path.resolve(watchedPath);
+        // Match nested worktrees relative to this checkout, not its ancestors.
+        return (
+          path.relative(rootDir, resolvedPath).split(path.sep).includes('.worktrees') ||
+          (resolvedPath.startsWith(parentDir) && !resolvedPath.startsWith(rootDir))
+        );
+      },
     },
   },
 });

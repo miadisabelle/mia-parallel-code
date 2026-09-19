@@ -29,6 +29,7 @@ type MockTask = {
   coordinatedBy?: string;
   agentIds: string[];
   shellAgentIds: string[];
+  agentSessionIds?: Record<string, string>;
   [key: string]: unknown;
 };
 
@@ -153,10 +154,12 @@ import {
   initMCPListeners,
   setTaskControl,
   collapseTask,
+  uncollapseTask,
   closeTask,
   mergeTask,
   pushTask,
   sendPrompt,
+  setLastPrompt,
   pasteDelayMs,
   markTaskUserActivity,
   setTaskPromptDraftActive,
@@ -179,6 +182,7 @@ import { getCoordinatorChildren } from './sidebar-order';
 import { recordMergedLines, recordTaskMerged } from './completion';
 import { markAgentSpawned, rescheduleTaskStatusPolling } from './taskStatus';
 import { saveState } from './persistence';
+import { MAX_PROMPT_HISTORY } from '../lib/prompt-history';
 import { getProjectBranchPrefix, getProjectPath, isProjectMissing } from './projects';
 const mockSetStore = expectDefined(core.harness, 'mock store harness').setStore;
 
@@ -460,6 +464,22 @@ describe('MCP_TaskCreated IPC handler', () => {
     taskCreatedHandler(baseEvent);
     expect(mockTasks['sub-task-1'].controlledBy).toBeDefined();
   });
+
+  // This def is synthesised when availableAgents has no entry for the
+  // coordinator's command, and it is persisted under `id: cmd` — an id
+  // enrichAgentDef will never match on restore — so an empty list here is
+  // stored permanently and read by every later consumer of the def.
+  it("synthesises a fallback def carrying the command's skip-permissions flags", () => {
+    taskCreatedHandler({ ...baseEvent, agentCommand: 'claude' });
+    const agent = mockAgents['agent-sub-1'] as { def: { skip_permissions_args: string[] } };
+    expect(agent.def.skip_permissions_args).toEqual(['--dangerously-skip-permissions']);
+  });
+
+  it('leaves the fallback def empty for a command that takes no such flag', () => {
+    taskCreatedHandler({ ...baseEvent, agentCommand: 'opencode' });
+    const agent = mockAgents['agent-sub-1'] as { def: { skip_permissions_args: string[] } };
+    expect(agent.def.skip_permissions_args).toEqual([]);
+  });
 });
 
 describe('task automation activity lease', () => {
@@ -584,6 +604,43 @@ describe('terminalInputPendingFromQuestion — real typing survives self-resolvi
 });
 
 describe('collapseTask — coordinated child guard (TODO #23)', () => {
+  it('keeps each pane on its own session across repeated collapse and reopen', async () => {
+    const def = {
+      id: 'claude',
+      name: 'Claude',
+      command: 'claude',
+      args: [],
+      resume_args: ['--continue'],
+      skip_permissions_args: [],
+      description: '',
+    };
+    const sessions = [
+      'fb4f2bc6-62d9-4b29-a795-240caf2fc459',
+      null,
+      'fb4f2bc6-62d9-4b29-a795-240caf2fc460',
+    ] as const;
+    mockTasks.task = {
+      id: 'task',
+      agentIds: ['a', 'b', 'c'],
+      shellAgentIds: [],
+      agentSessionIds: { a: sessions[0], c: sessions[2] },
+    };
+    for (const id of ['a', 'b', 'c']) {
+      mockAgents[id] = createAgentRecord({ id, taskId: 'task', def });
+    }
+    mockTaskOrder.push('task');
+    for (let round = 0; round < 2; round++) {
+      await collapseTask('task');
+      expect(mockTasks.task.savedAgentSessionIds).toEqual(sessions);
+      expect(mockTasks.task.agentSessionIds).toBeUndefined();
+      uncollapseTask('task');
+      const task = mockTasks.task;
+      expect(task.agentIds.map((id) => task.agentSessionIds?.[id] ?? null)).toEqual(sessions);
+      expect(task.savedAgentSessionIds).toBeUndefined();
+      for (const id of task.agentIds) expect(mockAgents[id]).toMatchObject({ resumed: true });
+    }
+  });
+
   it('is a no-op when task has coordinatedBy set', async () => {
     mockTasks['sub-task-1'] = {
       agentIds: ['agent-1'],
@@ -1006,23 +1063,22 @@ describe('createTask does not mutate defaultStepsEnabled', () => {
   });
 });
 
-// ─── createTask activation ────────────────────────────────────────────────────
-// A phone creating a task must not yank the desktop's selection out from under
-// whoever is typing there; the desktop's own New Task dialog still activates.
-
-describe('createTask activation', () => {
-  const agentDef = {
-    id: 'agent-def',
-    name: 'Claude',
-    command: 'claude',
-    args: [],
-    resume_args: [],
-    skip_permissions_args: [],
-    description: 'Claude',
-  };
-
-  function harnessState(): Record<string, unknown> {
-    return expectDefined(core.harness, 'mock store harness').state() as Record<string, unknown>;
+// A task's own first pane is created by a different path from the panes added
+// to it later, and only the latter used to get a session id. Without one the
+// pane launches on the positional default, which means "the newest session in
+// this worktree" — so as soon as a second pane exists, pane one resumes pane
+// two's conversation. That silent swap is the whole reason ids exist.
+describe('createTask assigns the first pane a session id', () => {
+  function agentDef(command: string) {
+    return {
+      id: 'agent-def',
+      name: command,
+      command,
+      args: [],
+      resume_args: [],
+      skip_permissions_args: [],
+      description: command,
+    };
   }
 
   beforeEach(() => {
@@ -1032,15 +1088,13 @@ describe('createTask activation', () => {
     mockTasks = {};
     mockAgents = {};
     mockTaskOrder = [];
-    harnessState().activeTaskId = null;
-    harnessState().activeAgentId = null;
     vi.mocked(getProjectPath).mockReturnValue('/repo');
     vi.mocked(getProjectBranchPrefix).mockReturnValue('task');
     vi.mocked(isProjectMissing).mockReturnValue(false);
     mockInvoke.mockImplementation((channel: string) => {
       if (channel === IPC.CreateTask) {
         return Promise.resolve({
-          id: 'task-new',
+          id: 'task-1',
           branch_name: 'task/my-task',
           worktree_path: '/repo/.worktrees/my-task',
         });
@@ -1049,34 +1103,38 @@ describe('createTask activation', () => {
     });
   });
 
-  const baseOpts = {
-    name: 'My Task',
-    agentDef,
-    projectId: 'proj-1',
-    gitIsolation: 'worktree' as const,
-    baseBranch: 'main',
-  };
+  async function createWith(command: string) {
+    await createTask({
+      name: 'My Task',
+      agentDef: agentDef(command),
+      projectId: 'proj-1',
+      gitIsolation: 'worktree',
+      baseBranch: 'main',
+    });
+    return mockTasks['task-1'];
+  }
 
-  it('activates the new task by default', async () => {
-    harnessState().activeTaskId = 'task-existing';
-    await createTask(baseOpts);
-    expect(harnessState().activeTaskId).toBe('task-new');
+  it('gives the first Claude pane an id of its own', async () => {
+    const task = await createWith('claude');
+    const agentId = expectDefined(task?.agentIds[0], 'first pane id');
+    expect(task?.agentSessionIds?.[agentId]).toEqual(expect.any(String));
   });
 
-  it('leaves the current selection alone when activate is false', async () => {
-    harnessState().activeTaskId = 'task-existing';
-    harnessState().activeAgentId = 'agent-existing';
-
-    await createTask({ ...baseOpts, activate: false });
-
-    expect(harnessState().activeTaskId).toBe('task-existing');
-    expect(harnessState().activeAgentId).toBe('agent-existing');
-    expect(mockTaskOrder).toContain('task-new');
+  // Claude rejects `--session-id` for a session that already exists, so the id
+  // has to be new rather than reused from anywhere.
+  it('gives two tasks different ids', async () => {
+    const first = (await createWith('claude'))?.agentSessionIds;
+    mockTasks = {};
+    mockAgents = {};
+    const second = (await createWith('claude'))?.agentSessionIds;
+    expect(Object.values(first ?? {})[0]).not.toBe(Object.values(second ?? {})[0]);
   });
 
-  it('still adopts the task when nothing is selected yet', async () => {
-    await createTask({ ...baseOpts, activate: false });
-    expect(harnessState().activeTaskId).toBe('task-new');
+  // Codex assigns its own ids, so one invented here would name a session that
+  // never existed and break the resume it was meant to fix.
+  it('leaves a Codex pane without one', async () => {
+    const task = await createWith('codex');
+    expect(task?.agentSessionIds ?? {}).toEqual({});
   });
 });
 
@@ -1114,6 +1172,203 @@ describe('sendPrompt', () => {
     expect(writePayloads()).toEqual(['\x1b[I', 'hello Codex', '\r']);
   });
 
+  it('clears stale terminal input after the app submits a prompt', async () => {
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].terminalInputPending = true;
+    await sendPrompt('task-1', 'agent-1', 'Continue');
+    expect(mockTasks['task-1'].terminalInputPending).toBeUndefined();
+  });
+
+  it('keeps terminal input pending if submitting Enter fails', async () => {
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].terminalInputPending = true;
+    mockInvoke.mockImplementation(async (_channel, payload) => {
+      if (payload?.data === '\r') throw new Error('PTY closed');
+    });
+    await expect(sendPrompt('task-1', 'agent-1', 'Continue')).rejects.toThrow('PTY closed');
+    expect(mockTasks['task-1'].terminalInputPending).toBe(true);
+  });
+
+  it('does not clear the main terminal draft when sending to another agent', async () => {
+    mockTasks['task-1'].agentIds = ['main-agent', 'agent-1'];
+    mockTasks['task-1'].terminalInputPending = true;
+    await sendPrompt('task-1', 'agent-1', 'Continue');
+    expect(mockTasks['task-1'].terminalInputPending).toBe(true);
+  });
+
+  it.each([
+    'please explain our architecture in reasoning graph',
+    'show the Reasoning Graph',
+    'update the mindmap',
+    'create a mind map',
+    'show a live map',
+  ])('includes canvas tool guidance with the chat request: %s', async (prompt) => {
+    mockAgents['agent-1'] = { status: 'running', canvasTools: true };
+    mockTasks['task-1'].promptedAgentIds = ['agent-1'];
+    mockIsAgentBracketedPasteEnabled.mockReturnValue(true);
+
+    await sendPrompt('task-1', 'agent-1', prompt);
+
+    const writes = writePayloads();
+    expect(writes).toHaveLength(3);
+    expect(writes[1].startsWith('\x1b[200~')).toBe(true);
+    expect(writes[1]).toContain(prompt);
+    expect(writes[1]).toContain('canvas_open with view "reasoning"');
+    expect(writes[1]).toContain('reasoning_read and reasoning_update');
+    expect(writes[1]).toContain('mindmap_read and mindmap_update');
+    expect(writes[1]).toContain('A Mermaid diagram or text graph in chat does not populate');
+    expect(writes[1].endsWith('\x1b[201~')).toBe(true);
+    expect(writes[2]).toBe('\r');
+    expect(mockTasks['task-1'].lastPrompt).toBe(prompt);
+  });
+
+  it('sends the canvas guidance once per agent session and never with app prompts', async () => {
+    mockAgents['agent-1'] = { status: 'running', canvasTools: true, generation: 3 };
+    mockTasks['task-1'].promptedAgentIds = ['agent-1'];
+    const prompt = 'update the mind map';
+
+    await sendPrompt('task-1', 'agent-1', prompt, { appPrompt: true });
+    expect(writePayloads()[1]).toBe(prompt);
+
+    await sendPrompt('task-1', 'agent-1', prompt);
+    expect(writePayloads()[4]).toContain('mindmap_read and mindmap_update');
+
+    await sendPrompt('task-1', 'agent-1', 'and the reasoning graph too');
+    expect(writePayloads()[7]).toBe('and the reasoning graph too');
+
+    mockAgents['agent-1'] = { status: 'running', canvasTools: true, generation: 4 };
+    await sendPrompt('task-1', 'agent-1', prompt);
+    expect(writePayloads()[10]).toContain('mindmap_read and mindmap_update');
+  });
+
+  it('sends the canvas guidance again when the delivery failed', async () => {
+    mockAgents['agent-1'] = { status: 'running', canvasTools: true, generation: 5 };
+    mockTasks['task-1'].promptedAgentIds = ['agent-1'];
+    const prompt = 'update the mind map';
+    mockInvoke.mockImplementationOnce(async () => {}).mockRejectedValueOnce(new Error('gone'));
+
+    await expect(sendPrompt('task-1', 'agent-1', prompt)).rejects.toThrow('gone');
+    await sendPrompt('task-1', 'agent-1', prompt);
+    expect(writePayloads().at(-2)).toContain('mindmap_read and mindmap_update');
+  });
+
+  it('does not mark a session restarted mid-send as guided', async () => {
+    mockAgents['agent-1'] = { status: 'running', canvasTools: true, generation: 6 };
+    mockTasks['task-1'].promptedAgentIds = ['agent-1'];
+    const prompt = 'update the mind map';
+    mockInvoke.mockImplementation(async (channel: string, payload: unknown) => {
+      // The agent restarts while the prompt text is on its way to the old session.
+      if (channel === IPC.WriteToAgent && (payload as { data: string }).data.includes(prompt))
+        mockAgents['agent-1'] = { status: 'running', canvasTools: true, generation: 7 };
+    });
+
+    await sendPrompt('task-1', 'agent-1', prompt);
+    expect(mockAgents['agent-1']).not.toHaveProperty('canvasGuidanceGeneration');
+
+    await sendPrompt('task-1', 'agent-1', prompt);
+    expect(writePayloads().at(-2)).toContain('mindmap_read and mindmap_update');
+    expect(mockAgents['agent-1']).toMatchObject({ canvasGuidanceGeneration: 7 });
+  });
+
+  it.each([false, undefined])(
+    'does not advertise unavailable canvas tools (%s)',
+    async (available) => {
+      mockAgents['agent-1'] = { status: 'running', canvasTools: available };
+      const prompt = 'please explain our architecture in reasoning graph';
+
+      await sendPrompt('task-1', 'agent-1', prompt);
+
+      expect(writePayloads()).toEqual(['\x1b[I', prompt, '\r']);
+    },
+  );
+
+  it('leaves unrelated prompts unchanged when canvas tools are available', async () => {
+    mockAgents['agent-1'] = { status: 'running', canvasTools: true };
+
+    await sendPrompt('task-1', 'agent-1', 'explain our architecture');
+
+    expect(writePayloads()).toEqual(['\x1b[I', 'explain our architecture', '\r']);
+  });
+
+  it('checks canvas availability after startup when sending the initial prompt', async () => {
+    const prompt = 'please explain our architecture in reasoning graph';
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].initialPrompt = prompt;
+    mockInvoke.mockImplementationOnce(async () => {
+      mockAgents['agent-1'] = { status: 'running', canvasTools: true };
+    });
+
+    await sendPrompt('task-1', 'agent-1', prompt);
+
+    expect(writePayloads()[1]).toContain('canvas_open with view "reasoning"');
+    expect(mockTasks['task-1'].initialPrompt).toBeUndefined();
+    expect(mockTasks['task-1'].lastPrompt).toBe(prompt);
+  });
+
+  it('routes chat prompts through app-server without writing into the hidden terminal', async () => {
+    mockAgents = { 'agent-1': { status: 'running', def: { id: 'codex' } } };
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].mainAgentView = 'chat';
+    await sendPrompt('task-1', 'agent-1', 'hello chat');
+    expect(mockInvoke).toHaveBeenCalledWith(IPC.AgentChat, {
+      action: 'send',
+      agentId: 'agent-1',
+      text: 'hello chat',
+    });
+    expect(writePayloads()).toEqual([]);
+    expect(mockTasks['task-1'].lastPrompt).toBe('hello chat');
+  });
+
+  it('supplies canvas guidance to a fresh chat and keeps it out of later messages and history', async () => {
+    const items: { kind: 'user'; text: string }[] = [];
+    mockAgents = {
+      'agent-1': {
+        status: 'running',
+        def: { id: 'codex' },
+        canvasTools: true,
+        chatState: { items },
+      },
+    };
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].mainAgentView = 'chat';
+    const deliver = vi.fn(async () => undefined);
+    await sendPrompt('task-1', 'agent-1', 'Create a mind map', { sendChat: deliver });
+    expect(deliver).toHaveBeenLastCalledWith(expect.stringContaining('canvas_open'));
+    expect(mockTasks['task-1'].lastPrompt).toBe('Create a mind map');
+    items.push({ kind: 'user', text: 'Create a mind map' });
+    await sendPrompt('task-1', 'agent-1', 'Continue', { sendChat: deliver });
+    expect(deliver).toHaveBeenLastCalledWith('Continue');
+  });
+
+  it('delivers through the chat runtime with steps and records only accepted prompts', async () => {
+    mockAgents = { 'agent-1': { status: 'running', def: { id: 'codex' } } };
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].mainAgentView = 'chat';
+    mockTasks['task-1'].stepsEnabled = true;
+    const deliver = vi.fn(async () => undefined);
+    deliver.mockRejectedValueOnce(new Error('Disconnected'));
+    await expect(
+      sendPrompt('task-1', 'agent-1', 'hello chat', { sendChat: deliver }),
+    ).rejects.toThrow('Disconnected');
+    expect(mockTasks['task-1'].lastPrompt).toBe('');
+    await sendPrompt('task-1', 'agent-1', 'hello chat', { sendChat: deliver });
+    expect(deliver).toHaveBeenLastCalledWith(expect.stringContaining('hello chat'));
+    expect(deliver).toHaveBeenLastCalledWith(expect.stringContaining('For active statuses'));
+    expect(mockTasks['task-1'].lastPrompt).toBe('hello chat');
+    expect(mockInvoke).not.toHaveBeenCalledWith(IPC.AgentChat, expect.anything());
+    expect(writePayloads()).toEqual([]);
+  });
+
+  it('does not record a prompt rejected by app-server', async () => {
+    mockAgents = { 'agent-1': { status: 'running', def: { id: 'codex' } } };
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].mainAgentView = 'chat';
+    mockInvoke.mockRejectedValue(new Error('Disconnected'));
+    await expect(sendPrompt('task-1', 'agent-1', 'not accepted')).rejects.toThrow('Disconnected');
+    expect(mockTasks['task-1'].lastPrompt).toBe('');
+    expect(writePayloads()).toEqual([]);
+  });
+
   it('asks tracked active steps to describe what is happening now', async () => {
     mockTasks['task-1'].stepsEnabled = true;
 
@@ -1137,6 +1392,42 @@ describe('sendPrompt', () => {
     await sendPrompt('task-1', 'agent-1', 'line 1\nline 2');
 
     expect(writePayloads()).toEqual(['\x1b[I', '\x1b[200~line 1\nline 2\x1b[201~', '\r']);
+  });
+
+  it('records repeated sent prompts separately and preserves the legacy last prompt', async () => {
+    mockTasks['task-1'].lastPrompt = 'Earlier prompt';
+    mockAgents['agent-1'] = { status: 'running', def: { name: 'Codex' } };
+    await sendPrompt('task-1', 'agent-1', 'continue');
+    await sendPrompt('task-1', 'agent-1', 'continue');
+    expect(mockTasks['task-1'].promptHistory).toEqual([
+      { text: 'Earlier prompt' },
+      { text: 'continue', sentAt: expect.any(Number), agentName: 'Codex' },
+      { text: 'continue', sentAt: expect.any(Number), agentName: 'Codex' },
+    ]);
+  });
+
+  it('records terminal-entered prompts, but ignores empty input and removed tasks', () => {
+    setLastPrompt('task-1', 'Typed in the terminal', 'agent-1');
+    setLastPrompt('task-1', '   ', 'agent-1');
+    setLastPrompt('missing', 'Do not recreate this task', 'agent-1');
+    expect(mockTasks['task-1'].promptHistory).toHaveLength(1);
+    expect(mockTasks['task-1'].lastPrompt).toBe('Typed in the terminal');
+    expect(mockTasks.missing).toBeUndefined();
+  });
+
+  it('keeps only the most recent prompts so a long session cannot grow the save forever', () => {
+    for (let i = 0; i < MAX_PROMPT_HISTORY + 20; i++) setLastPrompt('task-1', `prompt ${i}`);
+    const history = mockTasks['task-1'].promptHistory as Array<{ text: string }>;
+    expect(history).toHaveLength(MAX_PROMPT_HISTORY);
+    expect(history[0].text).toBe('prompt 20');
+    expect(history.at(-1)?.text).toBe(`prompt ${MAX_PROMPT_HISTORY + 19}`);
+  });
+
+  it('does not record a prompt when sending fails', async () => {
+    mockInvoke.mockRejectedValueOnce(new Error('PTY closed'));
+    await expect(sendPrompt('task-1', 'agent-1', 'not sent')).rejects.toThrow('PTY closed');
+    expect(mockTasks['task-1'].promptHistory).toBeUndefined();
+    expect(mockTasks['task-1'].lastPrompt).toBe('');
   });
 
   it.each(['landed_pending_review', 'landed_cleanup_failed', 'reviewed'] as const)(
@@ -1208,6 +1499,34 @@ describe('closeTask — IPC cleanup ordering', () => {
     harness.reset(harness.state());
     mockInvoke.mockResolvedValue(undefined);
   });
+
+  it.each([
+    { gitIsolation: 'direct', externalWorktree: undefined, removes: true },
+    { gitIsolation: 'none', externalWorktree: undefined, removes: true },
+    { gitIsolation: 'worktree', externalWorktree: true, removes: true },
+    { gitIsolation: 'worktree', externalWorktree: undefined, removes: false },
+  ])(
+    'removes reasoning reports only when the checkout outlives the task: %j',
+    async ({ gitIsolation, externalWorktree, removes }) => {
+      mockTasks['task-1'] = {
+        agentIds: [],
+        shellAgentIds: [],
+        gitIsolation,
+        externalWorktree,
+        worktreePath: '/repo',
+        projectId: 'proj-1',
+      };
+      mockInvoke.mockResolvedValue(undefined);
+
+      await closeTask('task-1');
+
+      const removal = mockInvoke.mock.calls.find(([c]) => c === IPC.RemoveReasoningFeeds);
+      expect(removal?.[1]).toEqual(
+        removes ? { worktreePath: '/repo', taskId: 'task-1' } : undefined,
+      );
+      expect(mockTasks['task-1']?.closingStatus).toBe('removing');
+    },
+  );
 
   it('MCP_CoordinatedTaskClosed rejection is swallowed and task is still removed', async () => {
     mockTasks['task-1'] = {
@@ -1649,5 +1968,79 @@ describe('mergeTask / pushTask preconditions', () => {
     vi.mocked(getProjectPath).mockReturnValue(undefined);
     await expect(pushTask('task-2', channel)).rejects.toThrow('Project folder not found');
     expect(mockInvoke).not.toHaveBeenCalled();
+  });
+});
+
+// ─── createTask activation ────────────────────────────────────────────────────
+// A phone creating a task must not yank the desktop's selection out from under
+// whoever is typing there; the desktop's own New Task dialog still activates.
+
+describe('createTask activation', () => {
+  const agentDef = {
+    id: 'agent-def',
+    name: 'Claude',
+    command: 'claude',
+    args: [],
+    resume_args: [],
+    skip_permissions_args: [],
+    description: 'Claude',
+  };
+
+  function harnessState(): Record<string, unknown> {
+    return expectDefined(core.harness, 'mock store harness').state() as Record<string, unknown>;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const harness = expectDefined(core.harness, 'mock store harness');
+    harness.reset(harness.state());
+    mockTasks = {};
+    mockAgents = {};
+    mockTaskOrder = [];
+    harnessState().activeTaskId = null;
+    harnessState().activeAgentId = null;
+    vi.mocked(getProjectPath).mockReturnValue('/repo');
+    vi.mocked(getProjectBranchPrefix).mockReturnValue('task');
+    vi.mocked(isProjectMissing).mockReturnValue(false);
+    mockInvoke.mockImplementation((channel: string) => {
+      if (channel === IPC.CreateTask) {
+        return Promise.resolve({
+          id: 'task-new',
+          branch_name: 'task/my-task',
+          worktree_path: '/repo/.worktrees/my-task',
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+  });
+
+  const baseOpts = {
+    name: 'My Task',
+    agentDef,
+    projectId: 'proj-1',
+    gitIsolation: 'worktree' as const,
+    baseBranch: 'main',
+  };
+
+  it('activates the new task by default', async () => {
+    harnessState().activeTaskId = 'task-existing';
+    await createTask(baseOpts);
+    expect(harnessState().activeTaskId).toBe('task-new');
+  });
+
+  it('leaves the current selection alone when activate is false', async () => {
+    harnessState().activeTaskId = 'task-existing';
+    harnessState().activeAgentId = 'agent-existing';
+
+    await createTask({ ...baseOpts, activate: false });
+
+    expect(harnessState().activeTaskId).toBe('task-existing');
+    expect(harnessState().activeAgentId).toBe('agent-existing');
+    expect(mockTaskOrder).toContain('task-new');
+  });
+
+  it('still adopts the task when nothing is selected yet', async () => {
+    await createTask({ ...baseOpts, activate: false });
+    expect(harnessState().activeTaskId).toBe('task-new');
   });
 });

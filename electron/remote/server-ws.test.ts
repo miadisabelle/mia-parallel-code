@@ -6,6 +6,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import WebSocket from 'ws';
+import http from 'node:http';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +21,7 @@ vi.mock('../ipc/pty.js', () => ({
   getActiveAgentIds: vi.fn(() => []),
   getAgentMeta: vi.fn(() => null),
   getAgentCols: vi.fn(() => 80),
+  getAgentRows: vi.fn(() => 24),
   onPtyEvent: vi.fn(() => vi.fn()), // returns an unsubscribe fn
 }));
 
@@ -31,6 +33,8 @@ let coordinatorToken = '';
 let mobileToken = '';
 let generatePin: () => { pin: string; expiresAt: number };
 let stop: () => Promise<void>;
+let rebind: (host: string) => Promise<void>;
+let srv: Awaited<ReturnType<typeof startRemoteServer>>;
 
 /** Elevate the mobile token to a paired one via the desktop PIN. */
 async function pair(): Promise<string> {
@@ -45,7 +49,7 @@ async function pair(): Promise<string> {
 }
 
 beforeEach(async () => {
-  const srv = await startRemoteServer({
+  srv = await startRemoteServer({
     port: 0,
     host: '0.0.0.0',
     staticDir: '/nonexistent',
@@ -54,6 +58,7 @@ beforeEach(async () => {
     getCoordinator: () => null,
   });
   port = srv.port;
+  rebind = srv.rebind;
   coordinatorToken = srv.token;
   mobileToken = srv.mobileToken;
   generatePin = srv.generatePairingPin;
@@ -162,6 +167,16 @@ describe('paired token over WebSocket', () => {
 
     expect(pty.resizeAgent).not.toHaveBeenCalled();
     expect(pty.killAgent).not.toHaveBeenCalled();
+  });
+
+  it('disconnects a paired phone that is already connected when devices are forgotten', async () => {
+    const paired = await pair();
+    const ws = await connectAndAuth(paired);
+    const closed = waitForClose(ws);
+    srv.forgetRememberedDevices();
+    // A socket authenticates once, on its auth message. Revoking the token alone would leave
+    // this one streaming every agent's output and still allowed to send input.
+    await closed;
   });
 
   it('a paired token from a stopped server is refused (4001)', async () => {
@@ -351,5 +366,239 @@ describe('coordinator token over WebSocket', () => {
       expect(pty.writeToAgent).toHaveBeenCalledWith('agent-1', 'hello');
     });
     ws.close();
+  });
+});
+
+describe('acknowledged phone messages', () => {
+  function nextMessage(ws: WebSocket): Promise<Record<string, unknown>> {
+    return new Promise((resolve) => ws.once('message', (raw) => resolve(JSON.parse(String(raw)))));
+  }
+
+  it('acknowledges only after both pasted text and Enter reach the PTY', async () => {
+    const ws = await connectAndAuth(await pair());
+    const result = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'agent-1',
+        data: 'hello\nworld',
+        requestId: 'reply-1',
+        submit: true,
+      }),
+    );
+    expect(await result).toEqual({ type: 'input-result', requestId: 'reply-1', ok: true });
+    expect(pty.writeToAgent).toHaveBeenNthCalledWith(1, 'agent-1', 'hello\nworld');
+    expect(pty.writeToAgent).toHaveBeenNthCalledWith(2, 'agent-1', '\r');
+    ws.close();
+  });
+
+  it('reports a missing agent instead of claiming delivery', async () => {
+    vi.mocked(pty.writeToAgent).mockImplementationOnce(() => {
+      throw new Error('Agent not found');
+    });
+    const ws = await connectAndAuth(await pair());
+    const result = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'gone',
+        data: 'hello',
+        requestId: 'reply-2',
+        submit: true,
+      }),
+    );
+    expect(await result).toMatchObject({ type: 'input-result', requestId: 'reply-2', ok: false });
+    expect(pty.writeToAgent).toHaveBeenCalledTimes(1);
+    ws.close();
+  });
+
+  it('reports a partial submission if the agent exits before Enter', async () => {
+    vi.mocked(pty.writeToAgent)
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new Error('gone');
+      });
+    const ws = await connectAndAuth(await pair());
+    const result = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'gone',
+        data: 'hello',
+        requestId: 'reply-3',
+        submit: true,
+      }),
+    );
+    expect(await result).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('Check the terminal'),
+    });
+    ws.close();
+  });
+
+  it('does not interleave two phones submitting into the same prompt', async () => {
+    const ws1 = await connectAndAuth(await pair());
+    const ws2 = await connectAndAuth(await pair());
+    const accepted = nextMessage(ws1);
+    const rejected = nextMessage(ws2);
+    const text = 'line\n'.repeat(40);
+    ws1.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'agent-1',
+        data: text,
+        requestId: 'first',
+        submit: true,
+      }),
+    );
+    await vi.waitFor(() => expect(pty.writeToAgent).toHaveBeenCalledWith('agent-1', text));
+    ws2.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'agent-1',
+        data: 'second',
+        requestId: 'second',
+        submit: true,
+      }),
+    );
+    expect(await rejected).toMatchObject({ requestId: 'second', ok: false });
+    expect(await accepted).toMatchObject({ requestId: 'first', ok: true });
+    expect(pty.writeToAgent).not.toHaveBeenCalledWith('agent-1', 'second');
+    ws1.close();
+    ws2.close();
+  });
+
+  it('types a shell prefix in its own write so the TUI reads it as a keystroke', async () => {
+    const ws = await connectAndAuth(await pair());
+    const result = nextMessage(ws);
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'agent-1',
+        data: 'ls -la',
+        requestId: 'shell-1',
+        submit: true,
+        prefixKey: '!',
+      }),
+    );
+    expect(await result).toEqual({ type: 'input-result', requestId: 'shell-1', ok: true });
+    expect(pty.writeToAgent).toHaveBeenNthCalledWith(1, 'agent-1', '!');
+    expect(pty.writeToAgent).toHaveBeenNthCalledWith(2, 'agent-1', 'ls -la');
+    expect(pty.writeToAgent).toHaveBeenNthCalledWith(3, 'agent-1', '\r');
+    ws.close();
+  });
+
+  it('does not let a second phone type into the shell prompt a prefix just opened', async () => {
+    const ws1 = await connectAndAuth(await pair());
+    const ws2 = await connectAndAuth(await pair());
+    const rejected = nextMessage(ws2);
+    ws1.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'agent-1',
+        data: 'ls -la',
+        requestId: 'shell',
+        submit: true,
+        prefixKey: '!',
+      }),
+    );
+    await vi.waitFor(() => expect(pty.writeToAgent).toHaveBeenCalledWith('agent-1', '!'));
+    ws2.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'agent-1',
+        data: 'Looks good, ship it',
+        requestId: 'chat',
+        submit: true,
+      }),
+    );
+    expect(await rejected).toMatchObject({ requestId: 'chat', ok: false });
+    expect(pty.writeToAgent).not.toHaveBeenCalledWith('agent-1', 'Looks good, ship it');
+    ws1.close();
+    ws2.close();
+  });
+
+  it('does not give view-only phones write access through acknowledged submission', async () => {
+    const ws = await connectAndAuth(mobileToken);
+    const closed = waitForClose(ws);
+    ws.send(
+      JSON.stringify({
+        type: 'input',
+        agentId: 'agent-1',
+        data: 'hello',
+        requestId: 'no-access',
+        submit: true,
+      }),
+    );
+    expect(await closed).toBe(4003);
+    expect(pty.writeToAgent).not.toHaveBeenCalled();
+  });
+});
+
+describe('rebind', () => {
+  it('completes while a WebSocket client is connected and keeps serving HTTP', async () => {
+    const ws = await connectAndAuth(mobileToken);
+    const closed = waitForClose(ws);
+    await rebind('127.0.0.1');
+    expect(typeof (await closed)).toBe('number');
+    const res = await fetch(`http://127.0.0.1:${port}/api/pair/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${mobileToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: '000000' }),
+    });
+    expect(res.status).not.toBe(404);
+  });
+});
+
+describe('rebind', () => {
+  /** Fail the next listen the way a missing interface does, without touching the network. */
+  const failListen = function (this: http.Server) {
+    process.nextTick(() => this.emit('error', new Error('EADDRNOTAVAIL')));
+    return this;
+  };
+
+  it('restores the previous interface when the new one cannot be bound', async () => {
+    // A wildcard bind blocks every other listener on the port, so narrow first; the
+    // second loopback address can then be occupied (Linux) or is missing (macOS): a
+    // real bind failure either way.
+    await rebind('127.0.0.1');
+    const occupied = http.createServer();
+    await new Promise<void>((resolve, reject) => {
+      occupied.once('error', (error: NodeJS.ErrnoException) =>
+        error.code === 'EADDRNOTAVAIL' ? resolve() : reject(error),
+      );
+      occupied.listen(port, '127.0.0.2', resolve);
+    });
+    try {
+      await expect(rebind('127.0.0.2')).rejects.toThrow(/EADDRINUSE|EADDRNOTAVAIL/);
+    } finally {
+      if (occupied.listening) await new Promise((resolve) => occupied.close(resolve));
+    }
+    expect(srv.bindHost).toBe('127.0.0.1');
+    expect(srv.listening).toBe(true);
+    const res = await fetch(`http://127.0.0.1:${port}/api/pair/verify`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${mobileToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: '000000' }),
+    });
+    expect(res.status).not.toBe(404);
+    const ws = await connectAndAuth(mobileToken);
+    ws.close();
+  });
+
+  // The fallback re-listens on the address just released, so nothing real can take it
+  // in between; only a stub makes both binds fail.
+  it('releases a handle that can listen nowhere so the caller can drop it', async () => {
+    const listen = vi.spyOn(http.Server.prototype, 'listen').mockImplementation(failListen);
+    try {
+      await expect(rebind('127.0.0.1')).rejects.toThrow('EADDRNOTAVAIL');
+    } finally {
+      listen.mockRestore();
+    }
+    expect(srv.listening).toBe(false);
+    await expect(connectAndAuth(mobileToken)).rejects.toThrow();
+    // The stop path releases PTY subscriptions; a second stop from afterEach is harmless.
+    for (const subscription of vi.mocked(pty.onPtyEvent).mock.results)
+      expect(subscription.value).toHaveBeenCalled();
   });
 });

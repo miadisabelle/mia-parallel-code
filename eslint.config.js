@@ -15,6 +15,8 @@ export default [
       'node_modules/**',
       '.worktrees/**',
       '.claude/**',
+      // Local scratch space (UI preview harnesses, throwaway scripts) — not source.
+      '.tmp/**',
       // Build config is excluded from electron tsconfig; ignore the config and its test.
       'electron/vite.config.electron.ts',
       'electron/vite.config.electron.test.ts',
@@ -30,6 +32,7 @@ export default [
   // SolidJS-specific rules for TSX files
   {
     files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/**/*.react.tsx'],
     ...solid,
     languageOptions: {
       parser: tsParser,

@@ -13,8 +13,14 @@ import { sf } from '../lib/fontScale';
 import { useFocusRegistration } from '../lib/focus-registration';
 import type { Task } from '../store/types';
 import type { CommitInfo } from '../ipc/types';
+import type { ChangeTourController } from '../lib/create-change-tour';
+import { getTaskDiffBaseBranch } from '../lib/load-task-diff';
+import { ChangeTourButton } from './ChangeTourButton';
 
 interface TaskChangedFilesSectionProps {
+  tour?: ChangeTourController;
+  onTourClick?: () => void;
+  tourDisabled?: boolean;
   task: Task;
   isActive: boolean;
   commitList: CommitInfo[];
@@ -28,6 +34,8 @@ interface TaskChangedFilesSectionProps {
 
 export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
   const coverageReportPath = () => getProject(props.task.projectId)?.coverageReportPath;
+  const diffBaseBranch = () =>
+    getTaskDiffBaseBranch(props.task.gitIsolation, props.task.baseBranch);
   const hasCommitNav = () =>
     props.task.gitIsolation === 'worktree' || props.task.gitIsolation === 'direct';
   // The tree button only earns its place once a branch has history to graph — a
@@ -67,7 +75,7 @@ export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
         height: '100%',
         'min-height': props.compact ? '56px' : '140px',
         'max-height': '40vh',
-        'min-width': '200px',
+        'min-width': '0',
         background: theme.taskPanelBg,
         display: 'flex',
         'flex-direction': 'column',
@@ -89,15 +97,25 @@ export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
           gap: '6px',
         }}
       >
-        <span style={{ 'flex-shrink': '0' }}>Changed Files</span>
-        <span style={{ flex: '1' }} />
+        <span
+          title="Changed Files"
+          style={{
+            flex: '1',
+            'min-width': '0',
+            overflow: 'hidden',
+            'white-space': 'nowrap',
+            'text-overflow': 'ellipsis',
+          }}
+        >
+          Changed Files
+        </span>
         <Show when={hasCommitNav()}>
-          <div style={{ display: 'flex', 'align-items': 'center', gap: '6px' }}>
+          <div style={{ display: 'flex', 'align-items': 'center', gap: '6px', 'flex-shrink': '0' }}>
             <Show when={canShowTree()}>
               <CommitTreeOverlay
                 commits={props.commitList}
                 worktreePath={props.task.worktreePath}
-                baseBranch={props.task.baseBranch}
+                baseBranch={diffBaseBranch()}
                 selectedCommit={props.selectedCommit}
                 onSelectCommit={props.onCommitNavigate}
               />
@@ -156,7 +174,7 @@ export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
           worktreePath={props.task.worktreePath}
           projectRoot={getProject(props.task.projectId)?.path}
           branchName={props.task.branchName}
-          baseBranch={props.task.baseBranch}
+          baseBranch={diffBaseBranch()}
           isActive={props.isActive}
           panelFocused={isPanelFocused(props.task.id, 'changed-files')}
           coverageReportPath={coverageReportPath()}
@@ -167,6 +185,15 @@ export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
           ref={(el) => (changedFilesRef = el)}
         />
       </div>
+      <Show when={props.tour}>
+        {(tour) => (
+          <ChangeTourButton
+            tour={tour()}
+            disabled={props.tourDisabled}
+            onClick={() => props.onTourClick?.()}
+          />
+        )}
+      </Show>
     </div>
   );
 }
