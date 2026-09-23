@@ -1,7 +1,12 @@
 import { batch } from 'solid-js';
 import { documentAgentTaskId } from '../documents/task-id';
 import { store, setStore } from './core';
-import { getTaskFocusedPanel, setTaskFocusedPanel, triggerFocus } from './focused-panel';
+import {
+  getTaskFocusedPanel,
+  scheduleTaskFocus,
+  setTaskFocusedPanel,
+  triggerFocus,
+} from './focused-panel';
 import { showNotification } from './notification';
 import { pickAndAddProject } from './projects';
 import { reorderTask } from './tasks';
@@ -60,36 +65,21 @@ export function setActiveTask(id: string): void {
   });
 }
 
-/**
- * Activate a task because the user pointed at its column.
- *
- * Distinct from `setActiveTask`, which keyboard jumps also use: pointing into
- * a column must additionally take focus away from the sidebar, the new-task
- * placeholder and the new-task panel. All three flags are hard gates — `isPanelFocused` returns false for
- * every panel while either is set, and `navigateRow`/`navigateColumn` keep
- * routing the arrow keys to the sidebar — so activating without clearing them
- * leaves the column highlighted as active while the app still behaves as if
- * the sidebar owned focus. Keyboard jumps deliberately keep sidebar focus, so
- * the two paths stay separate.
- */
+/** Activate a task from a click or tap into its column. Unlike `setActiveTask`,
+ *  which keyboard jumps share, this also takes focus away from the sidebar. */
 export function activateTaskFromPointer(id: string): void {
-  if (!store.tasks[id] && !store.terminals[id]) return;
-  // Idempotent: the same interaction can reach this twice (pointerdown on the
-  // column, then a title-bar tap), and nothing below would change.
-  if (
-    store.activeTaskId === id &&
-    !store.sidebarFocused &&
-    !store.placeholderFocused &&
-    !store.newTaskPanelFocused
-  ) {
-    return;
-  }
+  const leavingSidebar = store.sidebarFocused;
+  const wasActive = store.activeTaskId === id;
   batch(() => {
     setActiveTask(id);
-    setStore('sidebarFocused', false);
-    setStore('placeholderFocused', false);
-    setStore('newTaskPanelFocused', false);
+    // Only when the id was one setActiveTask accepted.
+    if (store.activeTaskId === id) setStore('sidebarFocused', false);
   });
+  // A column that was already active re-runs none of its focus effects, so
+  // nothing else would move DOM focus back into it.
+  if (leavingSidebar && wasActive && store.activeTaskId === id) {
+    scheduleTaskFocus(id, getTaskFocusedPanel(id));
+  }
 }
 
 export function setActiveAgent(agentId: string): void {

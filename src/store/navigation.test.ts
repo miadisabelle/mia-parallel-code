@@ -33,9 +33,16 @@ vi.mock('./focus', () => ({}));
 vi.mock('./notification', () => ({ showNotification: vi.fn() }));
 vi.mock('./projects', () => ({ pickAndAddProject: vi.fn() }));
 vi.mock('./tasks', () => ({ reorderTask: vi.fn() }));
+// DOM focus is exercised in navigation.client.test.tsx; here, where there is no
+// document, only whether focus is requested is observed. The gates stay real.
+vi.mock('./focused-panel', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./focused-panel')>()),
+  scheduleTaskFocus: vi.fn(),
+}));
 
 import { activateTaskFromPointer, jumpToTask, moveActiveTask } from './navigation';
 import { reorderTask } from './tasks';
+import { scheduleTaskFocus } from './focused-panel';
 
 beforeEach(() => {
   const harness = expectDefined(core.harness, 'mock store harness');
@@ -228,6 +235,23 @@ describe('activateTaskFromPointer', () => {
 
     expect(mockStore.activeTaskId).toBe('task-1');
     expect(mockStore.sidebarFocused).toBe(false);
+  });
+
+  // Nothing about the selection changes when the column was already active, so
+  // no focus effect runs again; the activation has to request focus itself.
+  it('requests focus when the clicked column was already active', () => {
+    mockStore.activeTaskId = 'task-2';
+    mockStore.sidebarFocused = true;
+    mockStore.focusedPanel = { 'task-2': 'ai-terminal:agent-b' };
+    activateTaskFromPointer('task-2');
+    expect(scheduleTaskFocus).toHaveBeenCalledWith('task-2', 'ai-terminal:agent-b');
+  });
+
+  it('requests no focus when the sidebar did not have it', () => {
+    mockStore.activeTaskId = 'task-2';
+    mockStore.sidebarFocused = false;
+    activateTaskFromPointer('task-2');
+    expect(scheduleTaskFocus).not.toHaveBeenCalled();
   });
 
   it('selects the agent belonging to the clicked task', () => {
