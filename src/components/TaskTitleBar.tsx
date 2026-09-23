@@ -219,7 +219,14 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
         <Show when={props.task.externalWorktree}>
           <span style={badgeStyle(theme.accent)}>Imported</span>
         </Show>
-        <Show when={skipPermissionsAgent()}>
+        {/* Not for tasks that start other tasks: their children take the separate
+            propagateSkipPermissions setting, so turning this off there would stop
+            only the parent's own agent skipping. */}
+        <Show
+          when={
+            !props.task.coordinatorMode && !props.task.delegationParent && skipPermissionsAgent()
+          }
+        >
           <button
             style={{
               ...badgeStyle(skipPermissionsOn() ? theme.warning : theme.fgMuted),
