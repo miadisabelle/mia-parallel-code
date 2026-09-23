@@ -1,3 +1,4 @@
+import { delegationRequest, taskAuthorityInput } from './delegation';
 import { restoreCanvasTaskLinks } from '../lib/canvas-task-links';
 import { restoreMindMap } from '../graph/model';
 import { produce } from 'solid-js/store';
@@ -5,6 +6,11 @@ import { invoke } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
 import { isChatPermissionMode, restoreChatSessions } from '../../electron/shared/agent-chat-types';
 import { isSessionId } from '../../electron/shared/session-record';
+import {
+  defaultAskCodeModel,
+  isAskCodeModel,
+  type AskCodeProvider,
+} from '../../electron/shared/ask-code-models';
 import { store, setStore } from './core';
 import { startRemoteAccess } from './remote';
 import { effectiveAgentId } from './agent-select';
@@ -184,8 +190,8 @@ function restoredPromptHistory(value: unknown): Task['promptHistory'] {
           'sentAt' in entry && typeof entry.sentAt === 'number' && Number.isFinite(entry.sentAt)
             ? entry.sentAt
             : undefined,
-        agentName:
-          'agentName' in entry && typeof entry.agentName === 'string' ? entry.agentName : undefined,
+        agentId:
+          'agentId' in entry && typeof entry.agentId === 'string' ? entry.agentId : undefined,
       },
     ];
   });
@@ -285,7 +291,12 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     branchAdoptedFrom: task.branchAdoptedFrom,
     branchOfferDismissed: task.branchOfferDismissed,
     ...(collapsed ? { collapsed: true } : {}),
+    delegationParent: task.delegationParent,
+    delegationPaused: task.delegationPaused,
+    integrationPolicy: task.integrationPolicy,
     coordinatorMode: task.coordinatorMode,
+    autoMergeChildren: task.autoMergeChildren,
+    autoSendChildUpdates: task.autoSendChildUpdates,
     propagateSkipPermissions: task.propagateSkipPermissions,
     maxConcurrentTasks: task.maxConcurrentTasks,
     coordinatedBy: task.coordinatedBy,
@@ -347,6 +358,10 @@ export async function saveState(): Promise<void> {
     editorCommand: store.editorCommand || undefined,
     dockerImage: store.dockerImage !== 'parallel-code-agent:latest' ? store.dockerImage : undefined,
     askCodeProvider: store.askCodeProvider !== 'claude' ? store.askCodeProvider : undefined,
+    askCodeModel:
+      store.askCodeModel !== defaultAskCodeModel(store.askCodeProvider)
+        ? store.askCodeModel
+        : undefined,
     customAgents: store.customAgents.length > 0 ? [...store.customAgents] : undefined,
     agentEnvFiles:
       Object.keys(store.agentEnvFiles).length > 0 ? { ...store.agentEnvFiles } : undefined,
@@ -365,7 +380,7 @@ export async function saveState(): Promise<void> {
     lightThemeCustomId: store.lightThemeCustomId ?? undefined,
     darkThemePreset: store.darkThemePreset,
     darkThemeCustomId: store.darkThemeCustomId ?? undefined,
-    coordinatorModeEnabled: store.coordinatorModeEnabled || undefined,
+    mcpOrchestrationEnabled: store.mcpOrchestrationEnabled,
     documentWorkspacesEnabled: store.documentWorkspacesEnabled || undefined,
     documentFullWidth: store.documentFullWidth || undefined,
     coordinatorControlHintDismissed: store.coordinatorControlHintDismissed || undefined,
@@ -544,6 +559,7 @@ interface LegacyPersistedState {
   editorCommand?: unknown;
   dockerImage?: unknown;
   askCodeProvider?: unknown;
+  askCodeModel?: unknown;
   minimaxApiKey?: unknown;
   customAgents?: unknown;
   agentEnvFiles?: unknown;
@@ -560,7 +576,7 @@ interface LegacyPersistedState {
   lightThemeCustomId?: unknown;
   darkThemePreset?: unknown;
   darkThemeCustomId?: unknown;
-  coordinatorModeEnabled?: unknown;
+  mcpOrchestrationEnabled?: unknown;
   documentWorkspacesEnabled?: unknown;
   documentFullWidth?: unknown;
   coordinatorControlHintDismissed?: unknown;
@@ -574,7 +590,10 @@ interface LegacyPersistedState {
 
 export async function loadState(): Promise<void> {
   const json = await invoke<string | null>(IPC.LoadAppState).catch(() => null);
-  if (!json) return;
+  if (!json) {
+    await delegationRequest({ action: 'orchestrationSetting', enabled: true });
+    return;
+  }
 
   let raw: LegacyPersistedState;
   try {
@@ -604,6 +623,7 @@ export async function loadState(): Promise<void> {
   // Also migrate defaultDirectMode -> defaultGitIsolation
   for (const p of projects) {
     if (!p.color) p.color = randomPastelColor();
+    p.allowPeerAccess = p.allowPeerAccess === true;
     if (typeof p.coverageReportPath === 'string') {
       const trimmed = p.coverageReportPath.trim();
       p.coverageReportPath = trimmed ? trimmed : undefined;
@@ -612,7 +632,12 @@ export async function loadState(): Promise<void> {
     }
     p.tasksCollapsed = typeof p.tasksCollapsed === 'boolean' ? p.tasksCollapsed : undefined;
     // Migrate defaultDirectMode -> defaultGitIsolation
-    const legacy = p as Project & { defaultDirectMode?: boolean };
+    const legacy = p as Project & {
+      defaultDirectMode?: boolean;
+      allowAgentTaskCreation?: boolean;
+    };
+    // Task creation now follows the global MCP setting, independently of old project consent.
+    delete legacy.allowAgentTaskCreation;
     if (legacy.defaultDirectMode !== undefined && p.defaultGitIsolation === undefined) {
       p.defaultGitIsolation = legacy.defaultDirectMode ? 'direct' : undefined;
       delete (legacy as unknown as Record<string, unknown>).defaultDirectMode;
@@ -632,6 +657,70 @@ export async function loadState(): Promise<void> {
       if (pt && !pt.projectId) {
         pt.projectId = id;
       }
+    }
+  }
+
+  // Apply the global gate before authority registration or terminal restoration.
+  // A failure must abort startup so autosave cannot replace the unrestored session.
+  try {
+    await delegationRequest({
+      action: 'orchestrationSetting',
+      enabled: raw.mcpOrchestrationEnabled !== false,
+    });
+  } catch (error) {
+    showNotification(`Could not restore MCP settings. Restart the app to retry: ${String(error)}`, {
+      durationMs: NOTIFICATION_ERROR_MS,
+    });
+    throw error;
+  }
+
+  // Restore acknowledged authority before store insertion can mount and spawn terminals.
+  for (const project of projects) {
+    await delegationRequest({
+      action: 'projectPolicy',
+      policy: {
+        projectId: project.id,
+        allowPeerAccess: project.allowPeerAccess === true,
+      },
+    }).catch((error: unknown) => console.warn('Could not restore project permissions:', error));
+  }
+  const detachedRestores: string[] = [];
+  for (const task of Object.values(raw.tasks)) {
+    const legacy = task as PersistedTask & { directMode?: boolean };
+    task.gitIsolation = legacy.gitIsolation ?? (legacy.directMode ? 'direct' : 'worktree');
+    if (!task.coordinatedBy || raw.tasks[task.coordinatedBy]) continue;
+    detachedRestores.push(task.name);
+    task.coordinatedBy = undefined;
+    task.controlledBy = undefined;
+    task.mcpConfigPath = undefined;
+    task.integrationPolicy = undefined;
+    task.delegationPaused = true;
+  }
+  const authorityErrors = new Map<string, string>();
+  const authorityTasks = Object.values(raw.tasks).sort(
+    (a, b) => Number(!!a.coordinatedBy) - Number(!!b.coordinatedBy),
+  );
+  for (const task of authorityTasks) {
+    const project = projects.find((p) => p.id === task.projectId);
+    if (!project || project.kind === 'document') continue;
+    const agent = task.agentDefs?.[0] ?? task.agentDef ?? undefined;
+    try {
+      await delegationRequest({
+        action: 'register',
+        task: taskAuthorityInput(
+          task,
+          project,
+          agent,
+          agent &&
+            raw.agentEnvFiles &&
+            typeof raw.agentEnvFiles === 'object' &&
+            typeof (raw.agentEnvFiles as Record<string, unknown>)[agent.id] === 'string'
+            ? (raw.agentEnvFiles as Record<string, string>)[agent.id]
+            : undefined,
+        ),
+      });
+    } catch (error) {
+      authorityErrors.set(task.id, String(error));
     }
   }
 
@@ -781,7 +870,7 @@ export async function loadState(): Promise<void> {
         }
       }
 
-      s.coordinatorModeEnabled = raw.coordinatorModeEnabled === true;
+      s.mcpOrchestrationEnabled = raw.mcpOrchestrationEnabled !== false;
       s.documentWorkspacesEnabled = raw.documentWorkspacesEnabled === true;
       s.documentFullWidth = raw.documentFullWidth === true;
 
@@ -817,7 +906,14 @@ export async function loadState(): Promise<void> {
           ? rawDockerImage.trim()
           : 'parallel-code-agent:latest';
 
-      s.askCodeProvider = raw.askCodeProvider === 'minimax' ? 'minimax' : 'claude';
+      const provider: AskCodeProvider =
+        raw.askCodeProvider === 'minimax' || raw.askCodeProvider === 'codex'
+          ? raw.askCodeProvider
+          : 'claude';
+      s.askCodeProvider = provider;
+      s.askCodeModel = isAskCodeModel(provider, raw.askCodeModel)
+        ? raw.askCodeModel
+        : defaultAskCodeModel(provider);
 
       // Restore custom agents
       if (Array.isArray(raw.customAgents)) {
@@ -925,7 +1021,17 @@ export async function loadState(): Promise<void> {
           stepsEnabled: pt.stepsEnabled,
           branchAdoptedFrom: validBranch(pt.branchAdoptedFrom, pt.branchName),
           branchOfferDismissed: validBranch(pt.branchOfferDismissed),
+          delegationParent: pt.delegationParent === true,
+          delegationPaused: pt.delegationPaused === true,
+          integrationPolicy:
+            pt.integrationPolicy === 'review'
+              ? 'review'
+              : pt.integrationPolicy === 'automatic'
+                ? 'automatic'
+                : undefined,
           coordinatorMode: pt.coordinatorMode,
+          autoMergeChildren: pt.autoMergeChildren,
+          autoSendChildUpdates: pt.autoSendChildUpdates,
           propagateSkipPermissions: pt.propagateSkipPermissions,
           maxConcurrentTasks: restoredMaxConcurrentTasks(pt.maxConcurrentTasks),
           coordinatedBy: pt.coordinatedBy,
@@ -1065,7 +1171,17 @@ export async function loadState(): Promise<void> {
             : undefined,
           savedAgentDef: agentDefs[0],
           savedAgentDefs: agentDefs.length > 0 ? agentDefs : undefined,
+          delegationParent: pt.delegationParent === true,
+          delegationPaused: pt.delegationPaused === true,
+          integrationPolicy:
+            pt.integrationPolicy === 'review'
+              ? 'review'
+              : pt.integrationPolicy === 'automatic'
+                ? 'automatic'
+                : undefined,
           coordinatorMode: pt.coordinatorMode,
+          autoMergeChildren: pt.autoMergeChildren,
+          autoSendChildUpdates: pt.autoSendChildUpdates,
           propagateSkipPermissions: pt.propagateSkipPermissions,
           maxConcurrentTasks: restoredMaxConcurrentTasks(pt.maxConcurrentTasks),
           coordinatedBy: pt.coordinatedBy,
@@ -1114,6 +1230,16 @@ export async function loadState(): Promise<void> {
     }),
   );
 
+  if (detachedRestores.length > 0) {
+    showNotification(
+      `Restored ${detachedRestores.join(', ')} as independent tasks because their parent is missing. Work is preserved; child launches are paused.`,
+    );
+  }
+  for (const [taskId, error] of authorityErrors) {
+    if (store.tasks[taskId])
+      showNotification(`Delegation unavailable for ${store.tasks[taskId].name}: ${error}`);
+  }
+
   // Restored agents are considered running; reflect that immediately in task status dots.
   for (const agentId of restoredRunningAgentIds) {
     markAgentSpawned(agentId);
@@ -1141,13 +1267,6 @@ export async function loadState(): Promise<void> {
       }
     }
     if (migrations.length > 0) await Promise.allSettled(migrations);
-  }
-
-  // Notify backend to initialize coordinator module if the feature was enabled.
-  if (store.coordinatorModeEnabled) {
-    invoke(IPC.SetCoordinatorModeEnabled, { enabled: true }).catch((e) =>
-      console.warn('Failed to notify backend of coordinator mode:', e),
-    );
   }
 
   // Auto-start the remote (Connect Phone) server so a phone can connect without

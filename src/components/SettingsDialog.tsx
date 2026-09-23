@@ -1,6 +1,11 @@
 import { For, Show, Switch, Match, createSignal, createEffect, createUniqueId, on } from 'solid-js';
 import type { JSX } from 'solid-js';
 import { Dialog } from './Dialog';
+import {
+  ASK_CODE_CLAUDE_MODELS,
+  type AskCodeProvider,
+} from '../../electron/shared/ask-code-models';
+import { codexModels, loadCodexModels } from '../lib/codex-models';
 import { CustomThemeDialog } from './CustomThemeDialog';
 import {
   getAvailableTerminalFonts,
@@ -30,11 +35,12 @@ import {
   setDockerImage,
   setShareDockerAgentAuth,
   setAskCodeProvider,
+  setAskCodeModel,
   setMinimaxApiKey,
   setAppearanceMode,
   setLightTheme,
   setDarkTheme,
-  setCoordinatorModeEnabled,
+  setMcpOrchestrationEnabled,
   setDocumentWorkspacesEnabled,
   setCoordinatorNotificationDelayMs,
   setDefaultStepsEnabled,
@@ -48,6 +54,7 @@ import {
 import { CustomAgentEditor } from './CustomAgentEditor';
 import { AgentEnvFileEditor } from './AgentEnvFileEditor';
 import { mod } from '../lib/platform';
+import { DEFAULT_COORDINATOR_CONCURRENT_TASKS } from '../lib/coordinator-limits';
 import { DEFAULT_DOCKER_IMAGE, PROJECT_DOCKERFILE_RELATIVE_PATH } from '../lib/docker';
 
 interface SettingsDialogProps {
@@ -60,7 +67,17 @@ function ensureSelectedFont(available: string[]): string[] {
   return [store.terminalFont, ...available];
 }
 
-type SettingsTab = 'general' | 'themes' | 'experimental';
+/** What each code Q&A provider needs installed, for the row under the select. */
+const ASK_CODE_PROVIDER_HINTS: Record<AskCodeProvider, string> = {
+  claude:
+    'Uses the claude CLI to answer questions about selected code. Requires Claude Code to be installed.',
+  codex:
+    'Uses the codex CLI (codex exec, read-only sandbox) to answer questions about selected code. Requires Codex to be installed.',
+  minimax:
+    'Uses MiniMax M2.7 (204K context) via the OpenAI-compatible API — no Claude Code CLI required.',
+};
+
+type SettingsTab = 'general' | 'themes' | 'mcp' | 'experimental';
 type ThemeSlot = 'light' | 'dark';
 
 function SettingsSection(props: { title: string; children: JSX.Element }) {
@@ -78,6 +95,7 @@ export function SettingsCheckboxRow(props: {
   checked: boolean;
   onChange: (checked: boolean) => void;
   align?: 'center' | 'flex-start';
+  disabled?: boolean;
 }) {
   return (
     <label
@@ -95,7 +113,11 @@ export function SettingsCheckboxRow(props: {
       <input
         type="checkbox"
         checked={props.checked}
-        onChange={(e) => props.onChange(e.currentTarget.checked)}
+        disabled={props.disabled}
+        onChange={(e) => {
+          props.onChange(e.currentTarget.checked);
+          e.currentTarget.checked = props.checked;
+        }}
         style={{ 'accent-color': theme.accent, cursor: 'pointer' }}
       />
       <div style={{ display: 'flex', 'flex-direction': 'column', gap: '2px' }}>
@@ -262,6 +284,20 @@ export function SettingsDialog(props: SettingsDialogProps) {
   const [customThemeDialogOpen, setCustomThemeDialogOpen] = createSignal(false);
   const [editingThemeId, setEditingThemeId] = createSignal<string | null>(null);
   const [cloneCss, setCloneCss] = createSignal<string | undefined>(undefined);
+  const [savingMcpSetting, setSavingMcpSetting] = createSignal(false);
+  const [mcpSettingError, setMcpSettingError] = createSignal<string | null>(null);
+
+  async function changeMcpOrchestration(enabled: boolean) {
+    setSavingMcpSetting(true);
+    setMcpSettingError(null);
+    try {
+      await setMcpOrchestrationEnabled(enabled);
+    } catch (error) {
+      setMcpSettingError(`Could not change agent orchestration: ${String(error)}`);
+    } finally {
+      setSavingMcpSetting(false);
+    }
+  }
 
   function openCloneDialog(presetId: string, label: string) {
     const vars = readCssVarsForPreset(presetId);
@@ -294,6 +330,11 @@ export function SettingsDialog(props: SettingsDialogProps) {
   // from defaulting to "shown" the way excluding non-checkable phases would.
   const canCheckForUpdates = () =>
     ['idle', 'checking', 'up-to-date', 'available', 'error'].includes(updateStatus().phase);
+
+  // The Codex model select is filled from the CLI's cache, read on first need.
+  createEffect(() => {
+    if (props.open && store.askCodeProvider === 'codex') loadCodexModels();
+  });
 
   // Fetch system fonts when the dialog opens
   createEffect(
@@ -381,7 +422,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
           'margin-bottom': '2px',
         }}
       >
-        <For each={['general', 'themes', 'experimental'] as SettingsTab[]}>
+        <For each={['general', 'themes', 'mcp', 'experimental'] as SettingsTab[]}>
           {(tab) => (
             <button
               role="tab"
@@ -391,7 +432,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
               type="button"
               onClick={() => setActiveTab(tab)}
               onKeyDown={(e) => {
-                const tabs: SettingsTab[] = ['general', 'themes', 'experimental'];
+                const tabs: SettingsTab[] = ['general', 'themes', 'mcp', 'experimental'];
                 const idx = tabs.indexOf(tab);
                 if (e.key === 'ArrowRight') setActiveTab(tabs[(idx + 1) % tabs.length]);
                 else if (e.key === 'ArrowLeft')
@@ -412,7 +453,13 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 transition: 'color 0.15s, border-color 0.15s',
               }}
             >
-              {tab === 'general' ? 'General' : tab === 'themes' ? 'Themes' : 'Experimental'}
+              {tab === 'general'
+                ? 'General'
+                : tab === 'themes'
+                  ? 'Themes'
+                  : tab === 'mcp'
+                    ? 'MCP'
+                    : 'Experimental'}
             </button>
           )}
         </For>
@@ -509,12 +556,12 @@ export function SettingsDialog(props: SettingsDialogProps) {
               onChange={setDefaultSkipPermissions}
               description="Pre-tick skip-permissions for every new task. The agent will run without asking for confirmation. Only honoured when the selected agent supports it."
             />
-            <Show when={store.coordinatorModeEnabled}>
+            <Show when={store.mcpOrchestrationEnabled}>
               <SettingsCheckboxRow
                 label="Propagate skip-permissions to sub-tasks"
                 checked={store.defaultPropagateSkipPermissions}
                 onChange={setDefaultPropagateSkipPermissions}
-                description="Pre-tick Propagate to sub-tasks when both coordinator mode and skip-permissions are enabled for a task"
+                description="Pre-tick Propagate to sub-tasks when skip-permissions are enabled for an eligible worktree task"
               />
             </Show>
           </SettingsSection>
@@ -605,9 +652,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 </span>
                 <select
                   value={store.askCodeProvider}
-                  onChange={(e) =>
-                    setAskCodeProvider(e.currentTarget.value as 'claude' | 'minimax')
-                  }
+                  onChange={(e) => setAskCodeProvider(e.currentTarget.value as AskCodeProvider)}
                   style={{
                     flex: '1',
                     background: theme.taskPanelBg,
@@ -621,9 +666,47 @@ export function SettingsDialog(props: SettingsDialogProps) {
                   }}
                 >
                   <option value="claude">Claude Code (claude CLI)</option>
+                  <option value="codex">Codex (codex CLI)</option>
                   <option value="minimax">MiniMax (M2.7)</option>
                 </select>
               </label>
+              <Show when={store.askCodeProvider !== 'minimax'}>
+                <label style={{ display: 'flex', 'align-items': 'center', gap: '10px' }}>
+                  <span style={{ 'font-size': '13px', color: theme.fg, 'white-space': 'nowrap' }}>
+                    Model
+                  </span>
+                  <select
+                    value={store.askCodeModel}
+                    onChange={(e) => setAskCodeModel(e.currentTarget.value)}
+                    style={{
+                      flex: '1',
+                      background: theme.taskPanelBg,
+                      border: `1px solid ${theme.border}`,
+                      'border-radius': 'var(--radius-sm)',
+                      padding: '6px 10px',
+                      color: theme.fg,
+                      'font-size': '13px',
+                      outline: 'none',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <Show
+                      when={store.askCodeProvider === 'codex'}
+                      fallback={
+                        <For each={ASK_CODE_CLAUDE_MODELS}>
+                          {(model) => <option value={model}>{model}</option>}
+                        </For>
+                      }
+                    >
+                      {/* Empty keeps whatever model the codex CLI defaults to. */}
+                      <option value="">CLI default</option>
+                      <For each={codexModels()}>
+                        {(model) => <option value={model.slug}>{model.displayName}</option>}
+                      </For>
+                    </Show>
+                  </select>
+                </label>
+              </Show>
               <Show when={store.askCodeProvider === 'minimax'}>
                 <label
                   style={{
@@ -655,9 +738,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 </label>
               </Show>
               <span style={{ 'font-size': '11px', color: theme.fgSubtle }}>
-                {store.askCodeProvider === 'minimax'
-                  ? 'Uses MiniMax M2.7 (204K context) via the OpenAI-compatible API — no Claude Code CLI required.'
-                  : 'Uses the claude CLI to answer questions about selected code. Requires Claude Code to be installed.'}
+                {ASK_CODE_PROVIDER_HINTS[store.askCodeProvider]}
               </span>
             </div>
           </div>
@@ -1083,28 +1164,39 @@ export function SettingsDialog(props: SettingsDialogProps) {
         onClose={() => setCustomThemeDialogOpen(false)}
       />
 
-      <Show when={activeTab() === 'experimental'}>
+      <Show when={activeTab() === 'mcp'}>
         <div
-          id="settings-tab-experimental"
+          id="settings-tab-mcp"
           role="tabpanel"
-          aria-labelledby="settings-tabbutton-experimental"
+          aria-labelledby="settings-tabbutton-mcp"
           style={{ display: 'flex', 'flex-direction': 'column', gap: '18px' }}
         >
-          <SettingsSection title="Document workspaces">
+          <SettingsSection title="Agent orchestration">
             <SettingsCheckboxRow
-              label="Document workspaces"
-              checked={store.documentWorkspacesEnabled}
-              onChange={setDocumentWorkspacesEnabled}
-              description="Add document projects: a folder with one Markdown document, set up for you if it is not a Git repository yet. Select a passage, send the same instruction to one or more agents running headlessly in isolated worktrees, compare the proposals side by side, and accept one as a single readable commit. Adds Document project to the + button next to Projects."
+              label="Allow agents to orchestrate tasks"
+              checked={store.mcpOrchestrationEnabled}
+              disabled={savingMcpSetting()}
+              onChange={(enabled) => void changeMcpOrchestration(enabled)}
+              description="Allow supported agents in top-level worktree tasks to create and manage Parallel Code tasks through MCP by default in new sessions. Peer access between tasks also requires project permission."
             />
+            <span style={{ 'font-size': '12px', color: theme.fgSubtle }}>
+              Child tasks launch additional agent sessions and may incur provider charges. The
+              default concurrent child limit is {DEFAULT_COORDINATOR_CONCURRENT_TASKS}; each parent
+              can have a configured limit. This is not a spending cap.
+            </span>
+            <span style={{ 'font-size': '12px', color: theme.fgSubtle }}>
+              Turning this off blocks new agent orchestration actions. Existing tasks keep running,
+              worktrees are preserved, and canvas tools remain available. After enabling, restart
+              agent sessions if their orchestration tools are not available. Use restart and resume
+              to preserve the conversation where supported.
+            </span>
+            <Show when={mcpSettingError()}>
+              <span role="alert" style={{ 'font-size': '12px', color: theme.error }}>
+                {mcpSettingError()}
+              </span>
+            </Show>
           </SettingsSection>
-          <SettingsSection title="Coordinator">
-            <SettingsCheckboxRow
-              label="Coordinator mode"
-              checked={store.coordinatorModeEnabled}
-              onChange={setCoordinatorModeEnabled}
-              description="Enable the Coordinator option when creating tasks. Coordinators can spawn sub-tasks, send prompts, and merge branches automatically via MCP tools. Requires app restart to fully disable."
-            />
+          <SettingsSection title="Automatic child updates">
             <div
               style={{
                 display: 'flex',
@@ -1124,7 +1216,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 }}
               >
                 <span style={{ 'font-size': '14px', color: theme.fg, 'white-space': 'nowrap' }}>
-                  Coordinator notification delay (seconds)
+                  Child update delay (seconds)
                 </span>
                 <input
                   type="number"
@@ -1153,10 +1245,28 @@ export function SettingsDialog(props: SettingsDialogProps) {
                 />
               </label>
               <span style={{ 'font-size': '12px', color: theme.fgSubtle }}>
-                How long the coordinator waits before firing a notification after a sub-task
+                How long to wait before automatically sending an update after a child task
                 completes. Default: 60s. Failed sub-tasks use max(10s, delay ÷ 4).
               </span>
             </div>
+          </SettingsSection>
+        </div>
+      </Show>
+
+      <Show when={activeTab() === 'experimental'}>
+        <div
+          id="settings-tab-experimental"
+          role="tabpanel"
+          aria-labelledby="settings-tabbutton-experimental"
+          style={{ display: 'flex', 'flex-direction': 'column', gap: '18px' }}
+        >
+          <SettingsSection title="Document workspaces">
+            <SettingsCheckboxRow
+              label="Document workspaces"
+              checked={store.documentWorkspacesEnabled}
+              onChange={setDocumentWorkspacesEnabled}
+              description="Add document projects: a folder with one Markdown document, set up for you if it is not a Git repository yet. Select a passage, send the same instruction to one or more agents running headlessly in isolated worktrees, compare the proposals side by side, and accept one as a single readable commit. Adds Document project to the + button next to Projects."
+            />
           </SettingsSection>
         </div>
       </Show>

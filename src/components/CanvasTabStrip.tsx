@@ -4,7 +4,9 @@ import { sf } from '../lib/fontScale';
 import { canvasTabKey } from '../lib/canvas-tabs';
 import type { CanvasTab, CanvasTabKind } from '../store/types';
 import { IconButton } from './IconButton';
-import { CloseIcon, PlusIcon } from './icons';
+import { CloseIcon, ExpandIcon, ExternalLinkIcon, PlusIcon } from './icons';
+import { UnderstandButton, tourButtonStyle } from './understanding/UnderstandButton';
+import type { UnderstandingTourController } from '../lib/create-understanding-tour';
 
 interface CanvasTabStripProps {
   tabs: CanvasTab[];
@@ -17,7 +19,13 @@ interface CanvasTabStripProps {
   onAdd: (kind: CanvasTabKind) => void;
   onCloseAll: () => void;
   fullscreen: boolean;
+  onEnterFullscreen: () => void;
   onExitFullscreen: () => void;
+  /** Hands the open document to whatever the system opens Markdown with. */
+  onOpenInDefaultEditor: (path: string) => void;
+  /** Both present: the open document gets a Take Tour button. */
+  understanding?: UnderstandingTourController;
+  onTakeTour?: (path: string) => void;
 }
 
 /** What the "+" menu offers. */
@@ -43,6 +51,17 @@ const tabLabel = (tab: CanvasTab): string => {
  *  more, and a cross that closes the whole column. */
 export function CanvasTabStrip(props: CanvasTabStripProps) {
   const [menuOpen, setMenuOpen] = createSignal(false);
+  /** The file behind the open tab, when the open tab is a document. */
+  const activePath = (): string | undefined => {
+    const tab = props.tabs.find((candidate) => canvasTabKey(candidate) === props.active);
+    return tab?.kind === 'markdown' ? tab.path : undefined;
+  };
+  const tourTarget = () => {
+    const path = activePath();
+    const tour = props.understanding;
+    const onTakeTour = props.onTakeTour;
+    return path && tour && onTakeTour ? { path, tour, onTakeTour } : undefined;
+  };
 
   return (
     <div
@@ -148,6 +167,36 @@ export function CanvasTabStrip(props: CanvasTabStripProps) {
           >
             Exit fullscreen
           </button>
+        </Show>
+        <Show when={tourTarget()}>
+          {(target) => (
+            <UnderstandButton
+              label="Take Tour"
+              tour={target().tour}
+              kind="plan"
+              subject={target().path}
+              onClick={() => target().onTakeTour(target().path)}
+              class="btn-secondary review-plan-btn canvas-tour-btn"
+              style={tourButtonStyle}
+              modelMenu
+            />
+          )}
+        </Show>
+        <Show when={activePath()}>
+          {(path) => (
+            <IconButton
+              icon={<ExternalLinkIcon size={13} />}
+              onClick={() => props.onOpenInDefaultEditor(path())}
+              title={`Open ${path()} in the default editor`}
+            />
+          )}
+        </Show>
+        <Show when={!props.fullscreen && activePath()}>
+          <IconButton
+            icon={<ExpandIcon size={13} />}
+            onClick={() => props.onEnterFullscreen()}
+            title="Fill the window with this canvas"
+          />
         </Show>
         <IconButton
           icon={<PlusIcon size={16} />}

@@ -29,6 +29,7 @@ export {
   removeCustomAgent,
   setAgentEnvFile,
 } from './agents';
+export { publishAgentTour } from './agent-tour';
 export {
   openCanvasDocument,
   openCanvasBrowser,
@@ -171,9 +172,9 @@ export {
   setDockerAvailable,
   setShareDockerAgentAuth,
   setAskCodeProvider,
+  setAskCodeModel,
   setMinimaxApiKey,
   setWindowState,
-  setCoordinatorModeEnabled,
   setDefaultStepsEnabled,
   setAutoResumeSessions,
   setDefaultSkipPermissions,
@@ -254,3 +255,5 @@ export {
   stopMCPStatusPolling,
 } from './mcpStatus';
 export { refreshUsage, startUsagePolling, stopUsagePolling, USAGE_PROVIDERS } from './usage';
+
+export { setMcpOrchestrationEnabled } from './delegation';

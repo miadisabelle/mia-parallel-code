@@ -21,6 +21,8 @@ import { useFocusRegistration } from '../lib/focus-registration';
 import { openFileInEditor } from '../lib/shell';
 import { errMessage } from '../lib/log';
 import type { CanvasTab, Task } from '../store/types';
+import type { UnderstandingTourController } from '../lib/create-understanding-tour';
+import { TOUR_MIN_DOCUMENT_CHARS } from '../../electron/shared/understanding-limits';
 import { ConfirmDialog } from './ConfirmDialog';
 import { CanvasFilePicker } from './CanvasFilePicker';
 import { CanvasTabStrip } from './CanvasTabStrip';
@@ -36,6 +38,9 @@ interface TaskCanvasPanelProps {
   isActive: boolean;
   reasoning?: JSX.Element;
   mindmap?: JSX.Element;
+  /** Both present: open documents get a Take Tour button in the strip. */
+  understanding?: UnderstandingTourController;
+  onTakeTour?: (path: string) => void;
 }
 
 /**
@@ -58,6 +63,8 @@ export function TaskCanvasPanel(props: TaskCanvasPanelProps) {
   });
   const [pickerOpen, setPickerOpen] = createSignal(false);
   const [dirtyTabs, setDirtyTabs] = createSignal<Record<string, boolean>>({});
+  /** Characters per document tab key, so short documents get no tour button. */
+  const [tabChars, setTabChars] = createSignal<Record<string, number>>({});
   // The tab a close was asked for while it had unsaved edits; null for the column.
   const [confirmClose, setConfirmClose] = createSignal<string | null | false>(false);
   const [fullscreen, setFullscreen] = createSignal(false);
@@ -67,6 +74,14 @@ export function TaskCanvasPanel(props: TaskCanvasPanelProps) {
   createEffect(() => {
     if (!props.isActive) setFullscreen(false);
   });
+
+  /** Enters fullscreen from a control that unmounts itself in the act.
+   *  Focus would land on the document body, out of reach of the Escape
+   *  handler above, leaving the overlay with no way back. */
+  function enterFullscreen(): void {
+    setFullscreen(true);
+    panelRef?.focus();
+  }
   const [contextMenu, setContextMenu] = createSignal<{
     path: string;
     x: number;
@@ -74,6 +89,11 @@ export function TaskCanvasPanel(props: TaskCanvasPanelProps) {
   } | null>(null);
 
   const tabs = () => props.task.canvasTabs ?? [];
+  // Closing the last tab under a fullscreen canvas would leave the window
+  // filled with the empty state and no tab strip worth showing.
+  createEffect(() => {
+    if (tabs().length === 0) setFullscreen(false);
+  });
   const active = () => props.task.canvasActiveTab;
   const markdownTabs = () => tabs().filter((tab) => tab.kind === 'markdown');
   // Mind map and reasoning tabs render from props; only file-backed tabs mount documents.
@@ -99,6 +119,12 @@ export function TaskCanvasPanel(props: TaskCanvasPanelProps) {
 
   const setDirty = (key: string, dirty: boolean) =>
     setDirtyTabs((d) => (d[key] === dirty ? d : { ...d, [key]: dirty }));
+  const setChars = (key: string, chars: number) =>
+    setTabChars((c) => (c[key] === chars ? c : { ...c, [key]: chars }));
+  const activeDocumentIsLong = () => {
+    const key = active();
+    return key !== undefined && (tabChars()[key] ?? 0) >= TOUR_MIN_DOCUMENT_CHARS;
+  };
 
   function requestCloseTab(key: string): void {
     if (dirtyTabs()[key]) setConfirmClose(key);
@@ -186,7 +212,7 @@ export function TaskCanvasPanel(props: TaskCanvasPanelProps) {
   function openFullscreenEditor(path: string): void {
     setContextMenu(null);
     activateCanvasTab(props.task.id, canvasTabKey({ kind: 'markdown', path }));
-    setFullscreen(true);
+    enterFullscreen();
   }
 
   return (
@@ -231,7 +257,11 @@ export function TaskCanvasPanel(props: TaskCanvasPanelProps) {
           }}
           onCloseAll={requestCloseAll}
           fullscreen={fullscreen()}
+          onEnterFullscreen={enterFullscreen}
           onExitFullscreen={() => setFullscreen(false)}
+          onOpenInDefaultEditor={openDefaultEditor}
+          understanding={props.understanding}
+          onTakeTour={activeDocumentIsLong() ? props.onTakeTour : undefined}
         />
         <Show when={pickerOpen()}>
           <CanvasFilePicker
@@ -282,6 +312,7 @@ export function TaskCanvasPanel(props: TaskCanvasPanelProps) {
                     path={tab().path}
                     active={active() === key}
                     onDirty={(dirty) => setDirty(key, dirty)}
+                    onLength={(chars) => setChars(key, chars)}
                   />
                 }
               >

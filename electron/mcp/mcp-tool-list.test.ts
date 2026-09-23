@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseReasoningUpdate } from '../shared/reasoning-feed.js';
+import { AGENT_TOUR_LIMITS } from '../shared/agent-tour.js';
+import { TOUR_CARD_LIMITS, TOUR_TONES } from '../shared/understanding-limits.js';
 import { acceptUpdate, emptyHistory } from '../shared/reasoning-state.js';
 import {
   selectTools,
@@ -9,6 +11,7 @@ import {
   REASONING_TOOLS,
   CANVAS_VIEW_TOOLS,
   CANVAS_INSTRUCTIONS,
+  TOUR_TOOLS,
   hasCanvasTools,
   type ToolDef,
 } from './mcp-tool-list.js';
@@ -21,6 +24,7 @@ describe('selectTools — role-based tool list', () => {
       ...MINDMAP_TOOLS,
       ...REASONING_TOOLS,
       ...CANVAS_VIEW_TOOLS,
+      ...TOUR_TOOLS,
     ]);
     expect(tools.map((t: ToolDef) => t.name)).toStrictEqual([
       'land_self',
@@ -30,6 +34,7 @@ describe('selectTools — role-based tool list', () => {
       'reasoning_read',
       'reasoning_update',
       'canvas_open',
+      'tour_publish',
     ]);
   });
 
@@ -40,6 +45,7 @@ describe('selectTools — role-based tool list', () => {
       ...MINDMAP_TOOLS,
       ...REASONING_TOOLS,
       ...CANVAS_VIEW_TOOLS,
+      ...TOUR_TOOLS,
     ]);
   });
 
@@ -138,6 +144,7 @@ it('ordinary canvas sessions advertise only map tools', () => {
     ...MINDMAP_TOOLS,
     ...REASONING_TOOLS,
     ...CANVAS_VIEW_TOOLS,
+    ...TOUR_TOOLS,
   ]);
 });
 
@@ -155,6 +162,27 @@ it('canvas_open takes exactly one of the two canvas views', () => {
   const tool = CANVAS_VIEW_TOOLS.find((t) => t.name === 'canvas_open');
   expect(tool?.inputSchema.required).toEqual(['view']);
   expect(tool?.inputSchema.properties.view).toEqual({ enum: ['mindmap', 'reasoning'] });
+});
+
+it('describes tour_publish with the caps the validator enforces', () => {
+  const tool = TOUR_TOOLS.find((t) => t.name === 'tour_publish');
+  expect(tool?.inputSchema.required).toEqual(['subject', 'gist', 'cards']);
+  expect(tool?.inputSchema.properties.cards).toMatchObject({
+    minItems: TOUR_CARD_LIMITS.minCards,
+    maxItems: TOUR_CARD_LIMITS.maxCards,
+  });
+  expect(tool?.inputSchema.properties.subject).toMatchObject({
+    maxLength: AGENT_TOUR_LIMITS.subject,
+  });
+  // The numbers come from the constants, so a cap change cannot leave the prompt behind.
+  expect(tool?.description).toContain(`at most ${TOUR_CARD_LIMITS.body} characters`);
+  expect(tool?.description).toContain(
+    `${TOUR_CARD_LIMITS.minCards} and ${TOUR_CARD_LIMITS.maxCards}`,
+  );
+  expect(tool?.description).toContain(`at most ${AGENT_TOUR_LIMITS.context} characters`);
+  expect(tool?.description).toContain(TOUR_TONES.join(', '));
+  expect(tool?.description).toContain('as a tour');
+  expect(tool?.description).toContain('follow-up');
 });
 
 it('advertises a self-contained reasoning example that the transaction engine accepts', () => {
@@ -177,4 +205,70 @@ it('advertises a self-contained reasoning example that the transaction engine ac
   });
   expect(history.snapshots[0].records).toHaveLength(3);
   expect(history.snapshots[0].relations[0]).toMatchObject({ source: 'finding', target: 'cause' });
+});
+
+describe('session capability tool sets', () => {
+  const canvas = [
+    'mindmap_read',
+    'mindmap_update',
+    'reasoning_read',
+    'reasoning_update',
+    'canvas_open',
+    'tour_publish',
+  ];
+  const supervision = [
+    'list_tasks',
+    'get_task_status',
+    'send_prompt',
+    'wait_for_idle',
+    'get_task_diff',
+    'get_task_output',
+    'wait_for_signal_done',
+  ];
+  const names = (
+    profile: 'ordinary' | 'child-review' | 'child-automatic',
+    canCreate = false,
+    peers = false,
+  ) => selectTools('task', '', false, { profile, canCreate, peers }).map((tool) => tool.name);
+
+  it('exposes exact ordinary rights separately from agent creation consent', () => {
+    expect(names('ordinary')).toEqual([...canvas, ...supervision]);
+    expect(names('ordinary', true)).toEqual([...canvas, 'create_task', ...supervision]);
+  });
+
+  it('never grants children creation even if a malformed capability requests it', () => {
+    expect(names('child-review', true)).toEqual([...canvas, 'signal_done']);
+    expect(names('child-automatic', true)).toEqual([...canvas, 'land_self', 'signal_done']);
+  });
+
+  it('adds only exact-session held-message tools when enabled', () => {
+    expect(names('child-review', false, true)).toEqual([
+      ...canvas,
+      'signal_done',
+      'list_agent_sessions',
+      'get_agent_output',
+      'send_agent_prompt',
+      'wait_for_agent_prompt',
+    ]);
+  });
+
+  it('uses bounded completion guidance without telling agents to self-land or auto-merge', () => {
+    const tools = selectTools('parent', '', false, {
+      profile: 'ordinary',
+      canCreate: true,
+      peers: false,
+    });
+    for (const name of ['wait_for_idle', 'wait_for_signal_done'])
+      expect(
+        tools.find((tool) => tool.name === name)?.inputSchema.properties.timeoutMs,
+      ).toMatchObject({ default: 30000, maximum: 60000 });
+    const child = selectTools('child', '', false, {
+      profile: 'child-review',
+      canCreate: false,
+      peers: false,
+    });
+    expect(child.find((tool) => tool.name === 'signal_done')?.description).not.toContain(
+      'Use land_self',
+    );
+  });
 });

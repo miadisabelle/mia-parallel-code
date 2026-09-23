@@ -17,7 +17,7 @@ import { produce } from 'solid-js/store';
 import { IPC } from '../../electron/ipc/channels';
 import { invoke } from '../lib/ipc';
 import { setStore, store } from './core';
-import { relinkProject, updateProject } from './projects';
+import { relinkProject, updateProject, updateProjectCoordination } from './projects';
 import { openDialog } from '../lib/dialog';
 import type { Task } from './types';
 
@@ -195,6 +195,17 @@ describe('relinkProject session ids', () => {
     expect(store.tasks['doc-agent-docs'].agentSessionIds?.a).toEqual(expect.any(String));
   });
 
+  it('drops the prompts sent to the conversation it replaced', async () => {
+    seed('claude', undefined);
+    setStore('tasks', 'doc-agent-docs', {
+      lastPrompt: 'old',
+      promptHistory: [{ text: 'old', agentId: 'a' }],
+    });
+    expect(await relinkProject('docs')).toBe(true);
+    expect(store.tasks['doc-agent-docs'].promptHistory).toBeUndefined();
+    expect(store.tasks['doc-agent-docs'].lastPrompt).toBe('');
+  });
+
   // Codex assigns its own, so an id invented here would name a session that
   // never existed.
   it('leaves a Codex pane without one', async () => {
@@ -306,4 +317,28 @@ describe('updateProject verify command', () => {
 
     expect(invoke).not.toHaveBeenCalled();
   });
+});
+
+it('changes project peer permission only after backend acknowledgment', async () => {
+  setStore('projects', [
+    {
+      id: 'consent',
+      name: 'Consent',
+      path: '/repo',
+      color: '',
+      allowPeerAccess: false,
+    },
+  ]);
+  vi.mocked(invoke).mockRejectedValueOnce(new Error('Permission update failed'));
+  await expect(updateProjectCoordination('consent', true)).rejects.toThrow(
+    'Permission update failed',
+  );
+  expect(store.projects[0].allowPeerAccess).toBe(false);
+  vi.mocked(invoke).mockResolvedValueOnce({});
+  await updateProjectCoordination('consent', true);
+  expect(invoke).toHaveBeenLastCalledWith(IPC.DelegationRequest, {
+    action: 'projectPolicy',
+    policy: { projectId: 'consent', allowPeerAccess: true },
+  });
+  expect(store.projects[0].allowPeerAccess).toBe(true);
 });

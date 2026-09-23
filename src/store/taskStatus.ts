@@ -15,6 +15,7 @@ import {
 import { warn as logWarn, info as logInfo, errMessage } from '../lib/log';
 import { adoptTaskBranch } from './task-branch';
 import { clearAgentHookStatus, getAgentHookStatus } from './agentHookStatus';
+import { getPrChecks } from './pr-checks-state';
 import {
   chunkContainsAgentPrompt,
   getAgentPromptReadiness,
@@ -123,7 +124,16 @@ function clearAutoTrustState(agentId: string): void {
 }
 
 export type TaskDotStatus = 'busy' | 'waiting' | 'ready' | 'review';
-export type TaskAttentionState = 'idle' | 'active' | 'needs_input' | 'error' | 'ready' | 'review';
+/** `active` means an agent is working. `shell_busy` means only a plain terminal
+ *  is producing output — informational, and never counted as needing attention. */
+export type TaskAttentionState =
+  | 'idle'
+  | 'active'
+  | 'shell_busy'
+  | 'needs_input'
+  | 'error'
+  | 'ready'
+  | 'review';
 
 // --- Prompt detection helpers ---
 // stripAnsi lives in the shared prompt-detect module (single source of truth);
@@ -131,6 +141,13 @@ export type TaskAttentionState = 'idle' | 'active' | 'needs_input' | 'error' | '
 export { stripAnsi };
 
 const CODEX_STATUS_FOOTER_PATTERN = /^gpt-\S+[ \t]+[^\r\n]*[·•][ \t]+(?:\/|~\/)[^\r\n]*$/;
+const CODEX_SHORTCUTS_FOOTER_PATTERN = /^\?\s*for\s*shortcuts(?:\s*\d+%\s*context\s*left)?$/;
+
+/** Codex's empty composer contains a suggestion, with its help footer below it.
+ * Cursor positioning can join these into one line after ANSI stripping. */
+function looksLikeCodexComposer(output: string): boolean {
+  return /›[^\r\n]*(?:\r?\n\s*)*\?\s*for\s*shortcuts(?:\s*\d+%\s*context\s*left)?\s*$/.test(output);
+}
 
 /** Returns true if `line` looks like a prompt waiting for input. */
 function looksLikePrompt(line: string): boolean {
@@ -796,14 +813,25 @@ export function markAgentOutput(agentId: string, data: Uint8Array, taskId?: stri
   if (!normalizeForComparison(text)) return;
 
   const latestOutput = stripAnsi(text.slice(Math.max(0, findLastFrameStart(text))));
+  const frame = stripAnsi(combined.slice(Math.max(0, findLastFrameStart(combined))));
+  const shortcutsFooter = CODEX_SHORTCUTS_FOOTER_PATTERN.test(latestOutput.trim());
+  // The composer and footer may arrive in separate PTY chunks. In that case
+  // keep startup/working indicators from the same frame in the readiness check.
+  const composerOutput = shortcutsFooter ? frame : latestOutput;
+  const codexComposer = looksLikeCodexComposer(composerOutput);
+  const readiness = getAgentPromptReadiness(composerOutput);
+  const canBeIdle = readiness.ready || readiness.reason === 'no_prompt';
   // A separately delivered footer says nothing about the turn. Preserve both
   // activity and its timer instead of reinterpreting a prompt from older output.
-  if (CODEX_STATUS_FOOTER_PATTERN.test(latestOutput.trim())) return;
+  if (
+    CODEX_STATUS_FOOTER_PATTERN.test(latestOutput.trim()) ||
+    (shortcutsFooter && (!codexComposer || !canBeIdle))
+  )
+    return;
 
   // A payload can contain multiple redraws; only the latest frame is current.
   // Strip controls before splitting so a cursor-only line cannot hide a prompt.
-  const frame = combined.slice(Math.max(0, findLastFrameStart(combined)));
-  const lines = stripAnsi(frame)
+  const lines = frame
     .slice(-1000)
     .split(/\r\n?|\n/)
     .map((line) => line.trim())
@@ -812,8 +840,7 @@ export function markAgentOutput(agentId: string, data: Uint8Array, taskId?: stri
   // known footer, never arbitrary output that followed an earlier prompt.
   if (CODEX_STATUS_FOOTER_PATTERN.test(lines.at(-1) ?? '')) lines.pop();
   const lastLine = lines.at(-1) ?? '';
-  const readiness = getAgentPromptReadiness(latestOutput);
-  if ((readiness.ready || readiness.reason === 'no_prompt') && looksLikePrompt(lastLine)) {
+  if (canBeIdle && (looksLikePrompt(lastLine) || codexComposer)) {
     // Prompt detected — agent is idle. Remove from active set immediately.
     //
     // NOTE: do NOT cancel pendingAnalysis here.  TUI agents (Copilot CLI,
@@ -896,8 +923,13 @@ export function clearAgentActivity(agentId: string): void {
 
 function isTaskReady(taskId: string): boolean {
   const git = store.taskGitStatus[taskId];
+  const prChecks = getPrChecks(taskId);
   return Boolean(
-    isGitStatusUsable(git) && git.has_committed_changes && !git.has_uncommitted_changes,
+    isGitStatusUsable(git) &&
+    git.has_committed_changes &&
+    !git.has_uncommitted_changes &&
+    prChecks?.overall !== 'failure' &&
+    !prChecks?.failing,
   );
 }
 
@@ -935,16 +967,28 @@ function isAgentWorking(agentId: string, active: ReadonlySet<string>): boolean {
   return hook ? hook.state === 'working' : active.has(agentId);
 }
 
-function hasRunningTaskActivity(taskId: string, predicate: (id: string) => boolean): boolean {
+/** Between turns with nothing asked of the user, by the same hook-first
+ *  precedence as the task status rather than the raw output heuristics. */
+export function isAgentSettled(agentId: string): boolean {
+  return !isAgentWorking(agentId, activeAgents()) && !isAgentBlockedOnInput(agentId);
+}
+
+function hasRunningAgentActivity(taskId: string, predicate: (id: string) => boolean): boolean {
   const task = store.tasks[taskId];
   if (!task) return false;
 
-  return (
-    task.agentIds.some((id) => {
-      const agent = store.agents[id];
-      return (agent?.status === 'running' || isAgentChat(task, id)) && predicate(id);
-    }) || task.shellAgentIds.some((id) => predicate(id))
-  );
+  return task.agentIds.some((id) => {
+    const agent = store.agents[id];
+    return (agent?.status === 'running' || isAgentChat(task, id)) && predicate(id);
+  });
+}
+
+function hasShellActivity(taskId: string, predicate: (id: string) => boolean): boolean {
+  return store.tasks[taskId]?.shellAgentIds.some((id) => predicate(id)) ?? false;
+}
+
+function hasRunningTaskActivity(taskId: string, predicate: (id: string) => boolean): boolean {
+  return hasRunningAgentActivity(taskId, predicate) || hasShellActivity(taskId, predicate);
 }
 
 export function getTaskAttentionState(taskId: string): TaskAttentionState {
@@ -965,10 +1009,14 @@ export function getTaskAttentionState(taskId: string): TaskAttentionState {
   }
 
   const active = activeAgents(); // reactive read
-  const hasActive = hasRunningTaskActivity(taskId, (id) => isAgentWorking(id, active));
-  if (hasActive) return 'active';
+  if (hasRunningAgentActivity(taskId, (id) => isAgentWorking(id, active))) return 'active';
 
   if (isTaskReady(taskId)) return 'ready';
+
+  // A plain terminal producing output is not agent work, so it reports itself
+  // separately and ranks below `ready` — otherwise a dev server or watcher
+  // masks a task that is actually finished for as long as it keeps printing.
+  if (hasShellActivity(taskId, (id) => active.has(id))) return 'shell_busy';
   return 'idle';
 }
 
@@ -993,8 +1041,9 @@ export function getTaskDotStatus(taskId: string): TaskDotStatus {
   }
 
   const active = activeAgents(); // reactive read
-  const hasActive = hasRunningTaskActivity(taskId, (id) => isAgentWorking(id, active));
-  if (hasActive) return 'busy';
+  // Shell panes are deliberately excluded: `busy` reads as "the agent is doing
+  // something", which a terminal running a dev server is not.
+  if (hasRunningAgentActivity(taskId, (id) => isAgentWorking(id, active))) return 'busy';
 
   if (task.needsReview) return 'review';
 

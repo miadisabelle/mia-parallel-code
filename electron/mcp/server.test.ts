@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { handleMCPToolCall, parseArgs, readTokenFile } from './server.js';
-import type { MCPClient } from './client.js';
+import { MCPClient } from './client.js';
 
 function makeClient(): MCPClient {
   return {
@@ -371,6 +371,43 @@ describe('mind map tools', () => {
     });
     expect(client.openCanvas).toHaveBeenCalledTimes(1);
   });
+  it('publishes a tour for the session task and rejects a malformed one before transport', async () => {
+    const client = {
+      publishTour: vi.fn().mockResolvedValue({ ok: true, subject: 'the retry bug' }),
+    } as unknown as MCPClient;
+    const card = { label: 'KEY DECISION', title: 'One idea', body: 'Body text.' };
+    const tour = { subject: 'the retry bug', gist: card, cards: [card], context: 'The facts.' };
+    const context = { client, taskId: 'own-task', coordinatorId: '', canvasOnly: true };
+    expect(
+      await handleMCPToolCall(context, 'tour_publish', { ...tour, taskId: 'other' }),
+    ).not.toHaveProperty('isError');
+    expect(client.publishTour).toHaveBeenCalledWith('own-task', tour);
+    expect(await handleMCPToolCall(context, 'tour_publish', { ...tour, cards: [] })).toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining('cards must be an array') }],
+    });
+    expect(client.publishTour).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses tour_publish without a task-scoped session', async () => {
+    const client = { publishTour: vi.fn() } as unknown as MCPClient;
+    const card = { label: 'KEY DECISION', title: 'One idea', body: 'Body text.' };
+    const result = await handleMCPToolCall(
+      { client, taskId: '', coordinatorId: '' },
+      'tour_publish',
+      {
+        subject: 'the retry bug',
+        gist: card,
+        cards: [card],
+      },
+    );
+    expect(result).toMatchObject({
+      isError: true,
+      content: [{ text: expect.stringContaining('task-scoped MCP session') }],
+    });
+    expect(client.publishTour).not.toHaveBeenCalled();
+  });
+
   it('rejects invalid operations before transport and exposes conflict failures', async () => {
     const client = {
       updateMindMap: vi.fn().mockRejectedValue(new Error('Read it again before editing.')),
@@ -446,4 +483,159 @@ describe('token file launches', () => {
       fs.rmSync(directory, { recursive: true, force: true });
     }
   });
+});
+
+describe('capability-bound sessions', () => {
+  const capabilities = { profile: 'ordinary' as const, canCreate: true, peers: true };
+
+  it('parses the session profile and additional launch flags without coordinator authority', () => {
+    expect(
+      parseArgs([
+        '--peer-tools',
+        '--url',
+        'http://localhost:7777',
+        '--task-id',
+        'parent',
+        '--session-profile',
+        'ordinary',
+        '--allow-create',
+      ]),
+    ).toMatchObject({
+      taskId: 'parent',
+      coordinatorId: '',
+      canvasOnly: false,
+      sessionCapabilities: capabilities,
+    });
+    for (const args of [
+      ['--session-profile', 'unknown'],
+      ['--session-profile', 'ordinary'],
+      ['--task-id', 'parent', '--session-profile', 'ordinary', '--canvas-only'],
+      ['--task-id', 'parent', '--session-profile', 'ordinary', '--coordinator-id', 'other'],
+      ['--allow-create'],
+    ])
+      expect(() => parseArgs(args)).toThrow();
+  });
+
+  it('routes ordinary creation through session authority without a coordinator header', async () => {
+    const client = makeClient();
+    client.callSessionTool = vi.fn().mockResolvedValue({ id: 'child' });
+    const params = {
+      name: 'Child',
+      prompt: 'Fix it',
+      requestId: 'request-1',
+      expectedBranch: 'task/parent',
+      expectedHeadSha: 'abc',
+      useLastCommit: true,
+    };
+    const result = await handleMCPToolCall(
+      { client, taskId: 'parent', coordinatorId: '', sessionCapabilities: capabilities },
+      'create_task',
+      params,
+    );
+    expect(result).not.toHaveProperty('isError');
+    expect(client.callSessionTool).toHaveBeenCalledWith('create_task', params);
+    expect(client.createTask).not.toHaveBeenCalled();
+  });
+
+  it('blocks hidden management and child creation even when invoked directly', async () => {
+    const client = makeClient();
+    client.callSessionTool = vi.fn();
+    for (const name of ['merge_task', 'close_task', 'review_and_merge_task', 'land_self']) {
+      expect(
+        await handleMCPToolCall(
+          { client, taskId: 'parent', coordinatorId: '', sessionCapabilities: capabilities },
+          name,
+          {},
+        ),
+      ).toMatchObject({ isError: true });
+    }
+    for (const name of ['create_task', 'land_self', 'list_tasks']) {
+      expect(
+        await handleMCPToolCall(
+          {
+            client,
+            taskId: 'child',
+            coordinatorId: '',
+            sessionCapabilities: { ...capabilities, profile: 'child-review' },
+          },
+          name,
+          {},
+        ),
+      ).toMatchObject({ isError: true });
+    }
+    expect(client.callSessionTool).not.toHaveBeenCalled();
+  });
+
+  it('normalizes bounded waits and rejects invalid timeout values', async () => {
+    const client = makeClient();
+    client.callSessionTool = vi.fn().mockResolvedValue({ remaining: 0 });
+    const context = {
+      client,
+      taskId: 'parent',
+      coordinatorId: '',
+      sessionCapabilities: capabilities,
+    };
+    await handleMCPToolCall(context, 'wait_for_signal_done', {});
+    expect(client.callSessionTool).toHaveBeenLastCalledWith('wait_for_signal_done', {
+      timeoutMs: 30000,
+    });
+    await handleMCPToolCall(context, 'wait_for_agent_prompt', {
+      deliveryId: 'delivery',
+      lastObservedState: 'waiting',
+      timeoutMs: 90000,
+    });
+    expect(client.callSessionTool).toHaveBeenLastCalledWith('wait_for_agent_prompt', {
+      deliveryId: 'delivery',
+      lastObservedState: 'waiting',
+      timeoutMs: 60000,
+    });
+    for (const timeoutMs of [0, -1, NaN, Infinity, '30000'])
+      expect(await handleMCPToolCall(context, 'wait_for_signal_done', { timeoutMs })).toMatchObject(
+        { isError: true },
+      );
+  });
+
+  it('retains canvas validation instead of forwarding arbitrary graph payloads', async () => {
+    const client = makeClient();
+    client.callSessionTool = vi.fn();
+    const result = await handleMCPToolCall(
+      { client, taskId: 'parent', coordinatorId: '', sessionCapabilities: capabilities },
+      'mindmap_update',
+      { operations: 'invalid' },
+    );
+    expect(result).toMatchObject({ isError: true });
+    expect(client.callSessionTool).not.toHaveBeenCalled();
+  });
+});
+
+it('sends scoped tool requests with the bearer credential and no coordinator override', async () => {
+  const fetchMock = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValue(new Response(JSON.stringify({ state: 'waiting' }), { status: 200 }));
+  try {
+    const client = new MCPClient('http://localhost:7777', 'session-token');
+    await expect(
+      client.callSessionTool('send_agent_prompt', {
+        agentId: 'recipient',
+        sessionInstanceId: 'instance',
+        prompt: 'Please review',
+        requestId: 'request',
+      }),
+    ).resolves.toEqual({ state: 'waiting' });
+    expect(fetchMock).toHaveBeenCalledWith('http://localhost:7777/api/session/tools', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer session-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'send_agent_prompt',
+        params: {
+          agentId: 'recipient',
+          sessionInstanceId: 'instance',
+          prompt: 'Please review',
+          requestId: 'request',
+        },
+      }),
+    });
+  } finally {
+    fetchMock.mockRestore();
+  }
 });

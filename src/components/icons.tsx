@@ -69,6 +69,68 @@ export function RedoIcon(props: IconProps): JSX.Element {
   );
 }
 
+/** Stroke arrows for step-by-step navigation; see also Undo/Redo above. */
+export function ChevronLeftIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path
+        d="M10 3.5 5.5 8l4.5 4.5"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </SvgIcon>
+  );
+}
+
+export function ChevronDownIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path
+        d="M3.5 6 8 10.5 12.5 6"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </SvgIcon>
+  );
+}
+
+export function ChevronRightIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path
+        d="M6 3.5 10.5 8 6 12.5"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </SvgIcon>
+  );
+}
+
+/** Stacked plates: one more level down than what is on screen. */
+export function LayersIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path
+        d="M8 1.5 14 4.25 8 7 2 4.25 8 1.5ZM2 8l6 2.75L14 8M2 11.5l6 2.75 6-2.75"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+    </SvgIcon>
+  );
+}
+
 export function AlertIcon(props: IconProps): JSX.Element {
   return (
     <SvgIcon {...props}>
@@ -187,6 +249,27 @@ export function LinkIcon(props: IconProps): JSX.Element {
   return (
     <SvgIcon {...props}>
       <path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z" />
+    </SvgIcon>
+  );
+}
+
+/** Opening something outside the app: a file in its own editor, a URL in the browser. */
+export function ExternalLinkIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path d="M3.5 2a1.5 1.5 0 0 0-1.5 1.5v9A1.5 1.5 0 0 0 3.5 14h9a1.5 1.5 0 0 0 1.5-1.5v-3a.75.75 0 0 1 1.5 0v3A3 3 0 0 1 12.5 16h-9A3 3 0 0 1 0 12.5v-9A3 3 0 0 1 3.5 0h3a.75.75 0 0 1 0 1.5h-3ZM10 .75a.75.75 0 0 1 .75-.75h4.5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-1.5 0V2.56L8.53 8.53a.75.75 0 0 1-1.06-1.06L13.44 1.5H10.75A.75.75 0 0 1 10 .75Z" />
+    </SvgIcon>
+  );
+}
+
+/** Four corner brackets: take the whole window. */
+export function ExpandIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path d="M2 2h5v1.5H3.5V7H2V2Z" />
+      <path d="M14 2v5h-1.5V3.5H9V2h5Z" />
+      <path d="M2 14V9h1.5v3.5H7V14H2Z" />
+      <path d="M14 14H9v-1.5h3.5V9H14v5Z" />
     </SvgIcon>
   );
 }

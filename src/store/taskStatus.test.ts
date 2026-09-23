@@ -7,6 +7,7 @@ let mockActiveTaskId: string | null = null;
 let mockTasks: Record<string, unknown> = {};
 let mockAgents: Record<string, unknown> = {};
 let mockTaskGitStatus: Record<string, unknown> = {};
+let mockPrChecks: Record<string, { overall: string; failing: number }> = {};
 const core = vi.hoisted(() => ({
   harness: undefined as
     | MockStoreHarness<{
@@ -58,6 +59,10 @@ vi.mock('./core', async () => {
 // Mock IPC so tryAutoTrust's invoke call doesn't hit Electron.
 vi.mock('../lib/ipc', () => ({
   invoke: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('./pr-checks-state', () => ({
+  getPrChecks: (taskId: string) => mockPrChecks[taskId],
 }));
 
 // Stub SolidJS reactive primitives — tests run outside a reactive root.
@@ -136,6 +141,7 @@ beforeEach(() => {
   mockTasks = {};
   mockAgents = {};
   mockTaskGitStatus = {};
+  mockPrChecks = {};
 });
 
 afterEach(() => {
@@ -727,6 +733,50 @@ describe('terminal redraw activity', () => {
     expect(isAgentIdle('agent-1')).toBe(true);
   });
 
+  it.each(['\r\n', '\x1b[24;3H'])(
+    'recognizes a fresh Codex composer with a placeholder and help footer (%j)',
+    (separator) => {
+      markAgentSpawned('agent-1');
+      markAgentOutput(
+        'agent-1',
+        encode(
+          'OpenAI Codex' +
+            separator +
+            '› Ask Codex to do anything' +
+            separator +
+            '? for shortcuts  100% context left',
+        ),
+        'task-1',
+      );
+      expect(isAgentIdle('agent-1')).toBe(true);
+
+      markAgentOutput('agent-1', encode('? for shortcuts  100% context left'), 'task-1');
+      expect(isAgentIdle('agent-1')).toBe(true);
+    },
+  );
+
+  it.each(['Working (2s • esc to interrupt)', 'Starting MCP servers (0/2)'])(
+    'keeps the Codex composer busy during %s',
+    (status) => {
+      markAgentOutput(
+        'agent-1',
+        encode(status + '\r\n› Ask Codex to do anything\r\n? for shortcuts  100% context left'),
+        'task-1',
+      );
+      expect(isAgentIdle('agent-1')).toBe(false);
+    },
+  );
+
+  it.each(['', 'Working (2s • esc to interrupt)\r\n', 'Starting MCP servers (0/2)\r\n'])(
+    'handles a separately delivered composer footer with status %j',
+    (status) => {
+      markAgentSpawned('agent-1');
+      markAgentOutput('agent-1', encode(status + '› Ask Codex to do anything\r\n'), 'task-1');
+      markAgentOutput('agent-1', encode('? for shortcuts  100% context left'), 'task-1');
+      expect(isAgentIdle('agent-1')).toBe(status === '');
+    },
+  );
+
   it('does not hide a returned prompt behind a trailing cursor-only line', () => {
     markAgentSpawned('agent-1');
     markAgentOutput('agent-1', encode('Done\r\n› \r\n\x1b[?25h'), 'task-1');
@@ -845,6 +895,26 @@ describe('task attention state', () => {
     expect(taskNeedsAttention('task-1')).toBe(false);
   });
 
+  it.each([
+    { overall: 'failure', failing: 1 },
+    { overall: 'failure', failing: 0 },
+    { overall: 'pending', failing: 1 },
+  ])('does not report ready for a CI failure ($overall, $failing failing)', (prChecks) => {
+    setMockTask('task-1', { agentIds: ['agent-1'] });
+    setMockAgent('agent-1', { status: 'running' });
+    vi.setSystemTime(new Date('2026-05-10T10:00:00Z'));
+    mockTaskGitStatus['task-1'] = {
+      has_committed_changes: true,
+      has_uncommitted_changes: false,
+      current_branch: 'task/example',
+      refreshedAt: Date.now(),
+    };
+    mockPrChecks['task-1'] = prChecks;
+
+    expect(getTaskAttentionState('task-1')).toBe('idle');
+    expect(getTaskDotStatus('task-1')).toBe('waiting');
+  });
+
   it('does not report ready from a stale git status snapshot', () => {
     setMockTask('task-1', { agentIds: ['agent-1'] });
     setMockAgent('agent-1', { status: 'running' });
@@ -922,9 +992,37 @@ describe('task attention state', () => {
     expect(taskNeedsAttention('task-1')).toBe(true);
   });
 
-  it('returns active and busy when a task shell is currently producing output', () => {
+  it('returns shell_busy without demanding attention when only a task shell is producing output', () => {
     setMockTask('task-1', { agentIds: [], shellAgentIds: ['shell-1'] });
 
+    markAgentSpawned('shell-1');
+
+    expect(getTaskAttentionState('task-1')).toBe('shell_busy');
+    expect(getTaskDotStatus('task-1')).toBe('waiting');
+    expect(taskNeedsAttention('task-1')).toBe(false);
+  });
+
+  it('still reports ready while a task shell keeps producing output', () => {
+    setMockTask('task-1', { agentIds: [], shellAgentIds: ['shell-1'] });
+    vi.setSystemTime(new Date('2026-05-10T10:00:00Z'));
+    mockTaskGitStatus['task-1'] = {
+      has_committed_changes: true,
+      has_uncommitted_changes: false,
+      current_branch: 'task/example',
+      refreshedAt: Date.now(),
+    };
+
+    markAgentSpawned('shell-1');
+
+    expect(getTaskAttentionState('task-1')).toBe('ready');
+    expect(getTaskDotStatus('task-1')).toBe('ready');
+  });
+
+  it('keeps reporting active when an agent works alongside a busy shell', () => {
+    setMockTask('task-1', { agentIds: ['agent-1'], shellAgentIds: ['shell-1'] });
+    setMockAgent('agent-1', { status: 'running' });
+
+    markAgentSpawned('agent-1');
     markAgentSpawned('shell-1');
 
     expect(getTaskAttentionState('task-1')).toBe('active');

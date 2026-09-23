@@ -1,3 +1,8 @@
+import type {
+  IntegrationPolicy,
+  SessionCapabilities,
+} from '../../electron/shared/delegation-types';
+import type { AgentTourPayload } from '../../electron/shared/agent-tour';
 import type { CanvasTaskLink, CanvasTaskSource } from '../lib/canvas-task-links';
 import type {
   AgentDef,
@@ -8,6 +13,7 @@ import type {
   WorktreeStatus,
 } from '../ipc/types';
 import type { ChatPermissionMode, ChatSession } from '../../electron/shared/agent-chat-types';
+import type { AskCodeProvider } from '../../electron/shared/ask-code-models';
 import type { DockerSource } from '../lib/docker';
 import type { LookPreset, AppearanceMode } from '../lib/look';
 import type { KeyBinding } from '../lib/keybindings';
@@ -75,6 +81,7 @@ export interface TerminalBookmark {
 }
 
 export interface Project {
+  allowPeerAccess?: boolean;
   id: string;
   name: string;
   path: string;
@@ -125,6 +132,9 @@ export interface DocumentSessionRef {
 }
 
 export interface Agent {
+  capabilities?: SessionCapabilities;
+  sessionInstanceId?: string;
+  requireResumeSuccess?: boolean;
   /** Runtime launch capability; never inferred from the selected CLI. */
   canvasTools?: boolean;
   chatState?: import('../../electron/shared/agent-chat-types').AgentChatState;
@@ -157,7 +167,7 @@ export type CanvasTabKind = CanvasTab['kind'];
 export interface PromptHistoryEntry {
   text: string;
   sentAt?: number;
-  agentName?: string;
+  agentId?: string;
 }
 
 export interface Task {
@@ -245,6 +255,12 @@ export interface Task {
   reasoningProfile?: ReasoningProfile;
   /** Runtime-only: bypass setup when this agent session opens the graph from chat. */
   reasoningCanvasRequest?: { agentId: string; generation: number };
+  /**
+   * Runtime-only: the tour the agent last published through `tour_publish`. The
+   * revision bumps on every publish so the panel opens the viewer again even
+   * when the payload is unchanged. Not persisted.
+   */
+  agentTour?: { revision: number; payload: AgentTourPayload };
   reasoningWorkspaces?: Record<string, ReasoningWorkspace>;
   /** Column shown without a tab (the user asked for it). Not persisted. */
   canvasOpen?: boolean;
@@ -260,7 +276,12 @@ export interface Task {
   promptDraft?: string;
   terminalInputPending?: boolean;
   terminalInputPendingFromQuestion?: boolean;
-  // Coordinator fields
+  delegationParent?: boolean;
+  delegationPaused?: boolean;
+  integrationPolicy?: IntegrationPolicy;
+  autoMergeChildren?: boolean;
+  autoSendChildUpdates?: boolean;
+  /** @deprecated Retained to restore tasks created with legacy coordinator transport. */
   coordinatorMode?: boolean;
   propagateSkipPermissions?: boolean;
   maxConcurrentTasks?: number;
@@ -351,7 +372,12 @@ export interface PersistedTask {
   stepsEnabled?: boolean;
   branchAdoptedFrom?: string;
   branchOfferDismissed?: string;
-  // Coordinator fields
+  delegationParent?: boolean;
+  delegationPaused?: boolean;
+  integrationPolicy?: IntegrationPolicy;
+  autoMergeChildren?: boolean;
+  autoSendChildUpdates?: boolean;
+  /** @deprecated Retained to restore tasks created with legacy coordinator transport. */
   coordinatorMode?: boolean;
   propagateSkipPermissions?: boolean;
   maxConcurrentTasks?: number;
@@ -420,7 +446,8 @@ export interface PersistedState {
   editorCommand?: string;
   dockerImage?: string;
   shareDockerAgentAuth?: boolean;
-  askCodeProvider?: 'claude' | 'minimax';
+  askCodeProvider?: AskCodeProvider;
+  askCodeModel?: string;
   customAgents?: AgentDef[];
   agentEnvFiles?: Record<string, string>;
   keybindingMigrationDismissed?: boolean;
@@ -432,7 +459,7 @@ export interface PersistedState {
   lightThemeCustomId?: string | null;
   darkThemePreset?: LookPreset;
   darkThemeCustomId?: string | null;
-  coordinatorModeEnabled?: boolean;
+  mcpOrchestrationEnabled?: boolean;
   documentWorkspacesEnabled?: boolean;
   documentFullWidth?: boolean;
   coordinatorNotificationDelayMs?: number;
@@ -542,7 +569,9 @@ export interface AppStore {
   dockerImage: string;
   dockerAvailable: boolean;
   shareDockerAgentAuth: boolean;
-  askCodeProvider: 'claude' | 'minimax';
+  askCodeProvider: AskCodeProvider;
+  /** CLI model alias or slug used for code Q&A and tours; empty lets the CLI choose. */
+  askCodeModel: string;
   newTaskDropUrl: string | null;
   newTaskPrefillPrompt: {
     prompt: string;
@@ -571,7 +600,7 @@ export interface AppStore {
   lightThemeCustomId: string | null;
   darkThemePreset: LookPreset;
   darkThemeCustomId: string | null;
-  coordinatorModeEnabled: boolean;
+  mcpOrchestrationEnabled: boolean;
   documentWorkspacesEnabled: boolean;
   /** Let the rendered document take the whole column instead of a reading width. */
   documentFullWidth: boolean;

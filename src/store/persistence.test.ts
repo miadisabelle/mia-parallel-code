@@ -1,3 +1,4 @@
+import { reconcile } from 'solid-js/store';
 import { createMindMap } from '../graph/model';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentDef } from '../ipc/types';
@@ -14,6 +15,7 @@ vi.mock('../lib/ipc', () => ({
 
 import { loadState, resolveIncomingPanelUserSize, saveState } from './persistence';
 import { setStore, store } from './core';
+import { setAskCodeProvider } from './ui';
 import { IPC } from '../../electron/ipc/channels';
 
 function agentDef(overrides: Partial<AgentDef> = {}): AgentDef {
@@ -69,6 +71,7 @@ async function loadPersistedAgent(def: AgentDef): Promise<AgentDef> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockInvoke.mockResolvedValue(undefined);
   setStore('projects', []);
   setStore('lastProjectId', null);
   setStore('lastAgentId', null);
@@ -406,6 +409,26 @@ describe('reasoning profile persistence', () => {
       expect(saved.tasks['task-2'].reasoningProfile).toBe(expected);
     },
   );
+});
+
+it('never writes a tour the agent published: it is runtime state only', async () => {
+  mockInvoke.mockResolvedValueOnce(
+    JSON.stringify({
+      projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'blue' }],
+      taskOrder: ['task-1'],
+      tasks: { 'task-1': persistedTask(agentDef()) },
+    }),
+  );
+  await loadState();
+  setStore('tasks', 'task-1', 'agentTour', {
+    revision: 1,
+    payload: { subject: 'the retry bug', gist: {}, cards: [{}] },
+  });
+  mockInvoke.mockClear();
+  mockInvoke.mockResolvedValueOnce(undefined);
+  await saveState();
+  const call = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+  expect(JSON.parse(call?.[1].json).tasks['task-1']).not.toHaveProperty('agentTour');
 });
 
 describe('mind map persistence', () => {
@@ -1457,6 +1480,73 @@ describe('document full width persistence', () => {
   });
 });
 
+describe('code Q&A model persistence', () => {
+  function stateJson(extra: Record<string, unknown>): string {
+    return JSON.stringify({
+      projects: [],
+      lastProjectId: null,
+      lastAgentId: null,
+      taskOrder: [],
+      collapsedTaskOrder: [],
+      tasks: {},
+      activeTaskId: null,
+      sidebarVisible: true,
+      ...extra,
+    });
+  }
+
+  async function lastSaved(): Promise<Record<string, unknown>> {
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    const lastCall = mockInvoke.mock.calls[mockInvoke.mock.calls.length - 1];
+    return JSON.parse(lastCall[1].json) as Record<string, unknown>;
+  }
+
+  it('round-trips a chosen alias and leaves the sonnet default out of the file', async () => {
+    mockInvoke.mockResolvedValueOnce(stateJson({ askCodeModel: 'opus' }));
+    await loadState();
+    expect(store.askCodeModel).toBe('opus');
+    expect((await lastSaved()).askCodeModel).toBe('opus');
+
+    mockInvoke.mockResolvedValueOnce(stateJson({ askCodeModel: 'gpt-4' }));
+    await loadState();
+    expect(store.askCodeModel).toBe('sonnet');
+    expect((await lastSaved()).askCodeModel).toBeUndefined();
+  });
+
+  it('round-trips a Codex provider with its model slug', async () => {
+    mockInvoke.mockResolvedValueOnce(
+      stateJson({ askCodeProvider: 'codex', askCodeModel: 'gpt-5.6-luna' }),
+    );
+    await loadState();
+    expect(store.askCodeProvider).toBe('codex');
+    expect(store.askCodeModel).toBe('gpt-5.6-luna');
+    const saved = await lastSaved();
+    expect(saved.askCodeProvider).toBe('codex');
+    expect(saved.askCodeModel).toBe('gpt-5.6-luna');
+  });
+
+  it('drops a Codex slug that could not be a CLI argument, leaving the CLI default', async () => {
+    mockInvoke.mockResolvedValueOnce(
+      stateJson({ askCodeProvider: 'codex', askCodeModel: '-- rm -rf /' }),
+    );
+    await loadState();
+    expect(store.askCodeProvider).toBe('codex');
+    expect(store.askCodeModel).toBe('');
+    expect((await lastSaved()).askCodeModel).toBeUndefined();
+  });
+
+  it('replaces a model the newly chosen provider cannot run', async () => {
+    mockInvoke.mockResolvedValueOnce(stateJson({ askCodeModel: 'opus' }));
+    await loadState();
+
+    setAskCodeProvider('codex');
+    expect(store.askCodeModel).toBe('');
+    setAskCodeProvider('claude');
+    expect(store.askCodeModel).toBe('sonnet');
+  });
+});
+
 describe('active task repair', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1617,7 +1707,7 @@ describe('prompt history persistence', () => {
   it.each([false, true])('restores and saves history for collapsed=%s', async (collapsed) => {
     const history = [
       { text: 'First prompt' },
-      { text: 'Second\nmultiline prompt', sentAt: 1700000000000, agentName: 'Codex' },
+      { text: 'Second\nmultiline prompt', sentAt: 1700000000000, agentId: 'agent-1' },
     ];
     mockInvoke.mockResolvedValueOnce(
       JSON.stringify({
@@ -1707,6 +1797,252 @@ it('round-trips canvas task links for active and collapsed tasks without revivin
   for (const id of ['task-1', 'task-2']) expect(saved.tasks[id].canvasTaskLinks).toEqual(links);
 });
 
+it('restores parent authority before its child and round-trips delegation policy', async () => {
+  const parent = { ...persistedTask(agentDef()), delegationParent: true, delegationPaused: true };
+  const child = {
+    ...persistedTask(agentDef()),
+    id: 'child-authority',
+    coordinatedBy: parent.id,
+    integrationPolicy: 'review' as const,
+  };
+  mockInvoke.mockResolvedValueOnce(
+    JSON.stringify({
+      projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: '' }],
+      taskOrder: [parent.id, child.id],
+      collapsedTaskOrder: [],
+      tasks: { 'child-authority': child, [parent.id]: parent },
+    }),
+  );
+  await loadState();
+  const registrations = mockInvoke.mock.calls.filter(
+    ([channel, args]) => channel === IPC.DelegationRequest && args?.action === 'register',
+  );
+  expect(registrations.map(([, args]) => args.task.taskId)).toEqual([parent.id, child.id]);
+  expect(store.tasks[parent.id].delegationParent).toBe(true);
+  expect(store.tasks[parent.id].delegationPaused).toBe(true);
+  expect(store.tasks[child.id].integrationPolicy).toBe('review');
+  await saveState();
+  const save = mockInvoke.mock.calls.findLast(([channel]) => channel === IPC.SaveAppState);
+  expect(JSON.parse(save?.[1].json).tasks[child.id].integrationPolicy).toBe('review');
+});
+
+it('restores a child with a missing parent independently without losing its work', async () => {
+  const child = {
+    ...persistedTask(agentDef()),
+    id: 'orphan-restore',
+    coordinatedBy: 'missing-parent',
+    integrationPolicy: 'review',
+    mcpConfigPath: '/stale/config.json',
+  };
+  mockInvoke.mockResolvedValueOnce(
+    JSON.stringify({
+      projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: '' }],
+      taskOrder: [child.id],
+      collapsedTaskOrder: [],
+      tasks: { [child.id]: child },
+    }),
+  );
+  await loadState();
+  expect(store.tasks[child.id]).toMatchObject({
+    worktreePath: child.worktreePath,
+    delegationPaused: true,
+  });
+  expect(store.tasks[child.id].coordinatedBy).toBeUndefined();
+  expect(store.tasks[child.id].mcpConfigPath).toBeUndefined();
+  expect(store.tasks[child.id].integrationPolicy).toBeUndefined();
+  const registration = mockInvoke.mock.calls.find(
+    ([channel, args]) => channel === IPC.DelegationRequest && args?.action === 'register',
+  );
+  expect(registration?.[1].task.parentTaskId).toBeUndefined();
+});
+
+it.each([
+  { directMode: true, expected: 'direct' },
+  { directMode: false, expected: 'worktree' },
+])(
+  'normalizes legacy task isolation before registering authority: $expected',
+  async ({ directMode, expected }) => {
+    const legacy = {
+      ...persistedTask(agentDef()),
+      id: 'legacy-authority',
+      gitIsolation: undefined,
+      directMode,
+    };
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: '' }],
+        taskOrder: [legacy.id],
+        collapsedTaskOrder: [],
+        tasks: { [legacy.id]: legacy },
+      }),
+    );
+    await loadState();
+    const registration = mockInvoke.mock.calls.find(
+      ([channel, args]) => channel === IPC.DelegationRequest && args?.action === 'register',
+    );
+    expect(registration?.[1].task.gitIsolation).toBe(expected);
+    expect(store.tasks[legacy.id].gitIsolation).toBe(expected);
+  },
+);
+
+describe('MCP orchestration policy persistence', () => {
+  beforeEach(() => setStore('tasks', reconcile({})));
+
+  function stateJson(enabled?: unknown): string {
+    return JSON.stringify({
+      projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: '' }],
+      taskOrder: ['task-1'],
+      tasks: { 'task-1': persistedTask(agentDef()) },
+      mcpOrchestrationEnabled: enabled,
+    });
+  }
+
+  it('preserves an explicit disabled setting when saving', async () => {
+    setStore('mcpOrchestrationEnabled', false);
+    await saveState();
+    const saved = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+    expect(saved).toBeDefined();
+    expect(JSON.parse(saved?.[1].json).mcpOrchestrationEnabled).toBe(false);
+  });
+
+  it('awaits the saved global policy before registering or restoring any task', async () => {
+    let acknowledge: (() => void) | undefined;
+    mockInvoke.mockImplementation(async (channel, args) => {
+      if (channel === IPC.LoadAppState) return stateJson(false);
+      if (args?.action === 'orchestrationSetting') {
+        await new Promise<void>((resolve) => (acknowledge = resolve));
+      }
+    });
+    const loading = loadState();
+    await vi.waitFor(() => expect(acknowledge).toBeDefined());
+    expect(Object.keys(store.tasks)).toHaveLength(0);
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      IPC.DelegationRequest,
+      expect.objectContaining({ action: 'register' }),
+    );
+    acknowledge?.();
+    await loading;
+    expect(store.mcpOrchestrationEnabled).toBe(false);
+    expect(store.tasks['task-1']).toBeDefined();
+    const actions = mockInvoke.mock.calls
+      .filter(([channel]) => channel === IPC.DelegationRequest)
+      .map(([, args]) => args.action);
+    expect(actions).toEqual(['orchestrationSetting', 'projectPolicy', 'register']);
+  });
+
+  it.each([undefined, true, 'invalid'])(
+    'defaults to enabled unless explicitly opted out (%s)',
+    async (enabled) => {
+      mockInvoke.mockResolvedValueOnce(stateJson(enabled));
+      await loadState();
+      expect(store.mcpOrchestrationEnabled).toBe(true);
+      expect(mockInvoke).toHaveBeenCalledWith(IPC.DelegationRequest, {
+        action: 'orchestrationSetting',
+        enabled: true,
+      });
+    },
+  );
+
+  it.each([undefined, false])(
+    'discards legacy project creation consent without changing the global setting (%s)',
+    async (enabled) => {
+      const saved = JSON.parse(stateJson(enabled));
+      saved.projects[0].allowAgentTaskCreation = false;
+      saved.projects[0].allowPeerAccess = true;
+      mockInvoke.mockResolvedValueOnce(JSON.stringify(saved));
+      await loadState();
+      expect(store.mcpOrchestrationEnabled).toBe(enabled !== false);
+      expect(store.projects[0]).not.toHaveProperty('allowAgentTaskCreation');
+      expect(store.projects[0].allowPeerAccess).toBe(true);
+      expect(mockInvoke).toHaveBeenCalledWith(IPC.DelegationRequest, {
+        action: 'projectPolicy',
+        policy: { projectId: 'project-1', allowPeerAccess: true },
+      });
+      await saveState();
+      const persisted = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+      expect(JSON.parse(persisted?.[1].json).projects[0]).not.toHaveProperty(
+        'allowAgentTaskCreation',
+      );
+    },
+  );
+
+  it('aborts restoration when the backend cannot apply the global policy', async () => {
+    mockInvoke.mockImplementation(async (channel, args) => {
+      if (channel === IPC.LoadAppState) return stateJson(false);
+      if (args?.action === 'orchestrationSetting') throw new Error('Policy unavailable');
+    });
+    await expect(loadState()).rejects.toThrow('Policy unavailable');
+    expect(Object.keys(store.tasks)).toHaveLength(0);
+    expect(store.notification).toContain('Could not restore MCP settings');
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      IPC.DelegationRequest,
+      expect.objectContaining({ action: 'register' }),
+    );
+  });
+});
+
+describe('task automation settings persistence', () => {
+  it.each([false, true])(
+    'round-trips explicit task options for collapsed=%s',
+    async (collapsed) => {
+      const options = {
+        autoMergeChildren: true,
+        autoSendChildUpdates: false,
+        propagateSkipPermissions: true,
+        maxConcurrentTasks: 4,
+      };
+      mockInvoke.mockResolvedValueOnce(
+        JSON.stringify({
+          projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: '' }],
+          taskOrder: collapsed ? [] : ['task-1'],
+          collapsedTaskOrder: collapsed ? ['task-1'] : [],
+          tasks: { 'task-1': { ...persistedTask(agentDef()), collapsed, ...options } },
+        }),
+      );
+      await loadState();
+      expect(store.tasks['task-1']).toMatchObject(options);
+      expect(store.tasks['task-1'].coordinatorMode).toBeUndefined();
+      expect(mockInvoke).toHaveBeenCalledWith(IPC.DelegationRequest, {
+        action: 'register',
+        task: expect.objectContaining(options),
+      });
+      await saveState();
+      const save = mockInvoke.mock.calls.findLast(([channel]) => channel === IPC.SaveAppState);
+      expect(JSON.parse(save?.[1].json).tasks['task-1']).toMatchObject(options);
+    },
+  );
+
+  it('restores legacy task transport while ignoring the retired global coordinator switch', async () => {
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: '' }],
+        coordinatorModeEnabled: true,
+        taskOrder: ['task-1'],
+        collapsedTaskOrder: [],
+        tasks: { 'task-1': { ...persistedTask(agentDef()), coordinatorMode: true } },
+      }),
+    );
+    await loadState();
+    expect(store.tasks['task-1']).toMatchObject({
+      coordinatorMode: true,
+      controlledBy: 'coordinator',
+      mcpStartupStatus: 'pending',
+    });
+    expect(store.tasks['task-1'].autoSendChildUpdates).toBeUndefined();
+    expect(mockInvoke).toHaveBeenCalledWith(IPC.DelegationRequest, {
+      action: 'register',
+      task: expect.objectContaining({ coordinatorMode: true }),
+    });
+    expect(
+      mockInvoke.mock.calls.some(([channel]) => channel === 'set_coordinator_mode_enabled'),
+    ).toBe(false);
+    await saveState();
+    const save = mockInvoke.mock.calls.findLast(([channel]) => channel === IPC.SaveAppState);
+    expect(JSON.parse(save?.[1].json)).not.toHaveProperty('coordinatorModeEnabled');
+    expect(JSON.parse(save?.[1].json).tasks['task-1'].coordinatorMode).toBe(true);
+  });
+});
+
 // Fork direction: restoring the app must not respawn every persisted session with
 // resume args — that re-enters each agent's previous conversation and can trigger
 // automatic context compaction across all of them at once. Auto-resume is opt-in;
@@ -1750,9 +2086,17 @@ describe('session auto-resume (fork)', () => {
   });
 
   it('reattaches agents whose PTY is still alive even without opt-in', async () => {
-    mockInvoke
-      .mockResolvedValueOnce(payloadWithTask(agentDef()))
-      .mockResolvedValueOnce(['agent-live']);
+    // Answered by channel: loadState makes other IPC calls before this one.
+    const payload = payloadWithTask(agentDef());
+    mockInvoke.mockImplementation((channel: string) =>
+      Promise.resolve(
+        channel === IPC.LoadAppState
+          ? payload
+          : channel === IPC.ListRunningAgentIds
+            ? ['agent-live']
+            : undefined,
+      ),
+    );
     await loadState();
     const agent = store.agents['agent-live'];
     expect(agent.suspended).toBeUndefined();

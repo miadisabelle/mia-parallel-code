@@ -779,6 +779,23 @@ describe('spawnAgent docker mode', () => {
 });
 
 describe('spawnAgent pending setup', () => {
+  it('rechecks trusted admission after asynchronous sandbox setup', async () => {
+    let allowed = true;
+    const admission = vi.fn(() => {
+      if (!allowed) throw new Error('Launch permission revoked');
+    });
+    const startup = spawnAgent(
+      createMockWindow(),
+      buildSpawnArgs({ cwd: makeTempHome([]), dockerMode: false }),
+      admission,
+    );
+    expect(mockPtySpawn).not.toHaveBeenCalled();
+    allowed = false;
+    await expect(startup).rejects.toThrow('Launch permission revoked');
+    expect(admission).toHaveBeenCalledOnce();
+    expect(mockPtySpawn).not.toHaveBeenCalled();
+  });
+
   it.each(['one', 'all'])('does not launch after stopping %s pending agents', async (mode) => {
     const agentId = nextAgentId();
     const startup = spawnAgent(
@@ -1409,6 +1426,30 @@ describe('Codex terminal handoff', () => {
     await expect(promise).resolves.toBe(id);
     await expect(handoffCodexTerminal(agentId)).resolves.toBe(id);
     expect(proc.kill).not.toHaveBeenCalled();
+  });
+  it('hands off an explicitly unsaved session to a fresh chat, including on retry', async () => {
+    const { agentId, proc } = launch();
+    const promise = handoffCodexTerminal(agentId);
+    proc.emitData(`\r\nSession ID: ${id}\r\n`);
+    proc.emitExit({ exitCode: 0, signal: undefined });
+    await expect(promise).resolves.toBeUndefined();
+    await expect(handoffCodexTerminal(agentId)).resolves.toBeUndefined();
+  });
+  it.each([0, 1])(
+    'rejects an unrecognized exit without a resume footer (code %s)',
+    async (exitCode) => {
+      const { agentId, proc } = launch();
+      const promise = handoffCodexTerminal(agentId);
+      proc.emitExit({ exitCode, signal: undefined });
+      await expect(promise).rejects.toThrow('without a resume ID');
+    },
+  );
+  it('rejects an abnormal exit even with an unsaved-session footer', async () => {
+    const { agentId, proc } = launch();
+    const promise = handoffCodexTerminal(agentId);
+    proc.emitData(`\r\nSession ID: ${id}\r\n`);
+    proc.emitExit({ exitCode: 1, signal: undefined });
+    await expect(promise).rejects.toThrow('without a resume ID');
   });
   it('replays the pre-handoff output into the relaunched terminal', async () => {
     const args = buildSpawnArgs({ command: 'codex', args: [], dockerMode: false });

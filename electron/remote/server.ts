@@ -30,6 +30,8 @@ import {
 import { parseMindMapUpdate, type MindMapDocument, type MindMapUpdate } from '../shared/mindmap.js';
 import { parseReasoningUpdate } from '../shared/reasoning-feed.js';
 import { parseCanvasView, type CanvasView } from '../shared/canvas-view.js';
+import { parseAgentTourPayload, type AgentTourPayload } from '../shared/agent-tour.js';
+import type { SessionCaller, SessionCapabilities } from '../shared/delegation-types.js';
 import type { ReasoningDocument } from '../shared/reasoning.js';
 import type { ReasoningUpdate } from '../shared/reasoning-state.js';
 import type { Coordinator } from '../mcp/coordinator.js';
@@ -241,8 +243,14 @@ const MIME: Record<string, string> = {
 interface RemoteServer {
   /** Stop transport; explicit desktop disconnect also revokes remembered phones. */
   stop: (forgetDevices?: boolean) => Promise<void>;
-  registerCanvasAgent: (taskId: string, agentId: string, isActive?: () => boolean) => string;
+  registerCanvasAgent: (
+    taskId: string,
+    agentId: string,
+    isActive?: () => boolean,
+    session?: { sessionInstanceId: string; capabilities: SessionCapabilities },
+  ) => string;
   unregisterCanvasAgent: (agentId: string) => void;
+  getSessionAgents: () => SessionCaller[];
   hasCanvasAgents: () => boolean;
   /** Move the listener to another interface; rejects and keeps the old one when the new
    *  bind fails, or rejects with a dead handle (`listening` false) when neither binds. */
@@ -335,9 +343,16 @@ function buildAgentList(
 /** Read and JSON-parse a request body with a hard size cap. */
 type CanvasOps = Pick<
   Parameters<typeof startRemoteServer>[0],
-  'readMindMap' | 'updateMindMap' | 'readReasoning' | 'updateReasoning' | 'openCanvas'
+  | 'readMindMap'
+  | 'updateMindMap'
+  | 'readReasoning'
+  | 'updateReasoning'
+  | 'openCanvas'
+  | 'publishTour'
 >;
-type CanvasRoute = 'mindmaps' | 'reasoning' | 'canvas';
+type CanvasRoute = 'mindmaps' | 'reasoning' | 'canvas' | 'tours';
+/** A published tour inlines its own context; the shared parser caps it again. */
+const TOUR_MAX_BODY_BYTES = 256 * 1024;
 const CANVAS_MAX_IN_FLIGHT = 4;
 // The renderer reports failures as plain messages; 409 tells the agent to read again, 400 to fix its input.
 const CANVAS_CONFLICT =
@@ -369,6 +384,13 @@ async function canvasRequest(
     const view = parseCanvasView(await readJsonBody(req));
     await ops.openCanvas(taskId, view);
     return { ok: true, view };
+  }
+  if (route === 'tours') {
+    if (req.method !== 'POST') throw httpError(405, 'Method not allowed');
+    if (!ops.publishTour) throw httpError(503, 'Tours unavailable');
+    const payload = parseAgentTourPayload(await readJsonBody(req, TOUR_MAX_BODY_BYTES));
+    await ops.publishTour(taskId, payload);
+    return { ok: true, subject: payload.subject };
   }
   const reasoning = route === 'reasoning';
   if (req.method === 'GET') {
@@ -817,6 +839,12 @@ export function startRemoteServer(opts: {
     lastLine: string;
   };
   getCoordinator: () => Coordinator | null;
+  isOrchestrationEnabled?: () => boolean;
+  callSessionTool?: (
+    caller: SessionCaller,
+    name: string,
+    params: Record<string, unknown>,
+  ) => Promise<unknown>;
   /** List projects the mobile "New Task" screen can target (renderer-backed). */
   getProjects?: () => Promise<RemoteProject[]>;
   /** Create a top-level task on behalf of a paired phone (renderer-backed). */
@@ -831,6 +859,8 @@ export function startRemoteServer(opts: {
   updateMindMap?: (taskId: string, update: MindMapUpdate) => Promise<MindMapDocument>;
   /** Open or focus a canvas view for the agent's own task (renderer-backed). */
   openCanvas?: (taskId: string, view: CanvasView) => Promise<void>;
+  /** Show a tour the agent wrote for its own task (renderer-backed). */
+  publishTour?: (taskId: string, payload: AgentTourPayload) => Promise<unknown>;
   /** Read a task's notes (renderer-backed). */
   getTaskNotes?: (taskId: string) => Promise<string>;
   /** Persist a task's notes (renderer-backed). */
@@ -853,7 +883,12 @@ export function startRemoteServer(opts: {
 
   const canvasAgents = new Map<
     string,
-    { taskId: string; token: Buffer; isActive?: () => boolean }
+    {
+      taskId: string;
+      token: Buffer;
+      isActive?: () => boolean;
+      session?: { sessionInstanceId: string; capabilities: SessionCapabilities };
+    }
   >();
   const canvasActive = ([agentId, owner]: [
     string,
@@ -1057,7 +1092,7 @@ export function startRemoteServer(opts: {
         res.end(JSON.stringify(body));
       };
 
-      const mapMatch = url.pathname.match(/^\/api\/(mindmaps|reasoning|canvas)\/([^/]+)$/);
+      const mapMatch = url.pathname.match(/^\/api\/(mindmaps|reasoning|canvas|tours)\/([^/]+)$/);
       if (mapMatch) {
         const route = mapMatch[1] as CanvasRoute;
         let taskId: string;
@@ -1094,6 +1129,52 @@ export function startRemoteServer(opts: {
         return;
       }
       // Canvas credentials have no access to task control, terminals or device pairing.
+      if (url.pathname === '/api/session/tools') {
+        const owner = canvasOwner(extractRawToken(req));
+        if (tokenClass !== 'canvas' || !owner?.[1].session || !canvasActive(owner))
+          return jsonEnd(403, { error: 'This session has no coordination capabilities.' });
+        if (req.method !== 'POST') return jsonEnd(405, { error: 'Method not allowed' });
+        if (!opts.callSessionTool) return jsonEnd(503, { error: 'Coordination unavailable' });
+        const [agentId, record] = owner;
+        const session = record.session;
+        if (!session) return jsonEnd(403, { error: 'Session unavailable' });
+        const release = acquireCanvasSlot(`session:${agentId}`);
+        if (!release) return jsonEnd(429, { error: 'Too many concurrent session requests' });
+        void readJsonBody(req, 1_000_000)
+          .then(async (body) => {
+            if (
+              typeof body.name !== 'string' ||
+              !body.params ||
+              typeof body.params !== 'object' ||
+              Array.isArray(body.params)
+            )
+              return jsonEnd(400, { error: 'Invalid session tool request' });
+            if (canvasAgents.get(agentId) !== record || !canvasActive(owner))
+              return jsonEnd(403, { error: 'Session expired' });
+            if (opts.isOrchestrationEnabled?.() === false && body.name !== 'signal_done')
+              return jsonEnd(403, { error: 'Agent orchestration is disabled in Settings > MCP.' });
+            const result = await opts.callSessionTool?.(
+              { taskId: record.taskId, agentId, ...session },
+              body.name,
+              body.params as Record<string, unknown>,
+            );
+            jsonEnd(200, result);
+          })
+          .catch((err: unknown) => {
+            const status =
+              err &&
+              typeof err === 'object' &&
+              'statusCode' in err &&
+              typeof err.statusCode === 'number'
+                ? err.statusCode
+                : 400;
+            jsonEnd(status, {
+              error: err instanceof Error ? err.message : 'Session request failed',
+            });
+          })
+          .finally(release);
+        return;
+      }
       if (tokenClass === 'canvas') return jsonEnd(403, { error: 'forbidden' });
 
       // --- Device pairing (mobile → paired elevation) ---
@@ -1297,6 +1378,13 @@ export function startRemoteServer(opts: {
         url.pathname === '/api/tasks' ||
         url.pathname === '/api/wait-signal' ||
         url.pathname.startsWith('/api/tasks/');
+      const disabledAgentRoute = () =>
+        isCoordinatorRoute &&
+        (tokenClass === 'coordinator' || tokenClass === 'subtask') &&
+        !(req.method === 'POST' && /^\/api\/tasks\/[^/]+\/done$/.test(url.pathname)) &&
+        opts.isOrchestrationEnabled?.() === false;
+      if (disabledAgentRoute())
+        return jsonEnd(403, { error: 'Agent orchestration is disabled in Settings > MCP.' });
       if (!orch && isCoordinatorRoute) {
         res.writeHead(503, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'coordinator not available' }));
@@ -1304,7 +1392,14 @@ export function startRemoteServer(opts: {
       }
       if (orch) {
         const jsonReply = createJsonReply(res, SECURITY_HEADERS);
-        const readBody = () => readCoordinatorBody(req, jsonReply);
+        const readBody = async () => {
+          const body = await readCoordinatorBody(req, jsonReply);
+          if (disabledAgentRoute()) {
+            jsonReply(403, { error: 'Agent orchestration is disabled in Settings > MCP.' });
+            throw new Error('Agent orchestration disabled while reading the request');
+          }
+          return body;
+        };
 
         // Extract the coordinator ID from the header (set by MCP coordinator clients).
         // Only honor it if it is a registered coordinator — prevents a caller from
@@ -1741,13 +1836,23 @@ export function startRemoteServer(opts: {
     unregisterCanvasAgent: (agentId) => {
       canvasAgents.delete(agentId);
     },
-    registerCanvasAgent: (taskId, agentId, isActive) => {
+    registerCanvasAgent: (taskId, agentId, isActive, session) => {
       const existing = canvasAgents.get(agentId);
-      if (existing?.taskId === taskId) return existing.token.toString();
+      if (
+        existing?.taskId === taskId &&
+        existing.session?.sessionInstanceId === session?.sessionInstanceId
+      )
+        return existing.token.toString();
       const secret = randomBytes(24).toString('base64url');
-      canvasAgents.set(agentId, { taskId, token: Buffer.from(secret), isActive });
+      canvasAgents.set(agentId, { taskId, token: Buffer.from(secret), isActive, session });
       return secret;
     },
+    getSessionAgents: () =>
+      [...canvasAgents].flatMap(([agentId, record]) =>
+        record.session && canvasActive([agentId, record])
+          ? [{ agentId, taskId: record.taskId, ...record.session }]
+          : [],
+      ),
     hasCanvasAgents: () => [...canvasAgents].some(canvasActive),
     token,
     subtaskToken,

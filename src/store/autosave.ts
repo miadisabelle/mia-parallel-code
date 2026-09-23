@@ -43,7 +43,7 @@ export function persistedSnapshot(): string {
     agentEnvFiles: store.agentEnvFiles,
     focusMode: store.focusMode,
     coordinatorNotificationDelayMs: store.coordinatorNotificationDelayMs,
-    coordinatorModeEnabled: store.coordinatorModeEnabled,
+    mcpOrchestrationEnabled: store.mcpOrchestrationEnabled,
     documentWorkspacesEnabled: store.documentWorkspacesEnabled,
     coordinatorControlHintDismissed: store.coordinatorControlHintDismissed,
     autoStartRemoteAccess: store.autoStartRemoteAccess,
@@ -77,15 +77,19 @@ export function persistedSnapshot(): string {
               externalWorktree: t.externalWorktree,
               savedInitialPrompt: t.savedInitialPrompt,
               collapsed: t.collapsed,
-              // Without these two the snapshot is blind to a skip-permissions
-              // flip on an existing task: the debounced autosave never fires
-              // and the change is lost on the next launch.
+              // Changeable after creation from the title bar.
               skipPermissions: t.skipPermissions,
-              propagateSkipPermissions: t.propagateSkipPermissions,
               agentSessionIds: t.agentSessionIds,
               savedAgentSessionIds: t.savedAgentSessionIds,
               coordinatedBy: t.coordinatedBy,
               coordinatorMode: t.coordinatorMode,
+              autoMergeChildren: t.autoMergeChildren,
+              autoSendChildUpdates: t.autoSendChildUpdates,
+              propagateSkipPermissions: t.propagateSkipPermissions,
+              maxConcurrentTasks: t.maxConcurrentTasks,
+              delegationParent: t.delegationParent,
+              delegationPaused: t.delegationPaused,
+              integrationPolicy: t.integrationPolicy,
               mcpConfigPath: t.mcpConfigPath,
               preambleFileExistedBefore: t.preambleFileExistedBefore,
               signalDoneReceived: t.signalDoneReceived,

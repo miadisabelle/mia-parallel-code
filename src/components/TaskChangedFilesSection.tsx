@@ -1,5 +1,11 @@
 import { Show, onMount } from 'solid-js';
-import { getProject, setActiveTask, setTaskFocusedPanel, isPanelFocused } from '../store/store';
+import {
+  getProject,
+  setActiveTask,
+  setTaskFocusedPanel,
+  isPanelFocused,
+  openCanvasDocument,
+} from '../store/store';
 import { ChangedFilesList } from './ChangedFilesList';
 import { CommitTreeOverlay } from './CommitTreeOverlay';
 import {
@@ -12,8 +18,9 @@ import { theme } from '../lib/theme';
 import { sf } from '../lib/fontScale';
 import { useFocusRegistration } from '../lib/focus-registration';
 import type { Task } from '../store/types';
-import type { CommitInfo } from '../ipc/types';
+import type { ChangedFile, CommitInfo } from '../ipc/types';
 import type { ChangeTourController } from '../lib/create-change-tour';
+import type { UnderstandingTourState } from '../lib/create-understanding-tour';
 import { getTaskDiffBaseBranch } from '../lib/load-task-diff';
 import { ChangeTourButton } from './ChangeTourButton';
 
@@ -30,6 +37,10 @@ interface TaskChangedFilesSectionProps {
   /** Shrink to a header strip: the column uses this while the list is empty. */
   compact?: boolean;
   onFileCountChange?: (count: number) => void;
+  /** Starts a guided tour of a changed file; omit to hide the row action. */
+  onUnderstandClick?: (file: ChangedFile) => void;
+  /** Lets each row's tour button show its own generating/ready state. */
+  understanding?: UnderstandingTourState;
 }
 
 export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
@@ -50,6 +61,11 @@ export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
   const focusChangedFilesPanel = () => {
     setActiveTask(props.task.id);
     setTaskFocusedPanel(props.task.id, 'changed-files');
+  };
+  const openMarkdownInCanvas = (file: ChangedFile) => {
+    setActiveTask(props.task.id);
+    openCanvasDocument(props.task.id, file.path);
+    setTaskFocusedPanel(props.task.id, 'canvas');
   };
 
   let changedFilesRef: HTMLDivElement | undefined;
@@ -182,6 +198,9 @@ export function TaskChangedFilesSection(props: TaskChangedFilesSectionProps) {
           onFileClick={(file) => props.onDiffFileClick(file.path)}
           onFileCountChange={props.onFileCountChange}
           onOpenInEditorClick={focusChangedFilesPanel}
+          onOpenMarkdownClick={openMarkdownInCanvas}
+          onUnderstandClick={props.onUnderstandClick}
+          understanding={props.understanding}
           ref={(el) => (changedFilesRef = el)}
         />
       </div>
