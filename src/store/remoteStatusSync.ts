@@ -8,12 +8,14 @@
 // main-side cache, and electron/remote/server.ts buildAgentList for how the
 // cached attention is attached to each RemoteAgent.
 
-import { createEffect, createRoot, onCleanup } from 'solid-js';
+import { createEffect, createRoot, onCleanup, untrack } from 'solid-js';
 import { store } from './store';
 import { getTaskAttentionState, getAgentOutputTail, stripAnsi } from './taskStatus';
+import { taskUsesAgentChat } from './agent-chat';
 import { fireAndForget } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
 import type { RemoteAttentionState, RemoteAgent } from '../../electron/remote/protocol';
+import type { AgentChatState } from '../../electron/shared/agent-chat-types';
 
 /** Pick recent content rather than terminal UI chrome for the phone's task cards. */
 export function remoteOutputPreview(rawTail: string): string {
@@ -43,6 +45,12 @@ export function remoteOutputPreview(rawTail: string): string {
   return (content.at(-1) ?? '').slice(0, 300);
 }
 
+/** The last line the agent wrote in a chat, as the phone's task card preview. */
+export function remoteChatPreview(state: AgentChatState | undefined): string {
+  const reply = state?.items.findLast((item) => item.kind === 'assistant' && item.text.trim());
+  return (reply?.text.trim().split('\n').at(-1) ?? '').trim().slice(0, 300);
+}
+
 export function startRemoteStatusSync(): () => void {
   // Serialized snapshot of the last push, so we only send on actual change.
   let lastSerialized = '';
@@ -64,7 +72,7 @@ export function startRemoteStatusSync(): () => void {
       const statuses: Record<string, RemoteAttentionState> = {};
       const contexts: Record<
         string,
-        Pick<RemoteAgent, 'projectName' | 'agentName' | 'lastLine'>
+        Pick<RemoteAgent, 'projectName' | 'projectColor' | 'agentName' | 'lastLine'>
       > = {};
       for (const taskId of [...store.taskOrder, ...store.collapsedTaskOrder]) {
         statuses[taskId] = getTaskAttentionState(taskId);
@@ -73,10 +81,15 @@ export function startRemoteStatusSync(): () => void {
         const agentId =
           task.agentIds.find((id) => store.agents[id]?.status === 'running') ?? task.agentIds[0];
         const agent = store.agents[agentId];
+        const project = store.projects.find((project) => project.id === task.projectId);
         contexts[taskId] = {
-          projectName: store.projects.find((project) => project.id === task.projectId)?.name ?? '',
+          projectName: project?.name ?? '',
+          projectColor: project?.color ?? '',
           agentName: agent?.def.name ?? '',
-          lastLine: remoteOutputPreview(getAgentOutputTail(agentId)),
+          // Untracked like the terminal tail: a streaming reply changes every frame.
+          lastLine: taskUsesAgentChat(task)
+            ? untrack(() => remoteChatPreview(store.agents[task.agentIds[0]]?.chatState))
+            : remoteOutputPreview(getAgentOutputTail(agentId)),
         };
       }
 

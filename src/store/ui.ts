@@ -218,6 +218,10 @@ export function setVerboseLogging(enabled: boolean): void {
   setStore('verboseLogging', enabled);
 }
 
+export function setPreferUiMode(enabled: boolean): void {
+  setStore('preferUiMode', enabled);
+}
+
 export function setDefaultStepsEnabled(enabled: boolean): void {
   setStore('defaultStepsEnabled', enabled);
 }
@@ -244,7 +248,7 @@ export function setCoordinatorNotificationDelayMs(ms: number): void {
 }
 
 export function setInactiveColumnOpacity(opacity: number): void {
-  setStore('inactiveColumnOpacity', Math.round(Math.max(0.3, Math.min(1.0, opacity)) * 100) / 100);
+  setStore('inactiveColumnOpacity', Math.round(Math.max(0.1, Math.min(1.0, opacity)) * 100) / 100);
 }
 
 export function setEditorCommand(command: string): void {

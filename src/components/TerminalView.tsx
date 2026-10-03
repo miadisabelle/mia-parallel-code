@@ -19,7 +19,8 @@ import { TerminalBookmarkGutter } from './TerminalBookmarks';
 import { invoke, fireAndForget, Channel } from '../lib/ipc';
 import { IPC } from '../../electron/ipc/channels';
 import { getTerminalFontFamily } from '../lib/fonts';
-import { TERMINAL_SCROLL_OPTIONS, base64ToUint8Array } from '../lib/terminalConstants';
+import { TERMINAL_SCROLL_OPTIONS } from '../lib/terminalConstants';
+import { leaveCursorQueriesToMain } from '../lib/terminalQueries';
 import {
   getTerminalSearchDecorations,
   getTerminalTheme,
@@ -178,6 +179,9 @@ interface TerminalViewProps {
 // Status parsing only needs recent output. Capping forwarded bytes avoids
 // expensive full-chunk decoding during large terminal bursts.
 const STATUS_ANALYSIS_MAX_BYTES = 8 * 1024;
+
+// Upper bound on waiting for an animation frame before flushing output anyway.
+const OUTPUT_FLUSH_FALLBACK_MS = 50;
 
 const openTerminalHttpLinkWithModifier = createTerminalHttpLinkHandler({
   isMac,
@@ -424,13 +428,19 @@ export function TerminalView(props: TerminalViewProps) {
     const attachExisting = props.attachExisting ?? true;
     const preserveSessionOnCleanup = props.preserveSessionOnCleanup === true;
     let ptyDetachedByLanding = false;
+    // Set once the PTY reports exit or never spawned; the backend no longer
+    // has the session, so input and resizes would only fail there.
+    let ptyGone = false;
+    // Set once SpawnAgent resolves. The backend registers the session only
+    // after its async setup, so earlier input and resizes are held until then.
+    let ptyReady = false;
 
     function taskPtyDetached(): boolean {
       return ptyDetachedByLanding || isLandedTaskState(store.tasks[taskId]?.landingState);
     }
 
     function canForwardInput(): boolean {
-      if (store.tasks[taskId]?.automationWriteInFlight) return false;
+      if (ptyGone || store.tasks[taskId]?.automationWriteInFlight) return false;
       return !taskPtyDetached();
     }
 
@@ -448,6 +458,7 @@ export function TerminalView(props: TerminalViewProps) {
         allowNonHttpProtocols: false,
       },
     });
+    leaveCursorQueriesToMain(term);
 
     fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -749,6 +760,7 @@ export function TerminalView(props: TerminalViewProps) {
     }
 
     let outputRaf: number | undefined;
+    let outputFallbackTimer: number | undefined;
     let outputQueue: Uint8Array[] = [];
     let outputQueuedBytes = 0;
     let outputWriteInFlight = false;
@@ -806,7 +818,7 @@ export function TerminalView(props: TerminalViewProps) {
         // Resume PTY reader when xterm.js has caught up
         if (watermark < FLOW_LOW && ptyPaused) {
           ptyPaused = false;
-          if (taskPtyDetached()) return;
+          if (ptyGone || taskPtyDetached()) return;
           invoke(IPC.ResumeAgent, { agentId }).catch((err: unknown) => {
             logWarn('terminal.flow', 'ResumeAgent failed', { err });
             ptyPaused = false;
@@ -826,12 +838,24 @@ export function TerminalView(props: TerminalViewProps) {
       });
     }
 
+    function cancelScheduledOutputFlush() {
+      if (outputRaf !== undefined) cancelAnimationFrame(outputRaf);
+      if (outputFallbackTimer !== undefined) clearTimeout(outputFallbackTimer);
+      outputRaf = undefined;
+      outputFallbackTimer = undefined;
+    }
+
     function scheduleOutputFlush() {
       if (outputRaf !== undefined) return;
-      outputRaf = requestAnimationFrame(() => {
-        outputRaf = undefined;
+      const flush = () => {
+        cancelScheduledOutputFlush();
         flushOutputQueue();
-      });
+      };
+      outputRaf = requestAnimationFrame(flush);
+      // Frames can stop in a background window even with throttling disabled
+      // (seen on macOS). The timer keeps output, and the terminal's replies to
+      // queries such as device attributes, from stalling.
+      outputFallbackTimer = window.setTimeout(flush, OUTPUT_FLUSH_FALLBACK_MS);
     }
 
     function enqueueOutput(chunk: Uint8Array) {
@@ -840,7 +864,7 @@ export function TerminalView(props: TerminalViewProps) {
       watermark += chunk.length;
 
       // Pause PTY reader when xterm.js falls behind
-      if (watermark > FLOW_HIGH && !ptyPaused && !taskPtyDetached()) {
+      if (watermark > FLOW_HIGH && !ptyPaused && !ptyGone && !taskPtyDetached()) {
         ptyPaused = true;
         invoke(IPC.PauseAgent, { agentId }).catch((err: unknown) => {
           logWarn('terminal.flow', 'PauseAgent failed', { err });
@@ -860,13 +884,14 @@ export function TerminalView(props: TerminalViewProps) {
     let initialCommandSent = false;
     onOutput.onmessage = (msg) => {
       if (msg.type === 'Data') {
-        enqueueOutput(base64ToUint8Array(msg.data));
+        enqueueOutput(msg.data);
         if (!initialCommandSent && props.initialCommand) {
           const cmd = props.initialCommand;
           initialCommandSent = true;
           setTimeout(() => enqueueInput(cmd + '\r'), 50);
         }
       } else if (msg.type === 'Exit') {
+        ptyGone = true;
         pendingExitPayload = msg.data;
         flushOutputQueue();
         if (!outputWriteInFlight && outputQueue.length === 0 && pendingExitPayload) {
@@ -882,7 +907,7 @@ export function TerminalView(props: TerminalViewProps) {
     let inputFlushTimer: number | undefined;
 
     function flushPendingInput() {
-      if (!pendingInput) return;
+      if (!pendingInput || !ptyReady) return;
       const data = pendingInput;
       pendingInput = '';
       if (inputFlushTimer !== undefined) {
@@ -963,7 +988,12 @@ export function TerminalView(props: TerminalViewProps) {
       if (!pendingResize) return;
       const { cols, rows } = pendingResize;
       pendingResize = null;
-      if (taskPtyDetached()) return;
+      if (ptyGone || taskPtyDetached()) return;
+      // SpawnAgent sends the startup size; later sizes wait for the session.
+      if (!ptyReady) {
+        pendingResize = { cols, rows };
+        return;
+      }
       if (cols === lastSentCols && rows === lastSentRows) return;
       lastSentCols = cols;
       lastSentRows = rows;
@@ -1142,6 +1172,7 @@ export function TerminalView(props: TerminalViewProps) {
         // eslint-disable-next-line solid/reactivity -- promise callbacks are not reactive contexts
         .then((result) => {
           if (spawnDisposed) return;
+          ptyReady = true;
           setAgentCanvasTools(agentId, result?.canvasTools === true);
           if (store.agents[agentId]) {
             setStore('agents', agentId, 'capabilities', result?.capabilities);
@@ -1153,6 +1184,7 @@ export function TerminalView(props: TerminalViewProps) {
         // eslint-disable-next-line solid/reactivity -- promise catch handler reads current prop values intentionally
         .catch((err) => {
           if (spawnDisposed) return;
+          ptyGone = true;
           // eslint-disable-next-line no-control-regex -- intentionally stripping control/escape chars to prevent terminal injection
           const safeErr = String(err).replace(/[\x00-\x1f\x7f]/g, '');
           term?.write(`\x1b[31mFailed to spawn: ${safeErr}\x1b[0m\r\n`);
@@ -1203,14 +1235,14 @@ export function TerminalView(props: TerminalViewProps) {
       if (resizeFlushTimer !== undefined) clearTimeout(resizeFlushTimer);
       if (webglReattachTimer !== undefined) clearTimeout(webglReattachTimer);
       if (webglDetachTimer !== undefined) clearTimeout(webglDetachTimer);
-      if (outputRaf !== undefined) cancelAnimationFrame(outputRaf);
+      cancelScheduledOutputFlush();
       onOutput.cleanup?.();
       webglAddon?.dispose();
       webglAddon = undefined;
       searchAddon?.dispose();
       searchAddon = undefined;
       unregisterTerminal(agentId);
-      if (ptyPaused && !taskPtyDetached()) {
+      if (ptyPaused && !ptyGone && !taskPtyDetached()) {
         fireAndForget(IPC.ResumeAgent, { agentId });
         ptyPaused = false;
       }

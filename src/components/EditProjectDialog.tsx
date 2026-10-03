@@ -1,6 +1,15 @@
-import { createSignal, createEffect, For, Show } from 'solid-js';
+import { createSignal, createEffect, For, on, Show } from 'solid-js';
 import { Dialog } from './Dialog';
-import { updateProject, PASTEL_HUES, isProjectMissing, relinkProject } from '../store/store';
+import {
+  updateProject,
+  PASTEL_HUES,
+  isProjectMissing,
+  relinkProject,
+  spConnection,
+  listSpProjects,
+  setProjectSpMapping,
+} from '../store/store';
+import type { SpProject } from '../../electron/shared/super-productivity';
 import { sanitizeBranchPrefix, toBranchName } from '../lib/branch-name';
 import { theme, sectionLabelStyle } from '../lib/theme';
 import type { Project, TerminalBookmark, GitIsolationMode } from '../store/types';
@@ -37,30 +46,50 @@ export function EditProjectDialog(props: EditProjectDialogProps) {
   const [newCommand, setNewCommand] = createSignal('');
   const [showImportDialog, setShowImportDialog] = createSignal(false);
   const [confirmRemove, setConfirmRemove] = createSignal(false);
+  const [spProjectId, setSpProjectId] = createSignal('');
+  // null until loaded: the mapping is only saved from a list the user saw.
+  const [spProjects, setSpProjects] = createSignal<SpProject[] | null>(null);
+  // Drops a list that arrives after the dialog moved on to another project.
+  let spProjectsLoad = 0;
   /** Branch and worktree settings only mean something where tasks run. */
   const isDocument = () => isDocumentProject(props.project ?? undefined);
   const showsTaskSettings = () => props.project?.isGitRepo !== false && !isDocument();
   let nameRef!: HTMLInputElement;
 
-  // Sync signals when project prop changes
-  createEffect(() => {
-    const p = props.project;
-    if (!p) return;
-    setName(p.name);
-    setAllowPeerAccess(p.allowPeerAccess === true);
-    setSaveError('');
-    setSelectedHue(hueFromColor(p.color));
-    setBranchPrefix(sanitizeBranchPrefix(p.branchPrefix ?? 'task'));
-    setDeleteBranchOnClose(p.deleteBranchOnClose ?? true);
-    setDefaultGitIsolation(p.defaultGitIsolation ?? 'worktree');
-    setDefaultBaseBranch(p.defaultBaseBranch ?? '');
-    setCoverageReportPath(p.coverageReportPath ?? '');
-    setVerifyCommand(p.verifyCommand ?? '');
-    setBookmarks(p.terminalBookmarks ? [...p.terminalBookmarks] : []);
-    setNewCommand('');
-    setConfirmRemove(false);
-    requestAnimationFrame(() => nameRef?.focus());
-  });
+  // Sync signals when a project opens. Keyed on identity, not fields: saving
+  // updates the stored project while a peer-access save is still pending, and a
+  // re-sync then would reset the form and move focus mid-save.
+  createEffect(
+    on(
+      () => props.project,
+      (p) => {
+        if (!p) return;
+        setName(p.name);
+        setAllowPeerAccess(p.allowPeerAccess === true);
+        setSaveError('');
+        setSelectedHue(hueFromColor(p.color));
+        setBranchPrefix(sanitizeBranchPrefix(p.branchPrefix ?? 'task'));
+        setDeleteBranchOnClose(p.deleteBranchOnClose ?? true);
+        setDefaultGitIsolation(p.defaultGitIsolation ?? 'worktree');
+        setDefaultBaseBranch(p.defaultBaseBranch ?? '');
+        setCoverageReportPath(p.coverageReportPath ?? '');
+        setVerifyCommand(p.verifyCommand ?? '');
+        setBookmarks(p.terminalBookmarks ? [...p.terminalBookmarks] : []);
+        setNewCommand('');
+        setConfirmRemove(false);
+        setSpProjectId(p.superProductivityProjectId ?? '');
+        setSpProjects(null);
+        // Bumped on every opening, so a list still loading from an earlier one is dropped.
+        const load = ++spProjectsLoad;
+        if (spConnection() !== 'not_configured' && !isDocumentProject(p)) {
+          void listSpProjects().then((list) => {
+            if (load === spProjectsLoad) setSpProjects(list);
+          });
+        }
+        requestAnimationFrame(() => nameRef?.focus());
+      },
+    ),
+  );
 
   function addBookmark() {
     const cmd = newCommand().trim();
@@ -98,9 +127,12 @@ export function EditProjectDialog(props: EditProjectDialogProps) {
       verifyCommand: verifyCommand().trim() || undefined,
       terminalBookmarks: bookmarks(),
     };
+    // Local fields save first: a failed peer-access update in the main process must
+    // not drop unrelated edits. The dialog stays open to report and retry it.
+    updateProject(projectId, updates);
+    if (spProjects() !== null) setProjectSpMapping(projectId, spProjectId() || undefined);
     try {
       if (syncPolicy) await updateProjectCoordination(projectId, peerConsent);
-      updateProject(projectId, updates);
       props.onClose();
     } catch (error) {
       setSaveError(String(error));
@@ -444,6 +476,32 @@ export function EditProjectDialog(props: EditProjectDialogProps) {
                   }}
                 />
               </div>
+            </Show>
+
+            <Show when={spProjects()}>
+              {(list) => (
+                <div style={{ display: 'flex', 'flex-direction': 'column', gap: '8px' }}>
+                  <label style={sectionLabelStyle}>Super Productivity project</label>
+                  <select
+                    class="project-select"
+                    aria-label="Super Productivity project"
+                    value={spProjectId()}
+                    onChange={(e) => setSpProjectId(e.currentTarget.value)}
+                  >
+                    <option value="">Not linked</option>
+                    <For each={list()}>
+                      {(spProject) => <option value={spProject.id}>{spProject.title}</option>}
+                    </For>
+                    <Show when={spProjectId() && !list().some((sp) => sp.id === spProjectId())}>
+                      <option value={spProjectId()}>(archived or deleted project)</option>
+                    </Show>
+                  </select>
+                  <div style={{ 'font-size': '12px', color: theme.fgSubtle, padding: '2px 2px 0' }}>
+                    Tasks you focus here are created and tracked in this project. Without one, they
+                    land in the project open in Super Productivity, or its default project.
+                  </div>
+                </div>
+              )}
             </Show>
 
             {/* Worktrees, verification, coverage and terminal bookmarks belong to

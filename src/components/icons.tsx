@@ -131,6 +131,24 @@ export function LayersIcon(props: IconProps): JSX.Element {
   );
 }
 
+/** A numbered list: an overview of items in order. */
+export function ListIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path
+        d="M6 4h8M6 8h8M6 12h8"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+      />
+      <circle cx="2.75" cy="4" r="1" />
+      <circle cx="2.75" cy="8" r="1" />
+      <circle cx="2.75" cy="12" r="1" />
+    </SvgIcon>
+  );
+}
+
 export function AlertIcon(props: IconProps): JSX.Element {
   return (
     <SvgIcon {...props}>
@@ -294,6 +312,14 @@ export function MentionIcon(props: IconProps): JSX.Element {
   return (
     <SvgIcon {...props}>
       <path d="M4.75 2.37a6.5 6.5 0 0 0 6.5 11.26.75.75 0 0 1 .75 1.298 8 8 0 1 1 4-6.928 2.5 2.5 0 0 1-4.9.612 3.5 3.5 0 1 1-.194-2.826.75.75 0 0 1 1.594.058v2.158a1 1 0 1 0 2 0V8a6.5 6.5 0 0 0-9.75-5.63ZM10 8a2 2 0 1 0-4 0 2 2 0 0 0 4 0Z" />
+    </SvgIcon>
+  );
+}
+
+export function ShieldIcon(props: IconProps): JSX.Element {
+  return (
+    <SvgIcon {...props}>
+      <path d="M7.76 1.05a.75.75 0 0 1 .48 0l5.25 1.75c.3.1.51.39.51.7V7.5c0 3.4-2.3 5.93-5.73 7.2a.75.75 0 0 1-.54 0C4.3 13.43 2 10.9 2 7.5V3.5c0-.31.2-.6.51-.7l5.25-1.75ZM3.5 4.04V7.5c0 2.56 1.64 4.54 4.5 5.7 2.86-1.16 4.5-3.14 4.5-5.7V4.04L8 2.54 3.5 4.04Z" />
     </SvgIcon>
   );
 }

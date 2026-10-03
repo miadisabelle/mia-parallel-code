@@ -90,8 +90,10 @@ export interface PeerMessage {
   recipient: PeerSession;
   prompt: string;
   createdAt: string;
-  state: 'waiting' | 'handled' | 'closed';
+  state: 'waiting' | 'delivered' | 'handled' | 'closed';
   reason?: string;
+  /** Keep a failed automatic submission visible until the user acknowledges it. */
+  deliveryFailed?: boolean;
 }
 
 export interface DelegationReview {
@@ -107,9 +109,17 @@ export type DelegationRequest =
   | { action: 'projectPolicy'; policy: ProjectDelegationPolicy }
   | { action: 'orchestrationSetting'; enabled: boolean }
   | { action: 'pause'; taskId: string; paused: boolean }
+  | { action: 'childLimit'; taskId: string; limit: number }
   | { action: 'review'; taskId: string }
   | { action: 'merge'; taskId: string; review: Omit<DelegationReview, 'diff'> }
   | { action: 'inbox'; taskId: string }
+  | { action: 'dismissMessageFailure'; deliveryId: string }
+  | {
+      action: 'deliverMessage';
+      deliveryId: string;
+      agentId: string;
+      sessionInstanceId: string;
+    }
   | {
       action: 'handleMessage';
       deliveryId: string;

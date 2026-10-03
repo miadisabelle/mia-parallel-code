@@ -8,6 +8,7 @@ import type {
   Query,
   Options,
   SDKUserMessage,
+  SDKSessionInfo,
   SessionMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 import { ClaudeChat } from './claude.js';
@@ -78,6 +79,9 @@ function harness(
         Object.assign(output, controls) as unknown as Query,
     ),
     getSessionMessages: vi.fn(async () => history),
+    getSessionInfo: vi.fn(async (sessionId: string) =>
+      sessionId === 'unwritten' ? undefined : ({ sessionId } as SDKSessionInfo),
+    ),
   };
   const publish = vi.fn();
   const chat = new ClaudeChat(
@@ -239,9 +243,77 @@ describe('Claude chat adapter', () => {
         content: [{ type: 'tool_result', tool_use_id: 'edit', content: 'Updated successfully.' }],
       },
     });
-    expect(h.chat.state.items[0].text).toContain('return false;');
-    expect(h.chat.state.items[0].text).toContain('return true;');
-    expect(h.chat.state.items[0].text).toContain('Updated successfully.');
+    expect(h.chat.state.items[0].activity?.diffs).toEqual([
+      { path: '/worktree/app.ts', diff: '-return false;\n+return true;', added: 1, removed: 1 },
+    ]);
+    // The confirmation adds nothing to the diff above it.
+    expect(h.chat.state.items[0].text).toBe('');
+  });
+
+  it('upgrades a proposed edit to the applied patch, with its line numbers', async () => {
+    const h = harness();
+    await h.chat.start();
+    await h.emit({
+      type: 'assistant',
+      message: {
+        id: 'reply',
+        content: [
+          {
+            type: 'tool_use',
+            id: 'edit',
+            name: 'Edit',
+            input: { file_path: '/worktree/app.ts', old_string: 'a', new_string: 'b' },
+          },
+        ],
+      },
+    });
+    await h.emit({
+      type: 'user',
+      uuid: 'result',
+      tool_use_result: {
+        filePath: '/worktree/app.ts',
+        structuredPatch: [
+          { oldStart: 3, oldLines: 2, newStart: 3, newLines: 2, lines: [' x', '-a', '+b'] },
+        ],
+      },
+      message: { content: [{ type: 'tool_result', tool_use_id: 'edit', content: 'Updated.' }] },
+    });
+    expect(h.chat.state.items[0].activity?.diffs).toEqual([
+      { path: '/worktree/app.ts', diff: '@@ -3,2 +3,2 @@\n x\n-a\n+b', added: 1, removed: 1 },
+    ]);
+  });
+
+  it('keeps a command apart from its output, and a failed edit shows why', async () => {
+    const h = harness();
+    await h.chat.start();
+    await h.emit({
+      type: 'assistant',
+      message: {
+        id: 'reply',
+        content: [
+          { type: 'tool_use', id: 'run', name: 'Bash', input: { command: 'npm test' } },
+          {
+            type: 'tool_use',
+            id: 'edit',
+            name: 'Edit',
+            input: { file_path: '/worktree/app.ts', old_string: 'a', new_string: 'b' },
+          },
+        ],
+      },
+    });
+    await h.emit({
+      type: 'user',
+      uuid: 'result',
+      message: {
+        content: [
+          { type: 'tool_result', tool_use_id: 'run', content: '1 passed' },
+          { type: 'tool_result', tool_use_id: 'edit', content: 'String not found', is_error: true },
+        ],
+      },
+    });
+    const [run, edit] = h.chat.state.items;
+    expect(run).toMatchObject({ text: '1 passed', activity: { command: 'npm test' } });
+    expect(edit).toMatchObject({ text: 'String not found', activity: { status: 'failed' } });
   });
 
   it('starts an explicit local session, preserves normal settings, and loads model capabilities', async () => {
@@ -254,8 +326,8 @@ describe('Claude chat adapter', () => {
       settingSources: ['user', 'project', 'local'],
       extraArgs: { 'replay-user-messages': null },
     });
-    // Settings that ask for nothing leave the session asking for everything.
-    expect(h.options().permissionMode).toBe('default');
+    // Auto is the app default when no task or settings file chooses a mode.
+    expect(h.options().permissionMode).toBe('auto');
     expect(h.options().allowDangerouslySkipPermissions).toBeUndefined();
     expect(h.options().sessionId).toBe(h.chat.state.threadId);
     expect(h.chat.state.models?.[0]).toMatchObject({
@@ -266,6 +338,25 @@ describe('Claude chat adapter', () => {
     await h.emit({ type: 'system', subtype: 'init', model: 'claude-fixture' });
     expect(h.chat.state.model).toBe('claude-fixture');
   });
+
+  it.each(['default', 'plan', 'acceptEdits'] as const)(
+    'preserves an explicit %s task mode over the Auto default',
+    async (permissionMode) => {
+      const h = harness([], undefined, { permissionMode });
+      await h.chat.start();
+      expect(h.options().permissionMode).toBe(permissionMode);
+    },
+  );
+
+  it.each(['default', 'plan', 'acceptEdits'])(
+    'preserves an explicit %s settings mode over the Auto default',
+    async (mode) => {
+      const root = settingsRoot({ user: JSON.stringify({ permissions: { defaultMode: mode } }) });
+      const h = harness([], undefined, { cwd: root });
+      await h.chat.start();
+      expect(h.options().permissionMode).toBe(mode);
+    },
+  );
 
   it('bypasses permissions only for a task that opted out', async () => {
     const h = harness([], undefined, { skipPermissions: true });
@@ -310,23 +401,37 @@ describe('Claude chat adapter', () => {
     expect(h.chat.state.permissionMode).toBe('acceptEdits');
   });
 
-  it('asks rather than take an escalating mode from the checkout itself', async () => {
+  it('uses the app default rather than take bypassPermissions from the checkout itself', async () => {
     // The CLI refuses this too: the worktree holds code the user has not read yet.
-    const root = settingsRoot({ project: '{"permissions":{"defaultMode":"auto"}}' });
+    const root = settingsRoot({ project: '{"permissions":{"defaultMode":"bypassPermissions"}}' });
     const h = harness([], undefined, { cwd: root });
     await h.chat.start();
-    expect(h.options().permissionMode).toBe('default');
+    expect(h.options().permissionMode).toBe('auto');
   });
 
-  it('asks rather than adopt a bypassPermissions setting, and says why', async () => {
+  it('uses Auto rather than adopt a bypassPermissions setting, and says why', async () => {
     const root = settingsRoot({ user: '{"permissions":{"defaultMode":"bypassPermissions"}}' });
     const h = harness([], undefined, { cwd: root });
     await h.chat.start();
-    expect(h.options().permissionMode).toBe('default');
+    expect(h.options().permissionMode).toBe('auto');
     expect(h.options().allowDangerouslySkipPermissions).toBeUndefined();
     expect(h.chat.state.permissionNote).toContain('bypassPermissions');
     // The user has now chosen for themselves what the settings could not carry over.
     await h.chat.setPermissionMode('plan');
+    expect(h.chat.state.permissionNote).toBeUndefined();
+  });
+
+  it('keeps the bypassPermissions note when Claude reports the mode it launched in', async () => {
+    const root = settingsRoot({ user: '{"permissions":{"defaultMode":"bypassPermissions"}}' });
+    const h = harness([], undefined, { cwd: root });
+    await h.chat.start();
+    await h.emit({ type: 'system', subtype: 'init', permissionMode: 'auto' });
+    await h.emit({ type: 'system', subtype: 'status', status: null, permissionMode: 'auto' });
+    expect(h.chat.state.permissionMode).toBe('auto');
+    expect(h.chat.state.permissionNote).toContain('bypassPermissions');
+    // A mode change reported from the CLI side makes the note stale.
+    await h.emit({ type: 'system', subtype: 'status', status: null, permissionMode: 'plan' });
+    expect(h.chat.state.permissionMode).toBe('plan');
     expect(h.chat.state.permissionNote).toBeUndefined();
   });
 
@@ -389,6 +494,26 @@ describe('Claude chat adapter', () => {
       },
     });
     expect(h.chat.state.items[1].text).toBe('Build finished');
+  });
+
+  it('shows a slash command and its output instead of the CLI envelope', async () => {
+    const h = harness();
+    await h.chat.start();
+    const user = (uuid: string, content: string) =>
+      h.emit({ type: 'user', uuid, message: { role: 'user', content } });
+    await user('caveat', '<local-command-caveat>Caveat: generated locally.</local-command-caveat>');
+    await user(
+      'command',
+      '<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-fable-5-1</command-args>',
+    );
+    await user(
+      'stdout',
+      '<local-command-stdout>Set model to `claude-fable-5-1`</local-command-stdout>',
+    );
+    expect(h.chat.state.items.map(({ kind, text }) => ({ kind, text }))).toEqual([
+      { kind: 'user', text: '/model claude-fable-5-1' },
+      { kind: 'assistant', text: 'Set model to `claude-fable-5-1`' },
+    ]);
   });
 
   it('records tools and their final results, including replay and subagent events', async () => {
@@ -633,6 +758,17 @@ describe('Claude chat adapter', () => {
     );
   });
 
+  it('starts a session under a handed-over id that Claude never wrote', async () => {
+    // A terminal launched with --session-id writes nothing until its first turn, so
+    // resuming the id it hands to Chat would fail with "No conversation found".
+    const h = harness([], 'unwritten');
+    await h.chat.start();
+    expect(h.sdk.getSessionInfo).toHaveBeenCalledWith('unwritten', { dir: '/worktree' });
+    expect(h.options().resume).toBeUndefined();
+    expect(h.options().sessionId).toBe('unwritten');
+    expect(h.chat.state.threadId).toBe('unwritten');
+  });
+
   it('refuses a task-specific config directory before opening a session', async () => {
     const h = harness([], undefined, {
       env: { ...process.env, CLAUDE_CONFIG_DIR: '/task/local' } as Record<string, string>,
@@ -660,6 +796,22 @@ describe('Claude chat adapter', () => {
     expect(h.options().resume).toBe('saved');
     expect(h.options().sessionId).toBeUndefined();
     expect(h.chat.state.items[0].text).toBe('Earlier answer');
+  });
+
+  it('publishes a restored history once rather than once per message', async () => {
+    const history = Array.from({ length: 50 }, (_, i) => ({
+      type: 'assistant' as const,
+      uuid: `old-${i}`,
+      session_id: 'saved',
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: { id: `old-message-${i}`, content: [{ type: 'text', text: `Answer ${i}` }] },
+    }));
+    const h = harness(history, 'saved');
+    await h.chat.start();
+    expect(h.chat.state.items).toHaveLength(50);
+    // Every publish sends the whole state, so one per message costs O(n²) on resume.
+    expect(h.publish.mock.calls.length).toBeLessThan(10);
   });
 
   it('interrupts an acknowledged turn and waits for its result before accepting another prompt', async () => {
@@ -714,6 +866,17 @@ describe('Claude chat adapter', () => {
     expect(h.chat.state.modelsError).toBe('No catalog');
     await h.chat.loadModels();
     expect(h.chat.state.modelsError).toBeUndefined();
+    // The picker shows names only; the CLI's "(recommended)" advice is dropped.
+    h.controls.supportedModels.mockResolvedValueOnce([
+      {
+        value: 'default',
+        resolvedModel: 'claude-fixture',
+        displayName: 'Default (recommended)',
+        supportedEffortLevels: [],
+      },
+    ]);
+    await h.chat.loadModels();
+    expect(h.chat.state.models?.[0]?.displayName).toBe('Default');
   });
 
   it('reports the cause of a successful-subtype turn that ended on an API error', async () => {

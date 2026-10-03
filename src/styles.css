@@ -67,7 +67,9 @@ body,
   height: 100%;
   margin: 0;
   overflow: hidden;
-  background: #0e1215;
+  /* Painted before data-look is applied; matches the default Obsidian --bg
+     and the BrowserWindow backgroundColor in electron/main.ts. */
+  background: #171717;
 }
 
 body {
@@ -544,8 +546,241 @@ body:has(
   border-color: color-mix(in srgb, var(--fg-subtle) 26%, transparent);
 }
 
+/* Shown in place of empty notes and changed files. */
+.task-support-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 30px;
+  padding: 4px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-support-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.task-support-toggle:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+/* Noir: a quiet frame, softly rounded workspaces, and a single focus accent.
+   Keep geometry stable when controls appear so parallel tasks never shift. */
+html[data-look='noir'] {
+  color-scheme: dark;
+  --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: var(--font-ui);
+  --bg: #0c0c10;
+  --bg-elevated: #1c1c24;
+  --bg-input: #202029;
+  --bg-hover: #2a2935;
+  --bg-selected: #343043;
+  --bg-selected-subtle: #282432;
+  --border: #33323e;
+  --border-subtle: #25252e;
+  --border-focus: #b7a5f5;
+  --fg: #e8e8ef;
+  --fg-muted: #b1b0bf;
+  --fg-subtle: #9392a3;
+  --accent: #b7a5f5;
+  --accent-hover: #cbbcfb;
+  --accent-text: #191421;
+  /* Links get their own hue so they never read as focus or selection. */
+  --link: #9cc8ea;
+  --success: #98c9ae;
+  --error: #f08f8a;
+  --warning: #dfba83;
+  --review: #8fbddd;
+  --info: #c4c3d0;
+  --diff-add-bg: rgba(152, 201, 174, 0.15);
+  --diff-remove-bg: rgba(240, 143, 138, 0.15);
+  --search-match: #dfc18e;
+  --search-match-active: #efa66f;
+  --island-bg: #15151b;
+  --island-border: #33323e;
+  --island-radius: 12px;
+  --task-container-bg: #15151b;
+  --task-panel-bg: #15151b;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --shadow-soft: 0 12px 32px rgba(0, 0, 0, 0.24);
+  --shadow-pop: 0 16px 48px rgba(0, 0, 0, 0.4);
+}
+
+.app-shell[data-look='noir']::before {
+  background: none;
+}
+
+html[data-look='noir'] .sidebar-panel {
+  padding: 12px 14px 16px !important;
+  gap: 20px !important;
+}
+
+html[data-look='noir'] .icon-btn:not(:hover):not(:focus-visible) {
+  border-color: transparent !important;
+}
+
+html[data-look='noir'] .sidebar-create-btn {
+  padding: 9px 12px !important;
+  background: var(--accent) !important;
+  color: var(--accent-text) !important;
+  border-color: transparent !important;
+  font-weight: 600 !important;
+}
+
+html[data-look='noir'] .sidebar-create-btn:hover {
+  background: var(--accent-hover) !important;
+}
+
+html[data-look='noir'] .app-shell:has(.task-column.active) .sidebar-create-btn {
+  background: var(--bg-input) !important;
+  color: var(--fg) !important;
+  border-color: var(--border) !important;
+  font-weight: 500 !important;
+}
+
+html[data-look='noir'] .app-shell:has(.task-column.active) .sidebar-create-btn:hover {
+  background: var(--bg-hover) !important;
+}
+
+html[data-look='noir'] .task-item {
+  border-radius: var(--radius-md) !important;
+}
+
+html[data-look='noir'] .task-item[aria-current='true'] {
+  box-shadow: inset 2px 0 var(--accent);
+}
+
+/* The column surface is only a shade above the frame, so the border carries
+   the boundary between parallel tasks. */
+html[data-look='noir'] .task-column {
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: none;
+}
+
+html[data-look='noir'] .task-column.active {
+  box-shadow: none;
+}
+
+html[data-look='noir'] .task-title-bar {
+  background: var(--island-bg);
+}
+
+html[data-look='noir'] .task-title-bar[data-active='true'],
+html[data-look='noir'] .island-header-active {
+  box-shadow: inset 0 2px var(--accent);
+}
+
+html[data-look='noir'] .task-title-actions {
+  background: transparent;
+}
+
+html[data-look='noir'] .task-action-group + .task-action-group {
+  border-left-color: var(--border-subtle);
+}
+
+/* Only lifecycle controls recede. Navigation, Git progress, and attention
+   remain visible. Opacity preserves tab order; focus-within reveals the group
+   before a keyboard user can activate it. Touch keeps every control visible. */
+@media (hover: hover) and (pointer: fine) {
+  html[data-look='noir']
+    .task-title-bar[data-active='false']:not(:hover):not(:focus-within)
+    .task-lifecycle-actions {
+    opacity: 0;
+    pointer-events: none;
+  }
+}
+
+/* Fade instead of popping in when the pointer crosses a title bar. */
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  html[data-look='noir'] .task-lifecycle-actions {
+    transition: opacity 0.12s ease;
+  }
+}
+
+html[data-look='noir'] .task-branch-info-bar {
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+html[data-look='noir'] :is(.info-bar, .changed-files-list-panel, .task-notes-body textarea) {
+  font-family: var(--font-ui) !important;
+}
+
+html[data-look='noir'] :is(.info-bar, .changed-files-list-panel, .sidebar-footer) {
+  font-variant-numeric: tabular-nums;
+}
+
+html[data-look='noir'] .info-bar button:not(:hover):not(:focus-visible) {
+  border-color: transparent !important;
+}
+
+html[data-look='noir'] .prompt-textarea {
+  font-family: var(--font-ui) !important;
+  box-shadow: none !important;
+}
+
+/* One quiet focus halo for every text field, replacing the default glow. */
+html[data-look='noir'] :is(.prompt-textarea, .input-field, .project-select):focus {
+  border-color: var(--border-focus) !important;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 12%, transparent) !important;
+}
+
+html[data-look='noir'] .task-notes-body textarea {
+  padding: 12px 14px !important;
+  font-size: 13px !important;
+  line-height: 1.65;
+}
+
+html[data-look='noir'] .file-row {
+  padding-top: 5px !important;
+  padding-bottom: 5px !important;
+}
+
+html[data-look='noir'] textarea::placeholder {
+  color: var(--fg-subtle);
+  opacity: 1;
+}
+
+html[data-look='noir'] .task-notes-body textarea::placeholder {
+  color: var(--fg-muted);
+}
+
+html[data-look='noir'] .task-git-status-badge:not([data-result='pending']) {
+  color: var(--accent-text) !important;
+}
+
+html[data-look='noir'] .prompt-send-btn:not(:disabled) {
+  background: var(--accent) !important;
+  color: var(--accent-text) !important;
+  border-radius: var(--radius-sm) !important;
+}
+
+html[data-look='noir'] .task-changed-files-section .changed-files-list-panel::after {
+  content: none;
+}
+
+html[data-look='noir'] .settings-theme-card.active {
+  background: var(--bg-selected-subtle);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 /* Obsidian: flat, square-edged workspaces with quiet navigation.
-   All styling is scoped to the preset, including portalled dialogs. */
+   All styling is scoped to the preset, including portalled dialogs.
+   Structural rules match both variants via [data-look^='obsidian'].
+   Amber is the accent, so "needs you" (--warning) uses a distinct orange. */
 html[data-look='obsidian'] {
   color-scheme: dark;
   --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -562,13 +797,13 @@ html[data-look='obsidian'] {
   --fg: #ededed;
   --fg-muted: #b5b5b5;
   --fg-subtle: #919191;
-  --accent: #c9c9c9;
-  --accent-hover: #e0e0e0;
-  --accent-text: #202020;
-  --link: #e0e0e0;
+  --accent: #c4a77d;
+  --accent-hover: #d6bd96;
+  --accent-text: #1e1b16;
+  --link: #d6bd96;
   --success: #98c9ae;
   --error: #eaa0aa;
-  --warning: #dfc18e;
+  --warning: #f29b70;
   --review: #c1b0e8;
   --info: #c9c9c9;
   --diff-add-bg: rgba(152, 201, 174, 0.12);
@@ -580,6 +815,50 @@ html[data-look='obsidian'] {
   --island-radius: 0px;
   --task-container-bg: #1e1e1e;
   --task-panel-bg: #1e1e1e;
+  --radius-xs: 4px;
+  --radius-sm: 4px;
+  --radius-md: 0px;
+  --radius-lg: 0px;
+  --shadow-soft: none;
+  --shadow-pop: none;
+}
+
+/* Obsidian Light: warm paper neutrals with the same square, flat structure.
+   Accent and status hues are darkened to keep AA text contrast on white. */
+html[data-look='obsidian-light'] {
+  color-scheme: light;
+  --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: var(--font-ui);
+  --bg: #f4f4f2;
+  --bg-elevated: #ffffff;
+  --bg-input: #f2f2f0;
+  --bg-hover: #ebebe8;
+  --bg-selected: #e2e1dc;
+  --bg-selected-subtle: #eeeeeb;
+  --border: #dddcd8;
+  --border-subtle: #e9e8e4;
+  --border-focus: #8a6433;
+  --fg: #1f1f1f;
+  --fg-muted: #555555;
+  --fg-subtle: #6e6e6e;
+  --accent: #8a6433;
+  --accent-hover: #75532a;
+  --accent-text: #ffffff;
+  --link: #75532a;
+  --success: #2f7d4f;
+  --error: #b3383f;
+  --warning: #ad4e00;
+  --review: #6d4fc2;
+  --info: #5e5e5e;
+  --diff-add-bg: rgba(47, 125, 79, 0.12);
+  --diff-remove-bg: rgba(179, 56, 63, 0.1);
+  --search-match: #d9a93b;
+  --search-match-active: #e07b39;
+  --island-bg: #ffffff;
+  --island-border: #dddcd8;
+  --island-radius: 0px;
+  --task-container-bg: #ffffff;
+  --task-panel-bg: #ffffff;
   --radius-xs: 0px;
   --radius-sm: 0px;
   --radius-md: 0px;
@@ -588,140 +867,160 @@ html[data-look='obsidian'] {
   --shadow-pop: none;
 }
 
-.app-shell[data-look='obsidian']::before {
+.app-shell[data-look^='obsidian']::before {
   background: none;
 }
 
-html[data-look='obsidian'] .sidebar-shell {
+html[data-look^='obsidian'] .sidebar-shell {
   padding: 0 4px 8px;
 }
 
-html[data-look='obsidian'] .sidebar-panel {
+html[data-look^='obsidian'] .sidebar-panel {
   padding: 8px 12px 18px !important;
   gap: 20px !important;
 }
 
 /* Quiet utility controls let the primary action and task names lead. */
-html[data-look='obsidian'] .icon-btn:not(:hover) {
+html[data-look^='obsidian'] .icon-btn:not(:hover) {
   border-color: transparent !important;
 }
 
-html[data-look='obsidian'] .sidebar-create-btn {
+html[data-look^='obsidian'] .sidebar-create-btn {
   padding: 9px 12px !important;
-  background: var(--fg) !important;
-  color: var(--bg) !important;
+  background: var(--accent) !important;
+  color: var(--accent-text) !important;
   border-color: transparent !important;
   font-weight: 600 !important;
   box-shadow: none;
 }
 
-html[data-look='obsidian'] .sidebar-create-btn:hover {
-  background: #ffffff !important;
+html[data-look^='obsidian'] .sidebar-create-btn:hover {
+  background: var(--accent-hover) !important;
 }
 
-html[data-look='obsidian'] .task-item[aria-current='true'] {
+html[data-look^='obsidian'] .task-item[aria-current='true'] {
   box-shadow: none;
 }
 
 /* Columns share one working surface instead of nesting floating cards. */
-html[data-look='obsidian'] [data-task-id] {
+html[data-look^='obsidian'] [data-task-id] {
   padding: 0 3px !important;
 }
 
-html[data-look='obsidian'] .task-column {
+/* A transparent top edge on every column keeps the active marker from
+   shifting layout when selection moves. */
+html[data-look^='obsidian'] .task-column {
   margin: 0;
   box-shadow: none;
   border: 0 !important;
-  border-left: 1px solid var(--border-subtle) !important;
+  border-left: 1px solid var(--border) !important;
+  border-top: 2px solid transparent !important;
 }
 
-html[data-look='obsidian'] .task-column.active {
+html[data-look^='obsidian'] .task-column.active {
   box-shadow: none;
-  border-color: var(--border-subtle) !important;
+  border-color: var(--border) !important;
+  border-top-color: var(--accent) !important;
 }
 
-html[data-look='obsidian'] .task-branch-info-bar {
+html[data-look^='obsidian'] .task-branch-info-bar {
   border-bottom-color: var(--border-subtle);
 }
 
 /* A flat composer; panel focus remains visible around its full boundary. */
-html[data-look='obsidian'] .prompt-input-panel {
+html[data-look^='obsidian'] .prompt-input-panel {
   padding: 0 !important;
-  background: var(--task-panel-bg);
+  background: var(--bg-input);
   border-top: 1px solid var(--border);
 }
 
-html[data-look='obsidian'] .prompt-textarea {
+html[data-look^='obsidian'] .prompt-textarea {
   font-family: var(--font-ui) !important;
   background: transparent !important;
   border-color: transparent !important;
   box-shadow: none !important;
 }
 
-html[data-look='obsidian'] textarea::placeholder {
+html[data-look^='obsidian'] textarea::placeholder {
   color: var(--fg-subtle);
 }
 
-html[data-look='obsidian'] .prompt-send-btn {
+html[data-look='obsidian'] .prompt-textarea::placeholder,
+html[data-look='islands-dark'] .prompt-textarea::placeholder {
+  color: var(--fg-subtle);
+  opacity: 1;
+}
+
+html[data-look^='obsidian'] .prompt-send-btn {
   border-radius: var(--radius-sm) !important;
 }
 
-html[data-look='obsidian'] :is(.input-field, .project-select):focus {
+html[data-look^='obsidian'] :is(.input-field, .project-select):focus {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--border-focus) 30%, transparent);
 }
 
-html[data-look='obsidian'] .settings-theme-card.active {
+html[data-look^='obsidian'] .settings-theme-card.active {
   background: var(--bg-selected-subtle);
   box-shadow: none;
 }
 
 /* Prose and navigation use the UI face; code and terminal output remain mono. */
-html[data-look='obsidian'] :is(.info-bar, .changed-files-list-panel, .task-notes-body textarea) {
+html[data-look^='obsidian'] :is(.info-bar, .changed-files-list-panel, .task-notes-body textarea) {
   font-family: var(--font-ui) !important;
 }
 
-html[data-look='obsidian'] .task-notes-body textarea {
+/* Inter's proportional digits make diff counts jitter as they update. */
+html[data-look^='obsidian'] :is(.info-bar, .changed-files-list-panel, .sidebar-footer) {
+  font-variant-numeric: tabular-nums;
+}
+
+html[data-look^='obsidian'] .task-notes-body textarea {
   padding: 12px 14px !important;
   font-size: 13px !important;
   line-height: 1.65;
 }
 
-html[data-look='obsidian'] .file-row {
+html[data-look^='obsidian'] .file-row {
   padding-top: 5px !important;
   padding-bottom: 5px !important;
 }
 
-html[data-look='obsidian'] .info-bar {
+html[data-look^='obsidian'] .info-bar {
   font-size: 12px !important;
 }
 
-html[data-look='obsidian'] .info-bar button:not(:hover):not(:focus-visible) {
+html[data-look^='obsidian'] .info-bar button:not(:hover):not(:focus-visible) {
   border-color: transparent !important;
 }
 
-/* Some controls have inline pill radii; keep every control square too.
-   Status dots and loading rings retain their meaningful circular shapes. */
-html[data-look='obsidian'] :is(button, input, textarea, select, [role='tab']),
-html[data-look='obsidian'] .tiling-layout-scroll-affordance::before,
-html[data-look='obsidian'] .project-swatch,
-html[data-look='obsidian'] .xterm-slider,
-html[data-look='obsidian'] ::-webkit-scrollbar-thumb {
+/* Small controls use a softer radius while workspace boundaries stay square.
+   Override inline pill radii; status dots and loading rings keep their shape. */
+html[data-look^='obsidian'] :is(button, input, textarea, select, [role='tab']),
+html[data-look^='obsidian'] .tiling-layout-scroll-affordance::before,
+html[data-look^='obsidian'] .project-swatch,
+html[data-look^='obsidian'] .xterm-slider,
+html[data-look^='obsidian'] ::-webkit-scrollbar-thumb {
+  border-radius: var(--radius-sm) !important;
+}
+
+/* The composer remains flush with its square workspace. */
+html[data-look^='obsidian'] .prompt-textarea {
   border-radius: 0 !important;
 }
 
-html[data-look='obsidian'] .info-bar button {
+html[data-look^='obsidian'] .info-bar button {
   font-family: var(--font-ui) !important;
 }
 
 /* Keep keyboard focus unambiguous, including the composer and shell toolbar. */
-html[data-look='obsidian'] .focusable-panel[data-panel-focused='true']::after,
-html[data-look='obsidian'] .prompt-input-panel:focus-within::after {
+html[data-look^='obsidian'] .focusable-panel[data-panel-focused='true']::after,
+html[data-look^='obsidian'] .prompt-input-panel:focus-within::after {
   content: '';
   border-width: 2px;
 }
 
 /* The file list sits inside an already outlined focusable section. */
-html[data-look='obsidian'] .task-changed-files-section .changed-files-list-panel::after {
+html[data-look^='obsidian'] .task-changed-files-section .changed-files-list-panel::after {
   content: none;
 }
 
@@ -981,7 +1280,10 @@ html[data-look='catppuccin-mocha'] .task-column.active {
 /* Islands Dark — JetBrains 2025.3 inspired: lighter tinted frame, darker uniform island panels.
    Frame uses a color→gray radial reminiscent of JetBrains' "Project Gradient". */
 html[data-look='islands-dark'] {
-  --bg: radial-gradient(circle at 0% 0%, #3a76d6 0%, #2c3a4d 8%, #26282c 18%);
+  color-scheme: dark;
+  --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: var(--font-ui);
+  --bg: radial-gradient(circle at 0% 0%, #30445e 0%, #2b323d 8%, #26282c 18%);
   --bg-elevated: #181a1d;
   --bg-input: #1e2126;
   --bg-hover: #23262c;
@@ -1068,6 +1370,13 @@ html[data-look^='islands-'] .task-column.active {
   margin: 0 !important;
   border-color: transparent !important;
   box-shadow: none !important;
+}
+
+/* A header marker identifies the active task independently of panel focus.
+   Inset paint preserves header size in both tiled and focus layouts. */
+html[data-look='islands-dark'] .task-title-bar[data-active='true'],
+html[data-look='islands-dark'] .island-header-active {
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 
 html[data-look^='islands-'] .tiling-layout-strip > .resize-handle-h {
@@ -1245,17 +1554,28 @@ html[data-look^='islands-'] .task-column.focus-mode .resize-handle-v {
   height: 5px;
 }
 
-/* Islands and Obsidian: hairline between adjacent sub-panels (notes ↔ changed-files,
+/* Outer islands provide grouping; inner panels only need their hairlines. */
+html[data-look='islands-dark'] .sidebar-panel,
+html[data-look='islands-dark'] .task-column.focus-mode .task-header-stack,
+html[data-look='islands-dark']
+  .task-column.focus-mode
+  .focusable-panel:not(.shell-terminal-container) {
+  box-shadow: none;
+}
+
+/* Islands, Obsidian and Noir: hairline between adjacent sub-panels (notes ↔ changed-files,
    shell ↔ agent terminal, etc). Drawn inside the existing 6px resize-handle
    so we don't change layout. Hidden during hover/drag — the handle's accent
    color takes over. */
 html[data-look^='islands-'] .resize-handle,
-html[data-look='obsidian'] .task-column .resize-handle {
+html[data-look^='obsidian'] .task-column .resize-handle,
+html[data-look='noir'] .task-column .resize-handle {
   position: relative;
 }
 
 html[data-look^='islands-'] .resize-handle-v::before,
-html[data-look='obsidian'] .task-column .resize-handle-v::before {
+html[data-look^='obsidian'] .task-column .resize-handle-v::before,
+html[data-look='noir'] .task-column .resize-handle-v::before {
   content: '';
   position: absolute;
   top: 50%;
@@ -1268,7 +1588,8 @@ html[data-look='obsidian'] .task-column .resize-handle-v::before {
 }
 
 html[data-look^='islands-'] .resize-handle-h::before,
-html[data-look='obsidian'] .task-column .resize-handle-h::before {
+html[data-look^='obsidian'] .task-column .resize-handle-h::before,
+html[data-look='noir'] .task-column .resize-handle-h::before {
   content: '';
   position: absolute;
   left: 50%;
@@ -1468,6 +1789,110 @@ button {
     color 0.16s ease,
     transform 0.16s ease,
     box-shadow 0.16s ease;
+}
+
+/* The change tour beside the diff: the understanding tour's card and threads,
+   compacted to fit the sidebar. It drives the file list below it, so an
+   accent rule and tint set it apart from that list in every look. */
+.change-tour {
+  display: flex;
+  box-sizing: border-box;
+  min-height: 0;
+  max-height: 70%;
+  flex-direction: column;
+  flex-shrink: 0;
+  gap: 8px;
+  padding: 12px;
+  overflow: hidden;
+  border-top: 2px solid var(--accent);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 6%, var(--task-panel-bg));
+}
+
+.diff-viewer-sidebar > .change-tour {
+  /* Leave room for files and notes; shorter windows scroll the sidebar. */
+  flex-shrink: 1;
+  min-height: 240px;
+}
+
+.diff-task-notes {
+  margin: 8px;
+  border: none;
+  border-radius: var(--radius-md);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
+}
+
+/* The dialog keeps its step strip faint; beside the diff it is the main
+   sense of where you are, so it reads at near full strength. */
+.change-tour .understanding-segments {
+  opacity: 0.75;
+}
+
+.change-tour-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+}
+
+.change-tour-top .understanding-subject {
+  max-width: none;
+}
+
+.change-tour-stage {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.change-tour .understanding-card {
+  flex: none;
+  padding: 16px 18px;
+  overflow: visible;
+  box-shadow: none;
+}
+
+.change-tour .tour-rework {
+  padding: 0;
+}
+
+.change-tour-note {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.change-tour-message {
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 0;
+  text-align: center;
+}
+
+.change-tour-ask {
+  display: flex;
+}
+
+.change-tour-nav {
+  display: flex;
+  gap: 8px;
+}
+
+.change-tour-nav > button {
+  flex: 1;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+.change-tour-nav > .change-tour-next {
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
 }
 
 .change-tour-footer {
@@ -1745,6 +2170,10 @@ textarea::placeholder {
   padding: 0 2px 2px;
 }
 
+.sidebar-attention-row {
+  border: none;
+}
+
 .sidebar-attention-row + .sidebar-attention-row {
   border-top: 1px solid color-mix(in srgb, var(--warning) 16%, transparent);
 }
@@ -1835,7 +2264,8 @@ textarea::placeholder {
   visibility: hidden;
 }
 
-.task-notes-body textarea::placeholder {
+.task-notes-body textarea::placeholder,
+.diff-task-notes::placeholder {
   color: var(--fg-muted);
 }
 
@@ -2230,11 +2660,16 @@ html:is(
 
 /* Match terminal dimming: actual keyboard/mouse focus brightens the panel,
    independently of the setting that dims entire inactive task columns. */
-:is(.task-canvas-panel, .task-notes-body, .task-changed-files-section) {
+:is(.task-canvas-panel, .task-notes-body, .task-changed-files-section, .diff-task-notes) {
   opacity: 0.8;
 }
 
-:is(.task-canvas-panel, .task-notes-body, .task-changed-files-section):focus-within,
+:is(
+  .task-canvas-panel,
+  .task-notes-body,
+  .task-changed-files-section,
+  .diff-task-notes
+):focus-within,
 .task-canvas-panel[data-panel-focused='true'] {
   opacity: 1;
 }
@@ -3216,38 +3651,6 @@ html[data-look='islands-light'] .window-title-icon {
   }
 }
 
-/* Monaco diff: hidden unchanged regions — make the collapse bar obvious and clickable */
-.monaco-editor .diff-hidden-lines .center {
-  cursor: pointer;
-  height: 28px;
-  line-height: 28px;
-  font-size: 13px;
-  font-family: var(--font-ui);
-  border-radius: var(--radius-xs);
-  transition: filter 0.15s ease;
-}
-
-.monaco-editor .diff-hidden-lines .center:hover {
-  filter: brightness(1.3);
-}
-
-/* Let the label text also be single-clickable (Monaco defaults to dblclick) */
-.monaco-editor .diff-hidden-lines .center span {
-  pointer-events: none;
-}
-
-/* Hide the unfold icon — the whole bar is clickable now */
-.monaco-editor .diff-hidden-lines .center > div:first-child {
-  width: 0 !important;
-  overflow: hidden;
-}
-
-/* Hide the tiny drag handles — the center bar handles expansion */
-.monaco-editor .diff-hidden-lines .top,
-.monaco-editor .diff-hidden-lines .bottom {
-  display: none;
-}
-
 /* Plan markdown rendering */
 /* ── Plan markdown: base (compact panel preview) ── */
 
@@ -3816,23 +4219,62 @@ html[data-look='islands-light'] .window-title-icon {
   min-width: 60px;
   gap: 4px;
   opacity: 0.35;
+  transition: opacity 120ms ease;
 }
 
-.understanding-segments > span {
+.understanding-segments:hover,
+.understanding-segments:focus-within {
+  opacity: 0.8;
+}
+
+/* The bar is 2px, but the button around it is tall enough to hit. */
+.understanding-segments > button {
+  position: relative;
   flex: 1;
+  height: 14px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.understanding-segments > button::before {
+  position: absolute;
+  top: 6px;
+  right: 0;
+  left: 0;
   height: 2px;
   border-radius: 2px;
   background: var(--border);
+  content: '';
+}
+
+.understanding-segments > button:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 1px;
 }
 
 /* Cards already read stay dimmer than the one in hand, so the strip says where
    you are and not only how far you got. */
-.understanding-segments > span[data-state='seen'] {
+.understanding-segments > button[data-state='seen']::before {
   background: color-mix(in srgb, var(--accent) 42%, transparent);
 }
 
-.understanding-segments > span[data-state='current'] {
+.understanding-segments > button[data-state='current']::before {
   background: var(--accent);
+}
+
+/* A dot above the bar marks a card with answered follow-ups under it. */
+.understanding-segments > button[data-answered]::after {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--accent);
+  content: '';
 }
 
 .understanding-count {
@@ -3929,7 +4371,7 @@ html[data-look='islands-light'] .window-title-icon {
   text-transform: uppercase;
 }
 
-/* A step above the body, not a headline: the body carries the card. */
+/* The headline states the claim; the content underneath supports it. */
 .understanding-card-title {
   margin: 0 0 12px;
   font-family: var(--font-ui);
@@ -3970,6 +4412,118 @@ html[data-look='islands-light'] .window-title-icon {
 
 .understanding-body > :last-child {
   margin-bottom: 0;
+}
+
+/* Card forms. A takeaway is its claim; comparison and flow cards give the
+   evidence the room and shrink the prose to a caption under it. */
+.understanding-card[data-form='takeaway'] .understanding-card-title {
+  max-width: 24ch;
+  margin: 8px 0 20px;
+  font-family: var(--font-display);
+  font-size: 26px;
+  line-height: 1.3;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+
+.understanding-card[data-form='takeaway'] .understanding-body {
+  color: var(--fg-muted);
+  font-size: 16px;
+}
+
+.understanding-card[data-form='flow'] :is(.understanding-diagram, .mermaid-block) {
+  margin: 8px 0 20px;
+  padding: 20px 22px;
+  border: 1px solid var(--border-subtle);
+  color: var(--fg);
+  font-size: 13.5px;
+}
+
+.understanding-card[data-form='flow'] .mermaid-rendered {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+}
+
+/* Narrow cards scroll the diagram instead of shrinking its labels away. */
+.understanding-card[data-form='flow'] .mermaid-rendered > svg {
+  min-width: 360px;
+}
+
+.understanding-card[data-form='flow'] .understanding-body,
+.understanding-card[data-form='comparison'] .understanding-body {
+  color: var(--fg-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+/* Side by side where there is room; stacked in the narrow change-tour column. */
+.understanding-compare {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr));
+  gap: 10px;
+  margin: 0 0 16px;
+}
+
+.understanding-compare-side {
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+  overflow-wrap: anywhere;
+}
+
+.understanding-compare-side > .understanding-card-label {
+  margin-bottom: 6px;
+}
+
+.understanding-compare-text {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+/* The overview borrows the card surface, so the stage keeps its size. */
+.understanding-overview ol {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0 0 0 1.6em;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.understanding-overview button {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+
+.understanding-overview button:hover,
+.understanding-overview button[aria-current='step'] {
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+}
+
+.understanding-overview .understanding-card-label {
+  margin: 0;
+  color: var(--fg-muted);
+}
+
+.understanding-overview-title {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.4;
 }
 
 /* The card's tone appears once, as the rule beside the consequence. */
@@ -4018,6 +4572,47 @@ html[data-look='islands-light'] .window-title-icon {
   opacity: 0.55;
 }
 
+/* Optional questions stay with their evidence, above any answers they open. */
+.tour-questions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 22px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.tour-question {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 4px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--link);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.tour-question:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+}
+
+.tour-question:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.tour-question:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .understanding-status {
   display: flex;
   align-items: center;
@@ -4050,6 +4645,37 @@ html[data-look='islands-light'] .window-title-icon {
   height: 10px;
   border-radius: var(--radius-xs);
   background: color-mix(in srgb, var(--fg) 7%, transparent);
+}
+
+.tour-rework {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px 10px;
+}
+
+/* Stale is a hint, not a failure: muted, with the one action it calls for. */
+.understanding-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 4px 10px;
+  color: var(--fg-muted);
+  font-size: 12px;
+}
+
+.understanding-notice-action {
+  padding: 2px 8px;
+  border: 1px solid color-mix(in srgb, var(--fg) 14%, transparent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.understanding-notice-action:hover {
+  border-color: var(--border-focus);
 }
 
 .understanding-alert-row {

@@ -175,6 +175,7 @@ export {
   setAskCodeModel,
   setMinimaxApiKey,
   setWindowState,
+  setPreferUiMode,
   setDefaultStepsEnabled,
   setAutoResumeSessions,
   setDefaultSkipPermissions,
@@ -257,3 +258,17 @@ export {
 export { refreshUsage, startUsagePolling, stopUsagePolling, USAGE_PROVIDERS } from './usage';
 
 export { setMcpOrchestrationEnabled } from './delegation';
+export {
+  spConnection,
+  spBanner,
+  refreshSpConnection,
+  connectSuperProductivity,
+  disconnectSuperProductivity,
+  listSpProjects,
+  setProjectSpMapping,
+  trackTaskInSp,
+  dismissSpBanner,
+  armSpCompletion,
+  startSuperProductivitySync,
+} from './superProductivity';
+export { startSpOpenListener } from './superProductivityOpen';

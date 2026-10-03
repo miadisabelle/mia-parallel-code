@@ -32,7 +32,6 @@ export default [
   // SolidJS-specific rules for TSX files
   {
     files: ['src/**/*.{ts,tsx}'],
-    ignores: ['src/**/*.react.tsx'],
     ...solid,
     languageOptions: {
       parser: tsParser,
@@ -93,6 +92,14 @@ export default [
     files: ['src/store/**/*.ts'],
     rules: {
       '@typescript-eslint/no-dynamic-delete': 'off',
+    },
+  },
+
+  // Showcase and benchmark scripts are command-line tools that report on stdout.
+  {
+    files: ['scripts/showcase/**/*.ts', 'scripts/bench/**/*.ts'],
+    rules: {
+      'no-console': 'off',
     },
   },
 

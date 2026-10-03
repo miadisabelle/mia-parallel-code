@@ -14,8 +14,8 @@ type MockStore = {
   sidebarFocused: boolean;
   sidebarFocusedProjectId: string | null;
   sidebarFocusedTaskId: string | null;
-  placeholderFocused: boolean;
   newTaskPanelFocused: boolean;
+  placeholderFocused: boolean;
 };
 
 let mockStore: MockStore;
@@ -40,9 +40,9 @@ vi.mock('./focused-panel', async (importOriginal) => ({
   scheduleTaskFocus: vi.fn(),
 }));
 
-import { activateTaskFromPointer, jumpToTask, moveActiveTask } from './navigation';
+import { activateTaskFromPointer, jumpToTask, moveActiveTask, setActiveTask } from './navigation';
+import { isPanelFocused, scheduleTaskFocus } from './focused-panel';
 import { reorderTask } from './tasks';
-import { scheduleTaskFocus } from './focused-panel';
 
 beforeEach(() => {
   const harness = expectDefined(core.harness, 'mock store harness');
@@ -63,8 +63,8 @@ beforeEach(() => {
     sidebarFocused: false,
     sidebarFocusedProjectId: null,
     sidebarFocusedTaskId: null,
-    placeholderFocused: false,
     newTaskPanelFocused: false,
+    placeholderFocused: false,
   });
 });
 
@@ -174,24 +174,67 @@ describe('jumpToTask', () => {
   });
 });
 
-// Clicking a column must hand focus to that column. `sidebarFocused` and
-// `placeholderFocused` are hard gates: while either is set, `isPanelFocused`
-// returns false for every panel and the arrow keys keep driving the sidebar.
-// Activating without clearing them leaves the column highlighted as active
-// while the app still behaves as if the sidebar owned focus — which reads as
-// "I clicked the panel and nothing happened".
+// `sidebarFocused` gates every panel: while it is set, `isPanelFocused` is false
+// and `scheduleTaskFocus` will not move DOM focus. A click into a column is the
+// user leaving the sidebar; a keyboard jump is not.
 describe('activateTaskFromPointer', () => {
-  it('takes focus away from the sidebar', () => {
+  const panel = 'ai-terminal:agent-b';
+
+  beforeEach(() => {
     mockStore.activeTaskId = 'task-1';
     mockStore.sidebarFocused = true;
-    mockStore.sidebarFocusedTaskId = 'task-1';
-
-    activateTaskFromPointer('task-2');
-
-    expect(mockStore.activeTaskId).toBe('task-2');
-    expect(mockStore.sidebarFocused).toBe(false);
+    mockStore.focusedPanel = { 'task-2': panel };
   });
 
+  it('setActiveTask leaves sidebarFocused set (keyboard jumps rely on it)', () => {
+    setActiveTask('task-2');
+    expect(mockStore.activeTaskId).toBe('task-2');
+    expect(isPanelFocused('task-2', panel)).toBe(false);
+  });
+
+  it('activates the column and hands it focus', () => {
+    activateTaskFromPointer('task-2');
+    expect(mockStore.activeTaskId).toBe('task-2');
+    expect(mockStore.sidebarFocused).toBe(false);
+    expect(isPanelFocused('task-2', panel)).toBe(true);
+  });
+
+  // Nothing about the selection changes here, so no focus effect runs again; the
+  // activation has to request focus itself.
+  it('clears the sidebar gate and requests focus when the column is already active', () => {
+    mockStore.activeTaskId = 'task-2';
+    activateTaskFromPointer('task-2');
+    expect(isPanelFocused('task-2', panel)).toBe(true);
+    expect(scheduleTaskFocus).toHaveBeenCalledWith('task-2', panel);
+  });
+
+  it('requests no focus itself when switching to another column', () => {
+    activateTaskFromPointer('task-2');
+    expect(scheduleTaskFocus).not.toHaveBeenCalled();
+  });
+
+  it('requests no focus when the sidebar did not have it', () => {
+    mockStore.sidebarFocused = false;
+    mockStore.activeTaskId = 'task-2';
+    activateTaskFromPointer('task-2');
+    expect(scheduleTaskFocus).not.toHaveBeenCalled();
+  });
+
+  it('leaves the sidebar focused when the id is not something setActiveTask accepts', () => {
+    activateTaskFromPointer('no-such-task');
+    expect(mockStore.activeTaskId).toBe('task-1');
+    expect(mockStore.sidebarFocused).toBe(true);
+  });
+
+  it('keeps keyboard jumps on the sidebar, as they were', () => {
+    jumpToTask(1);
+    expect(mockStore.sidebarFocused).toBe(true);
+  });
+});
+
+// Fork coverage of the gates setActiveTask clears for the pointer path, and of
+// the agent selection that comes with it.
+describe('activateTaskFromPointer: other focus gates (fork)', () => {
   it('takes focus away from the new-task placeholder', () => {
     mockStore.activeTaskId = 'task-1';
     mockStore.placeholderFocused = true;
@@ -225,35 +268,6 @@ describe('activateTaskFromPointer', () => {
     expect(mockStore.newTaskPanelFocused).toBe(false);
   });
 
-  it('claims focus even when the clicked column is already the active one', () => {
-    // Clicking into the active column after using the sidebar: the selection
-    // does not change, so only the focus flags can carry the intent.
-    mockStore.activeTaskId = 'task-1';
-    mockStore.sidebarFocused = true;
-
-    activateTaskFromPointer('task-1');
-
-    expect(mockStore.activeTaskId).toBe('task-1');
-    expect(mockStore.sidebarFocused).toBe(false);
-  });
-
-  // Nothing about the selection changes when the column was already active, so
-  // no focus effect runs again; the activation has to request focus itself.
-  it('requests focus when the clicked column was already active', () => {
-    mockStore.activeTaskId = 'task-2';
-    mockStore.sidebarFocused = true;
-    mockStore.focusedPanel = { 'task-2': 'ai-terminal:agent-b' };
-    activateTaskFromPointer('task-2');
-    expect(scheduleTaskFocus).toHaveBeenCalledWith('task-2', 'ai-terminal:agent-b');
-  });
-
-  it('requests no focus when the sidebar did not have it', () => {
-    mockStore.activeTaskId = 'task-2';
-    mockStore.sidebarFocused = false;
-    activateTaskFromPointer('task-2');
-    expect(scheduleTaskFocus).not.toHaveBeenCalled();
-  });
-
   it('selects the agent belonging to the clicked task', () => {
     mockStore.activeTaskId = 'task-1';
     mockStore.activeAgentId = 'agent-a';
@@ -261,25 +275,5 @@ describe('activateTaskFromPointer', () => {
     activateTaskFromPointer('task-2');
 
     expect(mockStore.activeAgentId).toBe('agent-b');
-  });
-
-  it('ignores ids that are neither a task nor a terminal', () => {
-    mockStore.activeTaskId = 'task-1';
-    mockStore.sidebarFocused = true;
-
-    activateTaskFromPointer('ghost');
-
-    expect(mockStore.activeTaskId).toBe('task-1');
-    expect(mockStore.sidebarFocused).toBe(true);
-  });
-
-  it('leaves keyboard jumps untouched — those keep the sidebar focused on purpose', () => {
-    mockStore.activeTaskId = 'task-1';
-    mockStore.sidebarFocused = true;
-
-    jumpToTask(1);
-
-    expect(mockStore.activeTaskId).toBe('task-2');
-    expect(mockStore.sidebarFocused).toBe(true);
   });
 });

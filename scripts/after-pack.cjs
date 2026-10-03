@@ -1,94 +1,79 @@
-// electron-builder afterPack hook (Linux).
+// electron-builder afterPack hook: make the packaged Linux app world-readable.
 //
-// Fork direction (miadisabelle): Parallel Code is a trusted local dev tool that
-// is frequently launched as root on headless servers. Chromium/Electron aborts
-// with a FATAL "Running as root without --no-sandbox is not supported" — and
-// that check runs in native code BEFORE any JS executes, so it cannot be fixed
-// from inside the app's main process. The only reliable place to inject the flag
-// is the launcher itself.
+// Files installed or generated under a restrictive umask keep modes without
+// world-read: node_modules as npm installed them (the asar-unpacked native
+// modules), build output, and the directories electron-builder creates. dpkg
+// installs those modes verbatim, which leaves a `/opt/Parallel Code` the desktop
+// user cannot enter.
 //
-// We rename the real Electron executable to `<name>.bin` and drop a tiny wrapper
-// in its place that always execs the real binary with `--no-sandbox`. Both the
-// desktop entry and the `/usr/bin/<name>` alternative point at this wrapper, so
-// icon launches and CLI launches (root or not) both work. `exec -a <name>`
-// preserves argv[0] so the X11 window class still matches StartupWMClass.
-//
-// Resource resolution is unaffected: Electron locates resources.pak, snapshot
-// blobs, locales/, resources/ and chrome_crashpad_handler relative to the
-// executable's directory (via /proc/self/exe), not its filename — and `.bin`
-// lives in that same directory.
+// Runs after the app is packed and before the deb and AppImage targets read it.
+// Files the targets generate themselves (the desktop entry, changelog) come
+// later and are covered by the `umask 022` in the `build` script instead.
 
 const fs = require('fs');
 const path = require('path');
 
-// The packaged tree inherits the *builder's* umask. On a shared server that is
-// often 007, which produces drwxrwx--- directories and -rw-rw---- files with no
-// "other" bits at all. dpkg preserves those modes verbatim, so `/opt/<app>`
-// installs root-owned and untraversable — the desktop user who is supposed to
-// run the app cannot even enter the directory, and the launcher fails before
-// Electron starts. Force world-readable, world-traversable modes on everything
-// we ship, regardless of the umask the build happened to run under.
+// Directories 755; files 644, or 755 where the owner could already execute them,
+// so no file becomes executable that its owner could not already execute. This
+// clears setuid, setgid and sticky bits; the packed tree has none (chrome-sandbox
+// is packed 0755, and the deb's postinst sets 4755 only on systems without user
+// namespaces). Symlinks carry no mode of their own and lchmod is not portable, so
+// they are left alone. A mode that is already right is not rewritten.
 function normalizePermissions(target) {
-  let stat;
-  try {
-    stat = fs.lstatSync(target);
-  } catch {
-    return;
-  }
-  // Symlinks carry no meaningful mode of their own and lchmod is not portable.
+  const stat = fs.lstatSync(target);
   if (stat.isSymbolicLink()) return;
 
+  const wanted = stat.isDirectory() || stat.mode & 0o100 ? 0o755 : 0o644;
+  if ((stat.mode & 0o7777) !== wanted) fs.chmodSync(target, wanted);
+
   if (stat.isDirectory()) {
-    fs.chmodSync(target, 0o755);
     for (const entry of fs.readdirSync(target)) {
       normalizePermissions(path.join(target, entry));
     }
-    return;
   }
-
-  // Keep the executable bit where the owner already had one (binaries, the
-  // launcher wrapper, chrome_crashpad_handler) and widen it to everyone.
-  fs.chmodSync(target, stat.mode & 0o100 ? 0o755 : 0o644);
 }
 
-exports.default = async function afterPack(context) {
-  if (context.electronPlatformName !== 'linux') return;
-
+// Fork direction (miadisabelle/mia-parallel-code): Parallel Code is launched as
+// root on headless servers, where Chromium aborts with "Running as root without
+// --no-sandbox is not supported". That check runs in native code before any JS,
+// so the flag has to come from the launcher itself. The real Electron binary is
+// renamed to `<name>.bin` and a wrapper takes its name, execing it with
+// --no-sandbox. The desktop entry and `/usr/bin/<name>` both point at the
+// wrapper, and `exec -a` keeps argv[0] so StartupWMClass still matches.
+// Electron resolves its resources relative to the executable's directory, which
+// `.bin` shares.
+function installNoSandboxLauncher(context) {
   const dir = context.appOutDir;
   const name =
     context.packager.executableName || context.packager.appInfo.productFilename || 'parallel-code';
-
   const launcher = path.join(dir, name);
   const real = path.join(dir, `${name}.bin`);
 
-  // Icons and other build resources are staged into the package straight from
-  // the repo, so they carry whatever modes the checkout got — outside appOutDir
-  // and therefore not covered by the pass below. This hook runs before the deb
-  // and AppImage targets assemble, which is the last point both are reachable.
-  const buildResources = path.join(process.cwd(), 'build');
-  if (fs.existsSync(buildResources)) normalizePermissions(buildResources);
-
-  // Idempotent — a re-pack over the same dir must not double-wrap.
-  if (fs.existsSync(real)) {
-    normalizePermissions(dir);
-    return;
-  }
-
+  // Idempotent: a re-pack over the same directory must not wrap twice.
+  if (fs.existsSync(real)) return;
   if (!fs.existsSync(launcher)) {
     throw new Error(`after-pack: expected Electron launcher not found at ${launcher}`);
   }
 
   fs.renameSync(launcher, real);
-
   const wrapper = `#!/bin/bash
 # Auto-generated by scripts/after-pack.cjs — always launch with --no-sandbox.
 # Chromium refuses to run as root without it, and the check fires before any JS.
 HERE="$(dirname "$(readlink -f "$0")")"
 exec -a "${name}" "$HERE/${name}.bin" --no-sandbox "$@"
 `;
-
   fs.writeFileSync(launcher, wrapper, { mode: 0o755 });
-  fs.chmodSync(launcher, 0o755);
+}
 
-  normalizePermissions(dir);
+exports.default = async function afterPack(context) {
+  if (context.electronPlatformName !== 'linux') return;
+
+  installNoSandboxLauncher(context);
+  normalizePermissions(context.appOutDir);
+
+  // fpm reads the menu icon from the build resources directory directly, so its
+  // modes reach the package too. This changes modes in the checkout's build/;
+  // git records only the executable bit, which is kept, so no diff results.
+  const buildResources = context.packager.buildResourcesDir;
+  if (buildResources && fs.existsSync(buildResources)) normalizePermissions(buildResources);
 };

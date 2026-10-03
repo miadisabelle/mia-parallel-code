@@ -15,13 +15,19 @@ import type {
 } from '../shared/agent-chat-types.js';
 import { stripAnsi } from '../shared/prompt-detect.js';
 import { readContextUsage } from '../shared/agent-chat-types.js';
-import { describePermissionUpdates, describeToolCall, visibleUserText } from './describe.js';
+import {
+  describePermissionUpdates,
+  describeToolCall,
+  localCommandOutput,
+  visibleUserText,
+} from './describe.js';
+import { appliedDiffs, proposedDiffs } from './claude-diffs.js';
 import { chatSettingSources, launchPermissionMode, settingsDefaultMode } from './settings-mode.js';
 import type { AgentChat, ChatStartOptions } from './types.js';
 
 type ClaudeSDK = Pick<
   typeof import('@anthropic-ai/claude-agent-sdk'),
-  'query' | 'getSessionMessages'
+  'query' | 'getSessionMessages' | 'getSessionInfo'
 >;
 const record = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value)
@@ -74,6 +80,8 @@ export class ClaudeChat implements AgentChat {
   private launchDiagnostics: string[] = [];
   private connecting = true;
   private contextRequest = 0;
+  /** The mode passed at launch; Claude's first report of it changes nothing. */
+  private launchedMode?: string;
   /** Resolves when the SDK's message stream ends — the only end-of-process
    *  signal available to `release`. */
   private reading?: Promise<void>;
@@ -110,10 +118,18 @@ export class ClaudeChat implements AgentChat {
     this.sdk = sdk;
     const sessionId = this.opts.threadId ?? randomUUID();
     this.state.threadId = sessionId;
-    if (this.opts.threadId) {
+    // A terminal launched with --session-id writes no transcript until its first
+    // turn, yet hands that id to Chat. Resuming it fails, so start it here instead;
+    // the id stays shared with the terminal either way.
+    const resume =
+      !!this.opts.threadId && !!(await sdk.getSessionInfo(sessionId, { dir: this.opts.cwd }));
+    if (this.isClosed()) throw new Error('Claude chat stopped while connecting.');
+    if (resume) {
       const history = await sdk.getSessionMessages(sessionId, { dir: this.opts.cwd });
-      for (const message of history) this.receive(message);
+      // Each publish sends the whole state; one per replayed message made resume O(n²).
+      for (const message of history) this.receive(message, false);
       this.settleActivities();
+      this.publish();
     }
     if (this.state.status === 'closed') throw new Error('Claude chat stopped while connecting.');
     // The SDK sends --permission-mode on every session it starts, defaulting the
@@ -126,13 +142,17 @@ export class ClaudeChat implements AgentChat {
         ? undefined
         : await settingsDefaultMode(this.opts.cwd);
     if (this.isClosed()) throw new Error('Claude chat stopped while connecting.');
+    const permissionMode = this.opts.skipPermissions
+      ? ('bypassPermissions' as const)
+      : (this.opts.permissionMode ?? launchPermissionMode(settingsMode) ?? 'auto');
+    this.launchedMode = permissionMode;
     this.query = sdk.query({
       prompt: this.prompts(),
       options: {
         cwd: this.opts.cwd,
         env: this.opts.env,
         pathToClaudeCodeExecutable: this.opts.command,
-        ...(this.opts.threadId ? { resume: sessionId } : { sessionId }),
+        ...(resume ? { resume: sessionId } : { sessionId }),
         systemPrompt: { type: 'preset', preset: 'claude_code' },
         settingSources: chatSettingSources(),
         includePartialMessages: true,
@@ -143,9 +163,7 @@ export class ClaudeChat implements AgentChat {
             : {}),
         },
         executable: 'node',
-        permissionMode: this.opts.skipPermissions
-          ? ('bypassPermissions' as const)
-          : (this.opts.permissionMode ?? launchPermissionMode(settingsMode) ?? 'default'),
+        permissionMode,
         ...(this.opts.skipPermissions ? { allowDangerouslySkipPermissions: true } : {}),
         canUseTool: this.canUseTool,
         // Diagnostics can include private tool arguments once a session is running.
@@ -197,7 +215,7 @@ export class ClaudeChat implements AgentChat {
   private noteUnadoptedSettingsMode(settingsMode: string | undefined): void {
     if (settingsMode !== 'bypassPermissions') return;
     this.state.permissionNote =
-      'Your settings use bypassPermissions, which chat does not turn on by itself. This chat asks instead; switch the task to skip permissions to run without prompts.';
+      'Your settings use bypassPermissions, which chat does not turn on by itself. This chat uses Auto instead; switch the task to skip permissions to run without prompts.';
   }
 
   subscribe(publish: (state: AgentChatState) => void): void {
@@ -216,7 +234,8 @@ export class ClaudeChat implements AgentChat {
       this.state.models = models
         .map((model) => ({
           model: model.resolvedModel ?? model.value,
-          displayName: model.displayName,
+          // A picker on the composer names the model; the CLI's advice would crowd it.
+          displayName: model.displayName.replace(/\s*\(recommended\)$/i, ''),
           supportedReasoningEfforts: (model.supportedEffortLevels ?? []).map((reasoningEffort) => ({
             reasoningEffort,
             description: '',
@@ -552,14 +571,18 @@ export class ClaudeChat implements AgentChat {
     });
   };
 
-  private receive(value: unknown): void {
+  /** `live` is false while replaying history, which the caller publishes once. */
+  private receive(value: unknown, live = true): void {
     const message = record(value);
     if (message.parent_tool_use_id) return; // Subagents are represented by their parent tool activity.
     if (message.type === 'system' && (message.subtype === 'init' || message.subtype === 'status')) {
       if (message.subtype === 'init') this.state.model = string(message.model) || this.state.model;
       // What the CLI resolved, which is not always what the settings asked for.
-      this.state.permissionMode = string(message.permissionMode) || this.state.permissionMode;
-      if (this.state.permissionMode !== 'default') this.state.permissionNote = undefined;
+      const reported = string(message.permissionMode);
+      // Claude reports the launch mode on init; only a different mode means someone
+      // changed it, which makes the note on how the launch mode was chosen stale.
+      if (reported && reported !== this.launchedMode) this.state.permissionNote = undefined;
+      this.state.permissionMode = reported || this.state.permissionMode;
     } else if (message.type === 'stream_event') {
       this.acceptSend();
       const event = record(message.event);
@@ -614,6 +637,9 @@ export class ClaudeChat implements AgentChat {
           });
           this.upsert({ id, kind: 'user', text, ...(images.length ? { images } : {}) });
         }
+        // Output answers the command, so it reads as a reply rather than as the user's words.
+        const output = localCommandOutput(contentText(content));
+        if (output) this.upsert({ id: `${id}:output`, kind: 'assistant', text: output });
       }
       content.forEach((value, index) => {
         const block = record(value);
@@ -642,15 +668,22 @@ export class ClaudeChat implements AgentChat {
               };
             });
           }
+          const diffs = proposedDiffs(tool, input);
           this.upsert({
             id: string(block.id),
             kind: 'tool',
-            text: `${describeToolCall(tool, input)}\n\n${JSON.stringify(input, null, 2)}`,
+            // Commands and edits have their own display; any other tool shows its call.
+            text:
+              type === 'tool' || (type === 'files' && !diffs)
+                ? `${describeToolCall(tool, input)}\n\n${JSON.stringify(input, null, 2)}`
+                : '',
             activity: {
               type,
               files: typeof input.file_path === 'string' ? [input.file_path] : undefined,
               label: string(input.command) || string(input.file_path) || tool,
               status: 'running',
+              ...(type === 'command' ? { command: string(input.command) } : {}),
+              ...(diffs ? { diffs } : {}),
             },
           });
         }
@@ -660,17 +693,28 @@ export class ClaudeChat implements AgentChat {
           this.seenToolResults.add(resultId);
           const toolId = string(block.tool_use_id);
           const previous = this.state.items.find((item) => item.id === toolId);
+          const output = contentText(block.content);
+          const diffs = block.is_error
+            ? undefined
+            : appliedDiffs(previous, message.tool_use_result);
+          const shownAlone = !!previous?.activity?.command || !!previous?.activity?.diffs;
           this.upsert({
             id: toolId,
             kind: 'tool',
-            // A blank line so the call stays legible above its output, which for a
-            // failure is the error text the user came to read.
-            text: [previous?.text, contentText(block.content)].filter(Boolean).join('\n\n'),
+            // A command shows its output under the command line, and an edit its
+            // diff, whose confirmation adds nothing; a failure's text is the point.
+            // Otherwise a blank line keeps the call legible above its output.
+            text: shownAlone
+              ? previous?.activity?.diffs && !block.is_error
+                ? ''
+                : output
+              : [previous?.text, output].filter(Boolean).join('\n\n'),
             activity: {
               ...previous?.activity,
               type: previous?.activity?.type ?? 'tool',
               label: previous?.activity?.label ?? 'Tool activity',
               status: this.toolDecisions.get(toolId) ?? (block.is_error ? 'failed' : 'completed'),
+              ...(diffs ? { diffs } : {}),
             },
           });
         }
@@ -730,6 +774,6 @@ export class ClaudeChat implements AgentChat {
       this.toolDecisions.clear();
       void this.refreshContextUsage();
     } else return;
-    this.publish();
+    if (live) this.publish();
   }
 }

@@ -38,6 +38,8 @@ import type { CommitInfo } from '../ipc/types';
 import type { GitIsolationMode } from '../store/types';
 import { ChangeTour } from './ChangeTour';
 import { createChangeTour, type ChangeTourController } from '../lib/create-change-tour';
+import type { TourLocation } from '../lib/change-tour';
+import { store, updateTaskNotes } from '../store/store';
 
 interface DiffViewerDialogProps {
   tour?: ChangeTourController;
@@ -155,6 +157,7 @@ export function DiffViewerDialog(props: DiffViewerDialogProps) {
 /** Inner content rendered inside ReviewProvider so it can call useReview(). */
 function DiffViewerContent(props: DiffViewerDialogProps & { tour: ChangeTourController }) {
   const review = useReview();
+  const task = () => (props.taskId ? store.tasks[props.taskId] : undefined);
   const headerPaddingTop = `${windowChromeTopInset + 12}px`;
 
   const [parsedFiles, setParsedFiles] = createSignal<FileDiff[]>([]);
@@ -170,18 +173,21 @@ function DiffViewerContent(props: DiffViewerDialogProps & { tour: ChangeTourCont
         props.tour.stops()[props.tour.step()]?.locations.map((location) => location.filePath) ?? [],
       ),
   );
+  // While a reworked tour generates there is no step, so every file stays in view.
   const visibleFiles = createMemo(() =>
-    tourOpen() && !showAllChanges()
+    tourOpen() && !showAllChanges() && stepFiles().size > 0
       ? parsedFiles().filter((file) => stepFiles().has(file.path))
       : parsedFiles(),
   );
 
-  function navigateTour(filePath: string, line: number) {
+  function navigateTour(location: TourLocation) {
+    const { filePath } = location;
     setActiveFilePath(filePath);
     const file = parsedFiles().find((entry) => entry.path === filePath);
     review.setScrollTarget({
       filePath,
-      startLine: line,
+      startLine: location.line,
+      ...(location.endLine !== undefined && { endLine: location.endLine }),
       side: file?.status === 'D' ? 'old' : 'new',
     });
   }
@@ -466,13 +472,15 @@ function DiffViewerContent(props: DiffViewerDialogProps & { tour: ChangeTourCont
       {/* Body */}
       <div style={{ flex: '1', overflow: 'hidden', display: 'flex' }}>
         <aside
+          class="diff-viewer-sidebar"
           style={{
             width: tourOpen() ? '380px' : '300px',
             'min-width': '240px',
             'max-width': tourOpen() ? '40vw' : '34vw',
             display: 'flex',
             'flex-direction': 'column',
-            background: theme.taskPanelBg,
+            background: theme.taskContainerBg,
+            'overflow-y': 'auto',
             'border-right': `1px solid ${theme.border}`,
             'flex-shrink': '0',
           }}
@@ -480,6 +488,7 @@ function DiffViewerContent(props: DiffViewerDialogProps & { tour: ChangeTourCont
           <Show when={tourOpen() && !loading() && !error()}>
             <ChangeTour
               tour={props.tour}
+              worktreePath={props.worktreePath}
               onNavigate={navigateTour}
               onFinish={() => {
                 props.tour.navigate(0);
@@ -525,7 +534,7 @@ function DiffViewerContent(props: DiffViewerDialogProps & { tour: ChangeTourCont
                   setShowAllChanges(showAll);
                   if (!showAll) {
                     const location = props.tour.stops()[props.tour.step()]?.locations[0];
-                    if (location) navigateTour(location.filePath, location.line);
+                    if (location) navigateTour(location);
                   }
                 }}
               >
@@ -533,7 +542,7 @@ function DiffViewerContent(props: DiffViewerDialogProps & { tour: ChangeTourCont
               </button>
             </div>
           </Show>
-          <div style={{ flex: '1', 'min-height': '0', overflow: 'hidden' }}>
+          <div style={{ flex: '1', 'min-height': '100px', overflow: 'hidden' }}>
             <ChangedFilesList
               worktreePath={props.worktreePath}
               filesOverride={
@@ -566,6 +575,29 @@ function DiffViewerContent(props: DiffViewerDialogProps & { tour: ChangeTourCont
               onFileClick={(file) => setActiveFilePath(file.path)}
             />
           </div>
+          <Show when={task()}>
+            {(currentTask) => (
+              <textarea
+                class="diff-task-notes"
+                aria-label="Task notes"
+                placeholder="Add a note…"
+                value={currentTask().notes}
+                onInput={(e) => updateTaskNotes(currentTask().id, e.currentTarget.value)}
+                style={{
+                  width: 'calc(100% - 16px)',
+                  height: '140px',
+                  'max-height': '25vh',
+                  background: currentTask().notes?.trim() ? theme.taskPanelBg : theme.bgInput,
+                  padding: '8px 10px',
+                  'flex-shrink': '0',
+                  color: theme.fg,
+                  'font-size': sf(12),
+                  'font-family': "'JetBrains Mono', monospace",
+                  resize: 'none',
+                }}
+              />
+            )}
+          </Show>
         </aside>
 
         <div style={{ flex: '1', overflow: 'hidden' }}>

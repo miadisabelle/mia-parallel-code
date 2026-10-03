@@ -1,8 +1,8 @@
 import { For, Show } from 'solid-js';
 import {
-  activateTaskFromPointer,
   getTaskAttentionState,
   getTaskDotStatus,
+  activateTaskFromPointer,
   store,
 } from '../store/store';
 import { openPanelOrder } from '../store/navigation';
@@ -45,6 +45,7 @@ export function FocusModeTaskIndicators() {
                 <Show when={item.isTask}>
                   <StatusDot
                     status={getTaskDotStatus(item.id)}
+                    taskId={item.id}
                     size="sm"
                     attention={getTaskAttentionState(item.id)}
                   />

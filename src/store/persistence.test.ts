@@ -69,9 +69,12 @@ async function loadPersistedAgent(def: AgentDef): Promise<AgentDef> {
   return store.agents[agentId as string].def;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.clearAllMocks();
   mockInvoke.mockResolvedValue(undefined);
+  // Saving is enabled only after the initial state has been read successfully.
+  await loadState();
+  vi.clearAllMocks();
   setStore('projects', []);
   setStore('lastProjectId', null);
   setStore('lastAgentId', null);
@@ -86,6 +89,7 @@ beforeEach(() => {
   setStore('coordinatorControlHintDismissed', false);
   setStore('autoStartRemoteAccess', false);
   setStore('terminalScreenReaderMode', false);
+  setStore('preferUiMode', false);
 });
 
 describe('resolveIncomingPanelUserSize', () => {
@@ -287,6 +291,88 @@ describe('landing state persistence', () => {
   });
 });
 
+describe('completion report persistence', () => {
+  const completion = {
+    id: '11111111-1111-4111-8111-111111111111',
+    completedAt: '2026-09-26T10:00:00.000Z',
+    reviewRevision: 3,
+    sourceCommit: 'a'.repeat(40),
+    snapshotState: 'dirty',
+    result: {
+      summary: 'Implemented the task',
+      verification: { checks: [{ name: 'Tests', command: 'npm test', result: 'passed' }] },
+      artifacts: [{ path: 'reports/result.txt', label: 'Result' }],
+      unresolvedIssues: ['Native smoke check pending'],
+    },
+  };
+
+  async function restore(value: unknown, reviewRevision: unknown = 3) {
+    mockInvoke.mockResolvedValueOnce(
+      JSON.stringify({
+        projects: [{ id: 'project-1', name: 'Repo', path: '/repo', color: 'hsl(0, 70%, 75%)' }],
+        taskOrder: ['task-1'],
+        collapsedTaskOrder: ['task-2'],
+        tasks: {
+          'task-1': { ...persistedTask(agentDef()), completion: value, reviewRevision },
+          'task-2': {
+            ...persistedTask(agentDef()),
+            id: 'task-2',
+            collapsed: true,
+            completion: value,
+            reviewRevision,
+          },
+        },
+        activeTaskId: 'task-1',
+        sidebarVisible: true,
+      }),
+    );
+    await loadState();
+  }
+
+  it('round-trips completion reports and revisions for active and collapsed tasks', async () => {
+    await restore(completion);
+    expect(store.tasks['task-2'].collapsed).toBe(true);
+    for (const taskId of ['task-1', 'task-2']) {
+      expect(store.tasks[taskId].completion).toEqual(completion);
+      expect(store.tasks[taskId].reviewRevision).toBe(3);
+    }
+    await saveState();
+    const savedCall = [...mockInvoke.mock.calls]
+      .reverse()
+      .find(([channel]) => channel === IPC.SaveAppState);
+    expect(savedCall).toBeDefined();
+    const saved = JSON.parse(savedCall?.[1].json);
+    for (const taskId of ['task-1', 'task-2']) {
+      expect(saved.tasks[taskId].completion).toEqual(completion);
+      expect(saved.tasks[taskId].reviewRevision).toBe(3);
+    }
+  });
+
+  it.each([
+    undefined,
+    null,
+    { ...completion, snapshotState: 'invalid' },
+    { ...completion, result: { summary: 42 } },
+  ])(
+    'drops absent or invalid completion data without restoring a previous report: %j',
+    async (invalid) => {
+      await restore(completion);
+      await restore(invalid, -1);
+      for (const taskId of ['task-1', 'task-2']) {
+        expect(store.tasks[taskId].completion).toBeUndefined();
+        expect(store.tasks[taskId].reviewRevision).toBeUndefined();
+      }
+      await saveState();
+      const savedCall = [...mockInvoke.mock.calls]
+        .reverse()
+        .find(([channel]) => channel === IPC.SaveAppState);
+      const saved = JSON.parse(savedCall?.[1].json);
+      expect(saved.tasks['task-1']).not.toHaveProperty('completion');
+      expect(saved.tasks['task-2']).not.toHaveProperty('completion');
+    },
+  );
+});
+
 describe('coordinator concurrency limit persistence', () => {
   function stateWithTasks(tasks: Record<string, unknown>): string {
     return JSON.stringify({
@@ -333,6 +419,81 @@ describe('coordinator concurrency limit persistence', () => {
     await loadState();
     expect(store.tasks['task-1'].maxConcurrentTasks).toBe(20);
     expect(store.tasks['task-2'].maxConcurrentTasks).toBeUndefined();
+  });
+});
+
+describe('Super Productivity link persistence', () => {
+  function stateWith(
+    tasks: Record<string, unknown>,
+    projectExtra: Record<string, unknown>,
+  ): string {
+    return JSON.stringify({
+      projects: [
+        {
+          id: 'project-1',
+          name: 'Repo',
+          path: '/repo',
+          color: 'hsl(0, 70%, 75%)',
+          ...projectExtra,
+        },
+      ],
+      lastProjectId: 'project-1',
+      lastAgentId: null,
+      taskOrder: Object.keys(tasks),
+      collapsedTaskOrder: [],
+      tasks,
+      activeTaskId: 'task-1',
+      sidebarVisible: true,
+    });
+  }
+
+  it('round-trips task links and the project mapping', async () => {
+    const def = agentDef();
+    mockInvoke.mockResolvedValueOnce(
+      stateWith(
+        {
+          'task-1': {
+            ...persistedTask(def),
+            superProductivity: { taskId: 'sp_task-1', syncedTitle: 'Fix login' },
+          },
+        },
+        { superProductivityProjectId: 'INBOX_PROJECT' },
+      ),
+    );
+    await loadState();
+    expect(store.tasks['task-1'].superProductivity).toEqual({
+      taskId: 'sp_task-1',
+      syncedTitle: 'Fix login',
+    });
+    expect(store.projects[0].superProductivityProjectId).toBe('INBOX_PROJECT');
+
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    const lastCall = mockInvoke.mock.calls[mockInvoke.mock.calls.length - 1];
+    const saved = JSON.parse(lastCall[1].json);
+    expect(saved.tasks['task-1'].superProductivity).toEqual({
+      taskId: 'sp_task-1',
+      syncedTitle: 'Fix login',
+    });
+    expect(saved.projects[0].superProductivityProjectId).toBe('INBOX_PROJECT');
+  });
+
+  it('drops malformed links from hand-edited state', async () => {
+    const def = agentDef();
+    mockInvoke.mockResolvedValueOnce(
+      stateWith(
+        {
+          'task-1': {
+            ...persistedTask(def),
+            superProductivity: { taskId: '../x', syncedTitle: 'x' },
+          },
+        },
+        { superProductivityProjectId: 42 },
+      ),
+    );
+    await loadState();
+    expect(store.tasks['task-1'].superProductivity).toBeUndefined();
+    expect(store.projects[0].superProductivityProjectId).toBeUndefined();
   });
 });
 
@@ -911,6 +1072,15 @@ describe('loadState theme persistence', () => {
     expect(store.lightThemePreset).toBe('islands-light');
   });
 
+  it('saves the light slot explicitly so a new default cannot replace it', async () => {
+    setStore('lightThemePreset', 'islands-light');
+    mockInvoke.mockResolvedValueOnce(undefined);
+    await saveState();
+    const savedCall = mockInvoke.mock.calls.find(([channel]) => channel === IPC.SaveAppState);
+    const json = (savedCall?.[1] as { json: string }).json;
+    expect(JSON.parse(json).lightThemePreset).toBe('islands-light');
+  });
+
   it('falls back to islands-light for an invalid lightThemePreset', async () => {
     mockInvoke.mockResolvedValueOnce(
       basePayload({ appearanceMode: 'light', lightThemePreset: 'bogus' }),
@@ -1193,6 +1363,35 @@ describe('project task group collapsed persistence', () => {
     const saved = JSON.parse(mockInvoke.mock.calls[0][1].json);
     expect(saved.projects[0].tasksCollapsed).toBe(true);
   });
+});
+
+describe('UI mode preference persistence', () => {
+  it.each([true, false, undefined, 'true', 1])('restores only boolean true (%s)', async (value) => {
+    setStore('preferUiMode', true);
+    mockInvoke.mockResolvedValueOnce(basePayload({ preferUiMode: value }));
+    await loadState();
+    expect(store.preferUiMode).toBe(value === true);
+  });
+
+  it.each([true, false])(
+    'round-trips the preference (%s) without changing saved task views',
+    async (enabled) => {
+      setStore('preferUiMode', enabled);
+      await saveState();
+      const saved = JSON.parse(mockInvoke.mock.calls.at(-1)?.[1].json);
+      expect(saved.preferUiMode).toBe(enabled || undefined);
+      mockInvoke.mockResolvedValueOnce(
+        basePayload({
+          ...saved,
+          tasks: { 'task-1': { ...persistedTask(agentDef()), mainAgentView: 'terminal' } },
+          taskOrder: ['task-1'],
+        }),
+      );
+      await loadState();
+      expect(store.preferUiMode).toBe(enabled);
+      expect(store.tasks['task-1'].mainAgentView).not.toBe('chat');
+    },
+  );
 });
 
 describe('new task defaults persistence', () => {
@@ -1978,6 +2177,8 @@ describe('MCP orchestration policy persistence', () => {
       IPC.DelegationRequest,
       expect.objectContaining({ action: 'register' }),
     );
+    await saveState();
+    expect(mockInvoke.mock.calls.some(([channel]) => channel === IPC.SaveAppState)).toBe(false);
   });
 });
 

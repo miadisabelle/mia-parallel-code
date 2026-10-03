@@ -51,7 +51,7 @@ export const [store, setStore] = createStore<AppStore>({
   terminalScreenReaderMode: false,
   themePreset: defaultPresetForTone('dark'),
   appearanceMode: 'dark',
-  lightThemePreset: 'islands-light',
+  lightThemePreset: defaultPresetForTone('light'),
   lightThemeCustomId: null,
   darkThemePreset: defaultPresetForTone('dark'),
   darkThemeCustomId: null,
@@ -98,6 +98,7 @@ export const [store, setStore] = createStore<AppStore>({
   activeDocumentProjectId: null,
   coordinatorNotificationDelayMs: 60_000,
   coordinatorControlHintDismissed: false,
+  preferUiMode: false,
   defaultStepsEnabled: false,
   // Fork direction (miadisabelle): per-tool permission prompts are unworkable for our
   // agent workflow, so skip-permissions — and its propagation to coordinator sub-agents —

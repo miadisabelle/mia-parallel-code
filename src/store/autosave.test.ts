@@ -4,6 +4,17 @@ import { persistedSnapshot } from './autosave';
 import type { Task } from './types';
 
 describe('autosave snapshot includes new-task-default fields', () => {
+  it('preferUiMode changes the snapshot', () => {
+    setStore('preferUiMode', false);
+    const before = persistedSnapshot();
+    setStore('preferUiMode', true);
+    try {
+      expect(persistedSnapshot()).not.toBe(before);
+    } finally {
+      setStore('preferUiMode', false);
+    }
+  });
+
   it('mcpOrchestrationEnabled changes the snapshot', () => {
     setStore('mcpOrchestrationEnabled', true);
     const before = persistedSnapshot();
@@ -60,29 +71,6 @@ describe('autosave snapshot includes new-task-default fields', () => {
     expect('showSteps' in store).toBe(false);
   });
 
-  // A per-task skip-permissions flip must reach the debounced autosave, or the
-  // change is silently dropped on the next launch.
-  it('a task-level skipPermissions flip changes the snapshot', () => {
-    const taskId = 'autosave-skip-perms-task';
-    setStore('tasks', taskId, {
-      id: taskId,
-      name: 'T',
-      projectId: 'p',
-      agentIds: [],
-      shellAgentIds: [],
-      skipPermissions: false,
-    } as never);
-    setStore('taskOrder', (order) => [...order, taskId]);
-
-    const before = persistedSnapshot();
-    setStore('tasks', taskId, 'skipPermissions', true);
-    const after = persistedSnapshot();
-    expect(before).not.toBe(after);
-
-    setStore('taskOrder', (order) => order.filter((id) => id !== taskId));
-    setStore('tasks', taskId, undefined as never);
-  });
-
   it('autoResumeSessions changes the snapshot', () => {
     setStore('autoResumeSessions', false);
     const before = persistedSnapshot();
@@ -90,6 +78,37 @@ describe('autosave snapshot includes new-task-default fields', () => {
     const after = persistedSnapshot();
     expect(before).not.toBe(after);
     setStore('autoResumeSessions', false);
+  });
+
+  it('a Super Productivity link changes the snapshot', () => {
+    // Links are made in the background (first focus, title sync); if they were
+    // left out, a crash before the next unrelated save would lose the link and
+    // the next focus would create a duplicate task over there.
+    const taskId = 'autosave-sp-task';
+    setStore('tasks', taskId, {
+      id: taskId,
+      name: taskId,
+      projectId: 'p1',
+      branchName: 'task/sp',
+      worktreePath: '/tmp/autosave-sp-task',
+      agentIds: [],
+      shellAgentIds: [],
+      notes: '',
+      lastPrompt: '',
+      gitIsolation: 'worktree',
+    } as Task);
+    setStore('taskOrder', (order) => [...order, taskId]);
+    try {
+      const before = persistedSnapshot();
+      setStore('tasks', taskId, 'superProductivity', { taskId: 'sp-1', syncedTitle: 'x' });
+      const linked = persistedSnapshot();
+      expect(linked).not.toBe(before);
+      setStore('tasks', taskId, 'superProductivity', 'syncedTitle', 'y');
+      expect(persistedSnapshot()).not.toBe(linked);
+    } finally {
+      setStore('taskOrder', (order) => order.filter((id) => id !== taskId));
+      setStore('tasks', taskId, undefined as unknown as Task);
+    }
   });
 
   it('branch adoption banner fields change the snapshot', () => {

@@ -33,6 +33,7 @@ import { getTaskDockerBadgeLabel } from '../lib/docker';
 import { displayTaskNameFromPrompt, shouldUsePromptDerivedTaskName } from '../lib/clean-task-name';
 import type { Task } from '../store/types';
 import { isLandedTaskState } from '../store/landing';
+import { bringTaskToFront, isTaskBackgrounded, sendTaskToBack } from '../store/background-tasks';
 
 // Kinds without an entry stay silent: a configured-but-never-run command on
 // every task would be noise, and cancelled runs carry no signal.
@@ -193,6 +194,7 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
         <span class="task-title-status" title={statusDescription()}>
           <StatusDot
             status={getTaskDotStatus(props.task.id)}
+            taskId={props.task.id}
             size="md"
             attention={getTaskAttentionState(props.task.id)}
           />
@@ -240,6 +242,9 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
           >
             {skipPermissionsOn() ? 'skip confirms' : 'confirms on'}
           </button>
+        </Show>
+        <Show when={isTaskBackgrounded(props.task.id)}>
+          <span style={badgeStyle(theme.fgMuted)}>Background</span>
         </Show>
         <Show when={props.task.needsReview}>
           <span
@@ -328,6 +333,7 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
                 fallback={
                   <Show when={props.pushSuccess}>
                     <div
+                      class="task-git-status-badge"
                       style={{
                         position: 'absolute',
                         bottom: '-4px',
@@ -339,10 +345,11 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
                         display: 'flex',
                         'align-items': 'center',
                         'justify-content': 'center',
+                        color: 'white',
                         'pointer-events': 'none',
                       }}
                     >
-                      <svg width="8" height="8" viewBox="0 0 16 16" fill="white">
+                      <svg width="8" height="8" viewBox="0 0 16 16" fill="currentColor">
                         <path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z" />
                       </svg>
                     </div>
@@ -351,6 +358,8 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
               >
                 {(c) => (
                   <div
+                    class="task-git-status-badge"
+                    data-result={c().overall}
                     style={{
                       position: 'absolute',
                       bottom: '-4px',
@@ -427,7 +436,44 @@ export function TaskTitleBar(props: TaskTitleBarProps) {
             title={store.focusMode ? 'Exit focus mode' : 'Focus on this task'}
           />
         </div>
-        <div class="task-action-group" role="group" aria-label="Task actions">
+        <div
+          class="task-action-group task-lifecycle-actions"
+          role="group"
+          aria-label="Task actions"
+        >
+          <IconButton
+            icon={
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M3 3h10M3 13h10" />
+                <path
+                  d={
+                    isTaskBackgrounded(props.task.id)
+                      ? 'M8 11V5m0 0L5.5 7.5M8 5l2.5 2.5'
+                      : 'M8 5v6m0 0L5.5 8.5M8 11l2.5-2.5'
+                  }
+                />
+              </svg>
+            }
+            onClick={() =>
+              isTaskBackgrounded(props.task.id)
+                ? bringTaskToFront(props.task.id)
+                : sendTaskToBack(props.task.id)
+            }
+            title={
+              isTaskBackgrounded(props.task.id)
+                ? 'Bring task to front'
+                : 'Send task to back until new activity'
+            }
+          />
           <Show when={!props.task.coordinatorMode && !props.task.delegationParent}>
             <IconButton
               icon={

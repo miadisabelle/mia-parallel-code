@@ -15,6 +15,7 @@ import { onMount, onCleanup, createEffect, Show, ErrorBoundary, createSignal } f
 import { invoke } from './lib/ipc';
 import { IPC } from '../electron/ipc/channels';
 import { appWindow } from './lib/window';
+import { startWindowVisibilityTracking } from './lib/windowVisibility';
 import { choice } from './lib/dialog';
 import { CLOSE_DIALOG_BUTTONS, resolveCloseChoice } from './lib/close-decision';
 import { resolvePanelCloseTarget } from './store/close-target';
@@ -100,6 +101,8 @@ import {
 import { dismissPinnedBubbles } from './documents/workspace-ui';
 import { resetForNewMatch } from './arena/store';
 import { startDesktopNotificationWatcher } from './store/desktopNotifications';
+import { startSuperProductivitySync, startSpOpenListener } from './store/store';
+import { startBackgroundTaskWatcher } from './store/background-tasks';
 import { startPrChecksSubscription } from './store/pr-checks';
 import { startUpdateSubscription } from './store/updates';
 import { startRemoteTaskHandlers } from './store/remoteTaskHandler';
@@ -358,6 +361,7 @@ function App() {
     });
 
     const stopDocumentListeners = initDocumentListeners();
+    const stopWindowVisibilityTracking = startWindowVisibilityTracking();
     void syncWindowFocused();
     void syncWindowMaximized();
 
@@ -500,6 +504,8 @@ function App() {
           integrationPolicy: task.integrationPolicy,
           controlledBy: task.controlledBy,
           agentId: task.agentIds[0],
+          completion: task.completion,
+          reviewRevision: task.reviewRevision,
           signalDoneAt: task.signalDoneAt,
           signalDoneConsumed: task.signalDoneConsumed,
           verification: task.verification,
@@ -562,6 +568,9 @@ function App() {
     startUsagePolling();
 
     const stopNotificationWatcher = startDesktopNotificationWatcher(windowFocused);
+    const stopSuperProductivitySync = startSuperProductivitySync(windowFocused);
+    const stopSpOpenListener = startSpOpenListener();
+    const stopBackgroundTaskWatcher = startBackgroundTaskWatcher();
     const stopPrChecksSubscription = startPrChecksSubscription();
     const stopUpdateSubscription = startUpdateSubscription();
     const stopRemoteTaskHandlers = startRemoteTaskHandlers();
@@ -769,6 +778,9 @@ function App() {
       stopUsagePolling();
       stopMCPListeners();
       stopNotificationWatcher();
+      stopSuperProductivitySync();
+      stopSpOpenListener();
+      stopBackgroundTaskWatcher();
       stopPrChecksSubscription();
       stopUpdateSubscription();
       stopRemoteTaskHandlers();
@@ -776,6 +788,7 @@ function App() {
       stopAgentHookStatusListener();
       stopCanvasAutoOpen();
       stopDocumentListeners();
+      stopWindowVisibilityTracking();
       offPlanContent();
       offStepsContent();
       unlistenFocusChanged?.();

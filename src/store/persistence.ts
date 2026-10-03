@@ -1,3 +1,4 @@
+import { parseCompletionRecord } from '../../electron/shared/completion-report';
 import { delegationRequest, taskAuthorityInput } from './delegation';
 import { restoreCanvasTaskLinks } from '../lib/canvas-task-links';
 import { restoreMindMap } from '../graph/model';
@@ -20,6 +21,7 @@ import { clampCoordinatorConcurrentTasks } from '../lib/coordinator-limits';
 import { MAX_PROMPT_HISTORY } from '../lib/prompt-history';
 import { normalizeReasoningProfile } from '../investigation/profiles';
 import { restoreReasoningWorkspaces } from '../investigation/editing';
+import { isValidSpId } from '../../electron/shared/super-productivity';
 
 /** A map that fails validation is kept aside rather than crashing load or being overwritten
  *  by the next save; the user is told once. */
@@ -44,6 +46,7 @@ import type {
   Task,
   PersistedState,
   PersistedTask,
+  SuperProductivityLink,
   PersistedWindowState,
   Project,
 } from './types';
@@ -230,6 +233,14 @@ function restoredCanvas(pt: PersistedTask): Pick<Task, 'canvasTabs' | 'canvasAct
   return { canvasTabs: tabs, canvasActiveTab: active };
 }
 
+function restoreSuperProductivityLink(value: unknown): SuperProductivityLink | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { taskId, syncedTitle } = value as Record<string, unknown>;
+  return isValidSpId(taskId) && typeof syncedTitle === 'string'
+    ? { taskId, syncedTitle }
+    : undefined;
+}
+
 function validBranch(value: unknown, exclude?: string): string | undefined {
   return typeof value === 'string' && value.length > 0 && value !== exclude ? value : undefined;
 }
@@ -275,6 +286,7 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     dockerImage: task.dockerImage,
     githubUrl: task.githubUrl,
     prUrl: task.prUrl,
+    superProductivity: task.superProductivity,
     savedInitialPrompt: task.savedInitialPrompt,
     savedSelectedAgentIndex: task.savedSelectedAgentIndex,
     savedAgentSessionIds: task.savedAgentSessionIds,
@@ -302,6 +314,8 @@ function toPersistedTask(task: Task, agentDefs: AgentDef[], collapsed?: boolean)
     coordinatedBy: task.coordinatedBy,
     controlledBy: task.controlledBy,
     mcpConfigPath: task.mcpConfigPath,
+    completion: task.completion,
+    reviewRevision: task.reviewRevision,
     signalDoneReceived: task.signalDoneReceived,
     signalDoneAt: task.signalDoneAt,
     signalDoneConsumed: task.signalDoneConsumed,
@@ -324,7 +338,13 @@ function restoredVerificationRun(
   return run;
 }
 
+// The renderer can receive input while startup IPC waits for the login shell.
+// Never serialize its initial empty store over a session we have not restored.
+let stateLoaded = false;
+
 export async function saveState(): Promise<void> {
+  if (!stateLoaded) return;
+
   const persisted: PersistedState = {
     projects: store.projects.map((p) => ({ ...p })),
     lastProjectId: store.lastProjectId,
@@ -375,8 +395,7 @@ export async function saveState(): Promise<void> {
     shareDockerAgentAuth: store.shareDockerAgentAuth || undefined,
     activeCustomThemeId: store.activeCustomThemeId ?? undefined,
     appearanceMode: store.appearanceMode !== 'dark' ? store.appearanceMode : undefined,
-    lightThemePreset:
-      store.lightThemePreset !== 'islands-light' ? store.lightThemePreset : undefined,
+    lightThemePreset: store.lightThemePreset,
     lightThemeCustomId: store.lightThemeCustomId ?? undefined,
     darkThemePreset: store.darkThemePreset,
     darkThemeCustomId: store.darkThemeCustomId ?? undefined,
@@ -384,6 +403,7 @@ export async function saveState(): Promise<void> {
     documentWorkspacesEnabled: store.documentWorkspacesEnabled || undefined,
     documentFullWidth: store.documentFullWidth || undefined,
     coordinatorControlHintDismissed: store.coordinatorControlHintDismissed || undefined,
+    preferUiMode: store.preferUiMode || undefined,
     defaultStepsEnabled: store.defaultStepsEnabled || undefined,
     // Fork direction: these default ON, so an explicit `false` (opt-out) must be
     // written, not collapsed to `undefined` — load reads an absent value as the default.
@@ -580,6 +600,7 @@ interface LegacyPersistedState {
   documentWorkspacesEnabled?: unknown;
   documentFullWidth?: unknown;
   coordinatorControlHintDismissed?: unknown;
+  preferUiMode?: unknown;
   defaultStepsEnabled?: unknown;
   defaultSkipPermissions?: unknown;
   defaultPropagateSkipPermissions?: unknown;
@@ -589,9 +610,11 @@ interface LegacyPersistedState {
 }
 
 export async function loadState(): Promise<void> {
-  const json = await invoke<string | null>(IPC.LoadAppState).catch(() => null);
+  stateLoaded = false;
+  const json = await invoke<string | null>(IPC.LoadAppState);
   if (!json) {
     await delegationRequest({ action: 'orchestrationSetting', enabled: true });
+    stateLoaded = true;
     return;
   }
 
@@ -631,6 +654,9 @@ export async function loadState(): Promise<void> {
       p.coverageReportPath = undefined;
     }
     p.tasksCollapsed = typeof p.tasksCollapsed === 'boolean' ? p.tasksCollapsed : undefined;
+    p.superProductivityProjectId = isValidSpId(p.superProductivityProjectId)
+      ? p.superProductivityProjectId
+      : undefined;
     // Migrate defaultDirectMode -> defaultGitIsolation
     const legacy = p as Project & {
       defaultDirectMode?: boolean;
@@ -806,7 +832,7 @@ export async function loadState(): Promise<void> {
       s.inactiveColumnOpacity =
         typeof rawOpacity === 'number' &&
         Number.isFinite(rawOpacity) &&
-        rawOpacity >= 0.3 &&
+        rawOpacity >= 0.1 &&
         rawOpacity <= 1.0
           ? Math.round(rawOpacity * 100) / 100
           : 0.6;
@@ -846,6 +872,9 @@ export async function loadState(): Promise<void> {
         : raw.darkThemePreset === undefined && savedMode
           ? 'islands-dark'
           : defaultPresetForTone('dark');
+      // Saves before Obsidian Light omitted the slot when it held the old
+      // Islands Light default, so a missing slot keeps Islands Light. Only
+      // fresh installs (no saved state) start on defaultPresetForTone('light').
       s.lightThemePreset = isLookPreset(raw.lightThemePreset)
         ? raw.lightThemePreset
         : 'islands-light';
@@ -885,6 +914,7 @@ export async function loadState(): Promise<void> {
           : 'defaultStepsEnabled' in (raw as object)
             ? false
             : raw.showSteps === true;
+      s.preferUiMode = raw.preferUiMode === true;
       // Fork direction: skip-permissions defaults ON. A legacy/absent or invalid value
       // adopts the fork default; an explicit boolean (including a `false` opt-out) is honored.
       s.defaultSkipPermissions =
@@ -1009,6 +1039,7 @@ export async function loadState(): Promise<void> {
           dockerImage: typeof pt.dockerImage === 'string' ? pt.dockerImage : undefined,
           githubUrl: pt.githubUrl,
           prUrl: pt.prUrl,
+          superProductivity: restoreSuperProductivityLink(pt.superProductivity),
           savedInitialPrompt: pt.savedInitialPrompt,
           savedSelectedAgentIndex: validAgentIndex(pt.savedSelectedAgentIndex),
           savedPromptedAgentIndexes: validPromptedAgentIndexes(pt.savedPromptedAgentIndexes),
@@ -1042,6 +1073,11 @@ export async function loadState(): Promise<void> {
           mcpStartupStatus:
             pt.coordinatorMode || pt.coordinatedBy ? ('pending' as const) : undefined,
           mcpConfigPath: pt.mcpConfigPath,
+          completion: parseCompletionRecord(pt.completion),
+          reviewRevision:
+            Number.isSafeInteger(pt.reviewRevision) && (pt.reviewRevision ?? -1) >= 0
+              ? pt.reviewRevision
+              : undefined,
           signalDoneReceived: pt.signalDoneReceived,
           signalDoneAt: pt.signalDoneAt,
           signalDoneConsumed: pt.signalDoneConsumed,
@@ -1150,6 +1186,7 @@ export async function loadState(): Promise<void> {
           dockerImage: typeof pt.dockerImage === 'string' ? pt.dockerImage : undefined,
           githubUrl: pt.githubUrl,
           prUrl: pt.prUrl,
+          superProductivity: restoreSuperProductivityLink(pt.superProductivity),
           savedInitialPrompt: pt.savedInitialPrompt,
           savedSelectedAgentIndex: validAgentIndex(pt.savedSelectedAgentIndex),
           savedPromptedAgentIndexes: validPromptedAgentIndexes(pt.savedPromptedAgentIndexes),
@@ -1190,6 +1227,11 @@ export async function loadState(): Promise<void> {
           mcpStartupStatus:
             pt.coordinatorMode || pt.coordinatedBy ? ('pending' as const) : undefined,
           mcpConfigPath: pt.mcpConfigPath,
+          completion: parseCompletionRecord(pt.completion),
+          reviewRevision:
+            Number.isSafeInteger(pt.reviewRevision) && (pt.reviewRevision ?? -1) >= 0
+              ? pt.reviewRevision
+              : undefined,
           signalDoneReceived: pt.signalDoneReceived,
           signalDoneAt: pt.signalDoneAt,
           signalDoneConsumed: pt.signalDoneConsumed,
@@ -1282,4 +1324,5 @@ export async function loadState(): Promise<void> {
       { durationMs: NOTIFICATION_ERROR_MS },
     );
   }
+  stateLoaded = true;
 }

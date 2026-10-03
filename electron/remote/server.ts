@@ -1,10 +1,10 @@
 // electron/remote/server.ts
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
-import { existsSync, createReadStream, readFileSync, rmSync } from 'fs';
+import { existsSync, readFile, readFileSync, rmSync, statSync } from 'fs';
 import { join, resolve, relative, extname, isAbsolute } from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
-import { randomBytes, randomInt, timingSafeEqual, createHash } from 'crypto';
+import { randomBytes, randomInt, timingSafeEqual, createHash, createHmac } from 'crypto';
 import { networkInterfaces } from 'os';
 import { atomicWriteFileSync } from '../mcp/atomic.js';
 import { warn } from '../log.js';
@@ -27,6 +27,11 @@ import {
   type RemoteAgent,
   type RemoteAttentionState,
 } from './protocol.js';
+import {
+  createChatSubscriptions,
+  runRemoteChatAction,
+  type RemoteChatSource,
+} from './chat-bridge.js';
 import { parseMindMapUpdate, type MindMapDocument, type MindMapUpdate } from '../shared/mindmap.js';
 import { parseReasoningUpdate } from '../shared/reasoning-feed.js';
 import { parseCanvasView, type CanvasView } from '../shared/canvas-view.js';
@@ -37,6 +42,7 @@ import type { ReasoningUpdate } from '../shared/reasoning-state.js';
 import type { Coordinator } from '../mcp/coordinator.js';
 import { validateBranchName } from '../mcp/validation.js';
 import type { ApiTaskDetail, LandSelfInput, SubtaskVerification } from '../mcp/types.js';
+import { parseSignalDoneInput } from '../shared/completion-report.js';
 
 // --- MCP log ring buffer ---
 export interface MCPLogEntry {
@@ -261,6 +267,9 @@ interface RemoteServer {
   enableRememberedDevices: (filePath: string) => void;
   /** Revoke remembered phones while the server keeps running for canvas agents. */
   forgetRememberedDevices: () => void;
+  /** The token a coordinator's agent authenticates with; it is valid only with that task ID. */
+  coordinatorTokenFor: (coordinatorTaskId: string) => string;
+  /** App-wide coordinator credential; main process only, never written into an agent config. */
   token: string;
   subtaskToken: string;
   mobileToken: string;
@@ -312,7 +321,7 @@ function buildAgentList(
   getTaskAttention: (taskId: string) => RemoteAttentionState,
   getTaskContext?: (
     taskId: string,
-  ) => Pick<RemoteAgent, 'projectName' | 'agentName' | 'lastLine'> | undefined,
+  ) => Pick<RemoteAgent, 'projectName' | 'projectColor' | 'agentName' | 'lastLine'> | undefined,
 ): RemoteAgent[] {
   const byTask = new Map<string, RemoteAgent>();
   for (const agentId of getActiveAgentIds()) {
@@ -338,6 +347,29 @@ function buildAgentList(
     }
   }
   return Array.from(byTask.values());
+}
+
+/**
+ * Add the desktop's running chats. A chat stands in for its task's terminal
+ * entry: the terminal only takes the conversation back by ending the chat.
+ */
+function withChatAgents(
+  terminals: RemoteAgent[],
+  chats: ReturnType<RemoteChatSource['list']>,
+  describe: (taskId: string) => Omit<RemoteAgent, 'agentId' | 'taskId' | 'status' | 'exitCode'>,
+): RemoteAgent[] {
+  const chatTasks = new Set(chats.map((chat) => chat.taskId));
+  return [
+    ...terminals.filter((agent) => !chatTasks.has(agent.taskId)),
+    ...chats.map(({ agentId, taskId, status }) => ({
+      ...describe(taskId),
+      agentId,
+      taskId,
+      status,
+      exitCode: null,
+      kind: 'chat' as const,
+    })),
+  ];
 }
 
 /** Read and JSON-parse a request body with a hard size cap. */
@@ -419,9 +451,19 @@ function doneTokenMatches(req: IncomingMessage, expected: string | null | undefi
   );
 }
 
+/** Whether a phone UI path can be served; like existsSync, a failed stat means no. */
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function readJsonBody(
   req: IncomingMessage,
   maxBytes = 64 * 1024,
+  rejectMalformed = false,
 ): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -448,7 +490,8 @@ function readJsonBody(
       try {
         resolve(data ? (JSON.parse(data) as Record<string, unknown>) : {});
       } catch {
-        resolve({});
+        if (rejectMalformed) reject(new Error('Invalid JSON request body'));
+        else resolve({});
       }
     });
     req.on('error', reject);
@@ -473,9 +516,10 @@ export function createJsonReply(
 export async function readCoordinatorBody(
   req: IncomingMessage,
   jsonReply: JsonReply,
+  rejectMalformed = false,
 ): Promise<Record<string, unknown>> {
   try {
-    return await readJsonBody(req, 1_000_000);
+    return await readJsonBody(req, 1_000_000, rejectMalformed);
   } catch (err) {
     if (err instanceof Error && err.message === 'Body too large') {
       jsonReply(413, { error: 'Request body too large' });
@@ -727,9 +771,34 @@ function handleSignalDone(ctx: CoordinatorRouteContext, taskId: string): void {
       return ctx.jsonReply(403, { error: 'forbidden' });
     }
   }
-  mcpLog('info', `signal_done id=${taskId}`);
-  ctx.orch.signalDone(taskId);
-  ctx.jsonReply(200, { ok: true });
+  ctx
+    .readBody()
+    .then(async (body) => {
+      let input;
+      try {
+        input = parseSignalDoneInput(body);
+      } catch (err) {
+        return ctx.jsonReply(400, { error: String(err) });
+      }
+      const assertCurrent = () => {
+        if (!ctx.requireTask(taskId)) throw new Error('Completion task is no longer available.');
+        if (ctx.tokenClass === 'subtask' && !ctx.hasMatchingDoneToken(taskId)) {
+          ctx.jsonReply(403, { error: 'forbidden' });
+          throw new Error('Completion task ownership changed.');
+        }
+      };
+      assertCurrent();
+      mcpLog('info', `signal_done id=${taskId}`);
+      const result = await ctx.orch.signalDone(taskId, input, assertCurrent);
+      ctx.jsonReply(200, result);
+    })
+    .catch((err) => {
+      mcpLog('error', `signal_done FAIL: ${String(err)}`);
+      ctx.jsonReply(
+        err instanceof Error && err.message === 'Invalid JSON request body' ? 400 : 409,
+        { error: String(err) },
+      );
+    });
 }
 
 function handleLandSelf(ctx: CoordinatorRouteContext, taskId: string): void {
@@ -869,13 +938,26 @@ export function startRemoteServer(opts: {
   getTaskAttention?: (taskId: string) => RemoteAttentionState;
   getTaskContext?: (
     taskId: string,
-  ) => Pick<RemoteAgent, 'projectName' | 'agentName' | 'lastLine'> | undefined;
+  ) => Pick<RemoteAgent, 'projectName' | 'projectColor' | 'agentName' | 'lastLine'> | undefined;
+  /** The desktop's built-in chats; without it phones only see terminals. */
+  chats?: RemoteChatSource;
 }): Promise<RemoteServer> {
   // Defensive default for the optional signature: every real caller wires
   // attention via mobileTaskBridge, so 'idle' is only used if a future caller
   // omits it.
   const getTaskAttention: (taskId: string) => RemoteAttentionState =
     opts.getTaskAttention ?? (() => 'idle');
+  const agentList = (): RemoteAgent[] =>
+    withChatAgents(
+      buildAgentList(opts.getTaskName, opts.getAgentStatus, getTaskAttention, opts.getTaskContext),
+      opts.chats?.list() ?? [],
+      (taskId) => ({
+        taskName: opts.getTaskName(taskId),
+        lastLine: '',
+        attention: getTaskAttention(taskId),
+        ...opts.getTaskContext?.(taskId),
+      }),
+    );
   const token = randomBytes(24).toString('base64url');
   const subtaskToken = randomBytes(24).toString('base64url');
   const mobileToken = randomBytes(24).toString('base64url');
@@ -1020,6 +1102,21 @@ export function startRemoteServer(opts: {
     return classifyCandidate(extractRawToken(req));
   }
 
+  /** Each coordinator agent gets a token derived from the app secret and its own task ID. The
+   *  secret stays in the main process, so an agent cannot claim another coordinator's ID. */
+  function coordinatorTokenFor(coordinatorTaskId: string): string {
+    return createHmac('sha256', tokenBuf).update(coordinatorTaskId).digest('base64url');
+  }
+
+  /** Whether the bearer is the agent token issued to the coordinator its X-Coordinator-Id names. */
+  function isCoordinatorAgent(req: IncomingMessage, candidate: string | null): boolean {
+    const coordinatorId = req.headers['x-coordinator-id'];
+    if (typeof coordinatorId !== 'string' || !coordinatorId || !candidate) return false;
+    const expected = Buffer.from(coordinatorTokenFor(coordinatorId));
+    const buf = Buffer.from(candidate);
+    return buf.length === expected.length && timingSafeEqual(buf, expected);
+  }
+
   function generatePairingPin(): { pin: string; expiresAt: number } {
     if (stopping) throw new Error('Remote server is stopping');
     // 6-digit zero-padded PIN; single active PIN, short TTL, capped attempts.
@@ -1079,7 +1176,13 @@ export function startRemoteServer(opts: {
         res.end(JSON.stringify({ error: 'forbidden origin' }));
         return;
       }
-      const tokenClass = classifyToken(req);
+      const rawToken = extractRawToken(req);
+      // An agent's coordinator token proves its X-Coordinator-Id, so every coordinator check
+      // below may trust that header; the app-wide token never leaves the main process.
+      const coordinatorAgent = isCoordinatorAgent(req, rawToken);
+      const tokenClass: TokenClass | null = coordinatorAgent
+        ? 'coordinator'
+        : classifyCandidate(rawToken);
       if (tokenClass === null) {
         res.writeHead(401, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'unauthorized' }));
@@ -1310,6 +1413,15 @@ export function startRemoteServer(opts: {
         return jsonEnd(405, { error: 'method not allowed' });
       }
 
+      // Coordinator agents reach their own tasks and canvases, never other agents' terminals.
+      if (
+        coordinatorAgent &&
+        url.pathname !== '/api/tasks' &&
+        url.pathname !== '/api/wait-signal' &&
+        !url.pathname.startsWith('/api/tasks/')
+      )
+        return jsonEnd(403, { error: 'forbidden' });
+
       if (tokenClass === 'subtask') {
         const allowed =
           req.method === 'POST' && /^\/api\/tasks\/[^/]+\/(?:done|land)$/.test(url.pathname);
@@ -1338,12 +1450,7 @@ export function startRemoteServer(opts: {
       }
 
       if (url.pathname === '/api/agents' && req.method === 'GET') {
-        const list = buildAgentList(
-          opts.getTaskName,
-          opts.getAgentStatus,
-          getTaskAttention,
-          opts.getTaskContext,
-        );
+        const list = agentList();
         res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/json' });
         res.end(JSON.stringify(list));
         return;
@@ -1393,7 +1500,7 @@ export function startRemoteServer(opts: {
       if (orch) {
         const jsonReply = createJsonReply(res, SECURITY_HEADERS);
         const readBody = async () => {
-          const body = await readCoordinatorBody(req, jsonReply);
+          const body = await readCoordinatorBody(req, jsonReply, url.pathname.endsWith('/done'));
           if (disabledAgentRoute()) {
             jsonReply(403, { error: 'Agent orchestration is disabled in Settings > MCP.' });
             throw new Error('Agent orchestration disabled while reading the request');
@@ -1446,7 +1553,14 @@ export function startRemoteServer(opts: {
         }
 
         if (taskIdMatch) {
-          const taskId = decodeURIComponent(taskIdMatch[1]);
+          // A malformed escape (e.g. "%") throws URIError, which this handler
+          // would not catch; agent tokens reach this route.
+          let taskId: string;
+          try {
+            taskId = decodeURIComponent(taskIdMatch[1]);
+          } catch {
+            return jsonEnd(400, { error: 'invalid task id' });
+          }
           const subpath = taskIdMatch[2] ?? null;
           const taskRoute = COORDINATOR_TASK_ROUTES.find(
             (route) => route.subpath === subpath && route.method === req.method,
@@ -1474,28 +1588,37 @@ export function startRemoteServer(opts: {
     }
 
     const serveFile = (path: string, ct: string, cc: string) => {
-      const stream = createReadStream(path);
-      res.writeHead(200, {
-        ...SECURITY_HEADERS,
-        // The policy governs documents; assets only need to be served by one.
-        ...(ct.startsWith('text/html')
-          ? { 'Content-Security-Policy': buildRemoteCsp(req.headers.host) }
-          : {}),
-        'Content-Type': ct,
-        'Cache-Control': cc,
-      });
-      stream.pipe(res);
-      stream.on('error', () => {
-        if (!res.headersSent) {
-          res.writeHead(500);
+      // Electron streams ASAR entries through cached temporary extractions, which
+      // can disappear while the app is running. readFile reads the archive directly.
+      readFile(path, (error, data) => {
+        if (error) {
+          warn('remote', 'Failed to read phone UI asset', { code: error.code });
+          res.writeHead(500, {
+            ...SECURITY_HEADERS,
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-store',
+          });
+          res.end('Unable to load the phone app. Restart Parallel Code and try again.');
+          return;
         }
-        res.end();
+        res.writeHead(200, {
+          ...SECURITY_HEADERS,
+          // The policy governs documents; assets only need to be served by one.
+          ...(ct.startsWith('text/html')
+            ? { 'Content-Security-Policy': buildRemoteCsp(req.headers.host) }
+            : {}),
+          'Content-Type': ct,
+          'Cache-Control': cc,
+        });
+        res.end(data);
       });
     };
 
-    if (!existsSync(fullPath)) {
+    if (!isFile(fullPath)) {
       const indexPath = join(opts.staticDir, 'index.html');
-      if (existsSync(indexPath)) {
+      // Only app routes fall back to the page. A missing asset, such as a hashed
+      // bundle from before an update, must fail: HTML in its place breaks the import.
+      if (!extname(fullPath) && existsSync(indexPath)) {
         serveFile(indexPath, 'text/html', 'no-cache');
         return;
       }
@@ -1545,6 +1668,10 @@ export function startRemoteServer(opts: {
   const clientTokenTypes = new Map<WebSocket, 'coordinator' | 'mobile' | 'paired'>();
   const pendingSubmissions = new Map<string, ReturnType<typeof setTimeout>>();
   const authTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
+  const clientChats = new WeakMap<WebSocket, ReturnType<typeof createChatSubscriptions>>();
+  // A phone on a slow link cannot drain a full conversation every frame interval;
+  // past this backlog, chat frames wait rather than pile up in the send buffer.
+  const CHAT_SOCKET_BACKLOG_BYTES = 1024 * 1024;
 
   function broadcast(msg: ServerMessage): void {
     const json = JSON.stringify(msg);
@@ -1556,22 +1683,18 @@ export function startRemoteServer(opts: {
   }
 
   const unsubSpawn = onPtyEvent('spawn', () => {
-    const list = buildAgentList(
-      opts.getTaskName,
-      opts.getAgentStatus,
-      getTaskAttention,
-      opts.getTaskContext,
-    );
+    const list = agentList();
     broadcast({ type: 'agents', list });
   });
 
+  const unsubChats =
+    opts.chats?.onChange(() => {
+      broadcast({ type: 'agents', list: agentList() });
+      for (const client of wss.clients) clientChats.get(client)?.rebind();
+    }) ?? (() => {});
+
   const unsubListChanged = onPtyEvent('list-changed', () => {
-    const list = buildAgentList(
-      opts.getTaskName,
-      opts.getAgentStatus,
-      getTaskAttention,
-      opts.getTaskContext,
-    );
+    const list = agentList();
     broadcast({ type: 'agents', list });
   });
 
@@ -1584,30 +1707,31 @@ export function startRemoteServer(opts: {
       clientSubs.get(client)?.delete(agentId);
     }
     setTimeout(() => {
-      const list = buildAgentList(
-        opts.getTaskName,
-        opts.getAgentStatus,
-        getTaskAttention,
-        opts.getTaskContext,
-      );
+      const list = agentList();
       broadcast({ type: 'agents', list });
     }, 100);
   });
 
   wss.on('connection', (ws, req) => {
     clientSubs.set(ws, new Map());
+    if (opts.chats)
+      clientChats.set(
+        ws,
+        createChatSubscriptions(
+          opts.chats,
+          (message) => {
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+          },
+          () => ws.bufferedAmount > CHAT_SOCKET_BACKLOG_BYTES,
+        ),
+      );
 
     // Support legacy URL-based auth (verifyClient accepted all connections).
     // Only coordinator token grants WS access; subtask and mobile tokens are denied.
     if (classifyToken(req) === 'coordinator') {
       authenticatedClients.add(ws);
       clientTokenTypes.set(ws, 'coordinator');
-      const list = buildAgentList(
-        opts.getTaskName,
-        opts.getAgentStatus,
-        getTaskAttention,
-        opts.getTaskContext,
-      );
+      const list = agentList();
       ws.send(JSON.stringify({ type: 'agents', list } satisfies ServerMessage));
     } else {
       // Close unauthenticated connections after 5 seconds. Distinct code from
@@ -1635,12 +1759,7 @@ export function startRemoteServer(opts: {
           clientTokenTypes.set(ws, tokenType);
           const timer = authTimers.get(ws);
           if (timer) clearTimeout(timer);
-          const list = buildAgentList(
-            opts.getTaskName,
-            opts.getAgentStatus,
-            getTaskAttention,
-            opts.getTaskContext,
-          );
+          const list = agentList();
           ws.send(JSON.stringify({ type: 'agents', list } satisfies ServerMessage));
         } else {
           ws.close(4001, 'Unauthorized');
@@ -1661,7 +1780,11 @@ export function startRemoteServer(opts: {
       // read the pairing PIN off the desktop screen. Resize (desktop owns the
       // geometry) and kill stay coordinator-only.
       const tokenType = clientTokenTypes.get(ws);
-      if (msg.type === 'input' && tokenType !== 'coordinator' && tokenType !== 'paired') {
+      if (
+        (msg.type === 'input' || msg.type === 'chat-action') &&
+        tokenType !== 'coordinator' &&
+        tokenType !== 'paired'
+      ) {
         ws.close(4003, 'Pairing required');
         return;
       }
@@ -1671,6 +1794,38 @@ export function startRemoteServer(opts: {
       }
 
       switch (msg.type) {
+        case 'chat-subscribe':
+          clientChats.get(ws)?.subscribe(msg.agentId);
+          break;
+
+        case 'chat-unsubscribe':
+          clientChats.get(ws)?.unsubscribe(msg.agentId);
+          break;
+
+        case 'chat-action': {
+          const reply = (ok: boolean, error?: string) => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            ws.send(
+              JSON.stringify({
+                type: 'input-result',
+                requestId: msg.requestId,
+                ok,
+                error,
+              } satisfies ServerMessage),
+            );
+          };
+          if (!opts.chats) {
+            reply(false, 'Chat is not available from this computer.');
+            break;
+          }
+          runRemoteChatAction(opts.chats, msg).then(
+            () => reply(true),
+            (error: unknown) =>
+              reply(false, error instanceof Error ? error.message : String(error)),
+          );
+          break;
+        }
+
         case 'input': {
           const reply = (ok: boolean, error?: string) => {
             if (msg.requestId && ws.readyState === WebSocket.OPEN) {
@@ -1813,6 +1968,7 @@ export function startRemoteServer(opts: {
           unsubscribeFromAgent(agentId, cb);
         }
       }
+      clientChats.get(ws)?.dispose();
     });
   });
 
@@ -1854,6 +2010,7 @@ export function startRemoteServer(opts: {
           : [],
       ),
     hasCanvasAgents: () => [...canvasAgents].some(canvasActive),
+    coordinatorTokenFor,
     token,
     subtaskToken,
     mobileToken,
@@ -1933,6 +2090,7 @@ export function startRemoteServer(opts: {
         unsubSpawn();
         unsubExit();
         unsubListChanged();
+        unsubChats();
         for (const client of wss.clients) client.close();
         wss.close();
         const timeout = setTimeout(() => resolve(), 5_000);
@@ -1949,6 +2107,7 @@ export function startRemoteServer(opts: {
       unsubSpawn();
       unsubExit();
       unsubListChanged();
+      unsubChats();
       wss.close();
       reject(toFriendlyListenError(err, opts.port));
     };

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { IPC } from '../../electron/ipc/channels';
+import { CANVAS_INSTRUCTIONS } from '../../electron/shared/canvas-view';
 import { expectDefined, type MockStoreHarness } from './test-helpers';
 
 // Hoisted so these refs are available both in vi.mock() factories and in test bodies.
@@ -18,6 +19,7 @@ const core = vi.hoisted(() => ({
         projects: { id: string; path: string; tasksCollapsed?: boolean }[];
         availableAgents: unknown[];
         defaultStepsEnabled: boolean;
+        preferUiMode: boolean;
       }>
     | undefined,
 }));
@@ -81,6 +83,7 @@ vi.mock('./core', async () => {
       mockProjects = next;
     },
     availableAgents: [],
+    preferUiMode: false,
     get agentEnvFiles() {
       return mockAgentEnvFiles;
     },
@@ -136,6 +139,11 @@ vi.mock('../lib/github-url', () => ({
   parseGitHubUrl: vi.fn(),
   taskNameFromGitHubUrl: vi.fn(),
 }));
+vi.mock('./superProductivity', () => ({
+  armSpCompletion: vi.fn(),
+  fireSpCompletion: vi.fn(),
+  onTaskRenamed: vi.fn(),
+}));
 
 vi.stubGlobal('window', {
   electron: {
@@ -175,7 +183,9 @@ import {
   createAgentRecord,
   selectActiveNeighborAfterRemoval,
   setTaskSkipPermissions,
+  updateTaskName,
 } from './tasks';
+import { armSpCompletion, fireSpCompletion, onTaskRenamed } from './superProductivity';
 import { updateTaskBranch } from './task-branch';
 import { getCoordinatorChildren } from './sidebar-order';
 import { recordMergedLines, recordTaskMerged } from './completion';
@@ -457,6 +467,40 @@ describe('MCP_TaskCreated IPC handler', () => {
   it('stores the backend-owned initial prompt for display and restart hydration', () => {
     taskCreatedHandler({ ...baseEvent, prompt: 'do the work' });
     expect(mockTasks['sub-task-1'].initialPrompt).toBe('do the work');
+  });
+
+  it('preserves completion metadata when adopting an existing backend task', () => {
+    const completion = {
+      id: '11111111-1111-4111-8111-111111111111',
+      completedAt: '2026-09-26T10:00:00.000Z',
+      reviewRevision: 4,
+      snapshotState: 'unknown',
+      result: { summary: 'Already completed' },
+    };
+    // A completion sync can arrive while native startup has not adopted the task yet.
+    taskStateSyncHandler({
+      taskId: baseEvent.taskId,
+      completion,
+      signalDoneReceived: true,
+      signalDoneAt: completion.completedAt,
+      signalDoneConsumed: true,
+    });
+    expect(mockTasks[baseEvent.taskId]).toBeUndefined();
+    taskCreatedHandler({
+      ...baseEvent,
+      completion,
+      reviewRevision: 4,
+      signalDoneReceived: true,
+      signalDoneAt: completion.completedAt,
+      signalDoneConsumed: true,
+    });
+    expect(mockTasks['sub-task-1'].completion).toEqual(completion);
+    expect(mockTasks['sub-task-1'].reviewRevision).toBe(4);
+    expect(mockTasks['sub-task-1'].signalDoneReceived).toBe(true);
+    expect(mockTasks['sub-task-1'].signalDoneAt).toBe(completion.completedAt);
+    expect(mockTasks['sub-task-1'].signalDoneConsumed).toBe(true);
+    taskCreatedHandler(baseEvent);
+    expect(mockTasks['sub-task-1'].completion).toEqual(completion);
   });
 
   it('regression: sub-tasks must not be created without controlledBy defined', () => {
@@ -893,6 +937,36 @@ describe('MCP startup status transitions', () => {
     expect(mockTasks['child-b'].mcpLaunchArgs).toEqual(['--mcp-config', '/tmp/child-b.json']);
   });
 
+  it('passes the saved completion and revision when hydrating a coordinated child', async () => {
+    const completion = {
+      id: '11111111-1111-4111-8111-111111111111',
+      completedAt: '2026-09-26T10:00:00.000Z',
+      reviewRevision: 4,
+      snapshotState: 'unknown',
+      result: { summary: 'Already completed' },
+    };
+    mockTasks['coord-1'] = { agentIds: [], shellAgentIds: [], mcpStartupStatus: 'ready' };
+    mockTasks['child-1'] = {
+      id: 'child-1',
+      agentIds: [],
+      shellAgentIds: [],
+      coordinatedBy: 'coord-1',
+      projectId: 'proj-1',
+      gitIsolation: 'worktree',
+      worktreePath: '/repo/.worktrees/child-1',
+      branchName: 'task/child-1',
+      completion,
+      reviewRevision: 4,
+    };
+    mockInvoke.mockResolvedValueOnce({ mcpLaunchArgs: ['--mcp-config', '/tmp/child.json'] });
+    await retryTaskMcpStartup('child-1');
+    expect(mockInvoke).toHaveBeenCalledWith(
+      IPC.MCP_HydrateCoordinatedTask,
+      expect.objectContaining({ id: 'child-1', completion, reviewRevision: 4 }),
+    );
+    expect(mockTasks['child-1'].completion).toEqual(completion);
+  });
+
   it('retry of child when coordinator is in error surfaces dependency message', async () => {
     mockTasks['coord-1'] = {
       agentIds: [],
@@ -1008,7 +1082,7 @@ describe('createTask delegation options', () => {
       autoMergeChildren: false,
       autoSendChildUpdates: false,
       propagateSkipPermissions: false,
-      maxConcurrentTasks: 3,
+      maxConcurrentTasks: 4,
     });
   });
 });
@@ -1072,7 +1146,7 @@ describe('createTask does not mutate defaultStepsEnabled', () => {
 // pane launches on the positional default, which means "the newest session in
 // this worktree" — so as soon as a second pane exists, pane one resumes pane
 // two's conversation. That silent swap is the whole reason ids exist.
-describe('createTask assigns the first pane a session id', () => {
+describe('createTask initial agent state', () => {
   function agentDef(command: string) {
     return {
       id: 'agent-def',
@@ -1089,6 +1163,7 @@ describe('createTask assigns the first pane a session id', () => {
     vi.clearAllMocks();
     const harness = expectDefined(core.harness, 'mock store harness');
     harness.reset(harness.state());
+    harness.store.preferUiMode = false;
     mockTasks = {};
     mockAgents = {};
     mockTaskOrder = [];
@@ -1141,6 +1216,32 @@ describe('createTask assigns the first pane a session id', () => {
     await creating;
     expect(mockTasks['task-1']).toBeDefined();
   });
+
+  it.each([
+    ['codex', true, false, 'chat'],
+    ['claude-code', true, false, 'chat'],
+    ['codex', false, false, undefined],
+    ['claude-code', false, false, undefined],
+    ['custom-agent', true, false, undefined],
+    ['codex', true, true, undefined],
+    ['claude-code', true, true, undefined],
+  ] as const)(
+    'initial view for %s (prefer UI: %s, Docker: %s) is %s',
+    async (id, preferUiMode, dockerMode, expected) => {
+      const harness = expectDefined(core.harness, 'mock store harness');
+      harness.store.preferUiMode = preferUiMode;
+      await createTask({
+        name: 'My Task',
+        agentDef: { ...agentDef(id === 'claude-code' ? 'claude' : id), id },
+        projectId: 'proj-1',
+        gitIsolation: 'worktree',
+        baseBranch: 'main',
+        dockerMode,
+      });
+      expect(mockTasks['task-1'].mainAgentView).toBe(expected);
+      harness.store.preferUiMode = false;
+    },
+  );
 
   it('gives the first Claude pane an id of its own', async () => {
     const task = await createWith('claude');
@@ -1366,6 +1467,15 @@ describe('sendPrompt', () => {
     },
   );
 
+  it('does not repeat canvas guidance the prompt already carries', async () => {
+    mockAgents['agent-1'] = { status: 'running', canvasTools: true, generation: 1 };
+    const prompt = `why was this sent?\n\n---\n${CANVAS_INSTRUCTIONS}`;
+
+    await sendPrompt('task-1', 'agent-1', prompt);
+
+    expect(writePayloads()[1]).toBe(prompt);
+  });
+
   it('leaves unrelated prompts unchanged when canvas tools are available', async () => {
     mockAgents['agent-1'] = { status: 'running', canvasTools: true };
 
@@ -1415,31 +1525,60 @@ describe('sendPrompt', () => {
     };
     mockTasks['task-1'].agentIds = ['agent-1'];
     mockTasks['task-1'].mainAgentView = 'chat';
-    const deliver = vi.fn(async () => undefined);
-    await sendPrompt('task-1', 'agent-1', 'Create a mind map', { sendChat: deliver });
-    expect(deliver).toHaveBeenLastCalledWith(expect.stringContaining('canvas_open'));
+    const sentText = () => (mockInvoke.mock.lastCall?.[1] as { text: string }).text;
+    await sendPrompt('task-1', 'agent-1', 'Create a mind map');
+    expect(sentText()).toContain('canvas_open');
     expect(mockTasks['task-1'].lastPrompt).toBe('Create a mind map');
     items.push({ kind: 'user', text: 'Create a mind map' });
-    await sendPrompt('task-1', 'agent-1', 'Continue', { sendChat: deliver });
-    expect(deliver).toHaveBeenLastCalledWith('Continue');
+    await sendPrompt('task-1', 'agent-1', 'Continue');
+    expect(sentText()).toBe('Continue');
   });
 
-  it('delivers through the chat runtime with steps and records only accepted prompts', async () => {
+  it('supplies canvas guidance to chat only when a prompt mentions a canvas, once per session', async () => {
+    const items: { kind: 'user'; text: string }[] = [];
+    mockAgents = {
+      'agent-1': {
+        status: 'running',
+        def: { id: 'codex' },
+        canvasTools: true,
+        generation: 2,
+        chatState: { items },
+      },
+    };
+    mockTasks['task-1'].agentIds = ['agent-1'];
+    mockTasks['task-1'].mainAgentView = 'chat';
+    const sentText = () => (mockInvoke.mock.lastCall?.[1] as { text: string }).text;
+
+    await sendPrompt('task-1', 'agent-1', 'fix the typo');
+    expect(sentText()).toBe('fix the typo');
+    items.push({ kind: 'user', text: 'fix the typo' });
+
+    await sendPrompt('task-1', 'agent-1', 'now show it in a mind map');
+    expect(sentText()).toContain('mindmap_read and mindmap_update');
+
+    await sendPrompt('task-1', 'agent-1', 'update the mind map');
+    expect(sentText()).toBe('update the mind map');
+  });
+
+  it('delivers chat images with steps and records only accepted prompts', async () => {
     mockAgents = { 'agent-1': { status: 'running', def: { id: 'codex' } } };
     mockTasks['task-1'].agentIds = ['agent-1'];
     mockTasks['task-1'].mainAgentView = 'chat';
     mockTasks['task-1'].stepsEnabled = true;
-    const deliver = vi.fn(async () => undefined);
-    deliver.mockRejectedValueOnce(new Error('Disconnected'));
-    await expect(
-      sendPrompt('task-1', 'agent-1', 'hello chat', { sendChat: deliver }),
-    ).rejects.toThrow('Disconnected');
+    const images = [{ name: 'shot.png', mediaType: 'image/png' as const, data: 'AAAA' }];
+    mockInvoke.mockRejectedValueOnce(new Error('Disconnected'));
+    await expect(sendPrompt('task-1', 'agent-1', 'hello chat', { images })).rejects.toThrow(
+      'Disconnected',
+    );
     expect(mockTasks['task-1'].lastPrompt).toBe('');
-    await sendPrompt('task-1', 'agent-1', 'hello chat', { sendChat: deliver });
-    expect(deliver).toHaveBeenLastCalledWith(expect.stringContaining('hello chat'));
-    expect(deliver).toHaveBeenLastCalledWith(expect.stringContaining('For active statuses'));
+    await sendPrompt('task-1', 'agent-1', 'hello chat', { images });
+    expect(mockInvoke).toHaveBeenLastCalledWith(IPC.AgentChat, {
+      action: 'send',
+      agentId: 'agent-1',
+      text: expect.stringContaining('For active statuses'),
+      images,
+    });
     expect(mockTasks['task-1'].lastPrompt).toBe('hello chat');
-    expect(mockInvoke).not.toHaveBeenCalledWith(IPC.AgentChat, expect.anything());
     expect(writePayloads()).toEqual([]);
   });
 
@@ -1730,6 +1869,94 @@ describe('closeTask — IPC cleanup ordering', () => {
   });
 });
 
+describe('Super Productivity completion wiring', () => {
+  const worktreeTask = () => ({
+    agentIds: [],
+    shellAgentIds: [],
+    gitIsolation: 'worktree',
+    projectId: 'proj-1',
+    branchName: 'task/task-1',
+    worktreePath: '/repo/.worktrees/task-1',
+    baseBranch: 'main',
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const harness = expectDefined(core.harness, 'mock store harness');
+    harness.reset(harness.state());
+    vi.mocked(getProjectPath).mockReturnValue('/repo');
+    mockProjects = [{ id: 'proj-1', path: '/repo' }];
+    mockInvoke.mockImplementation((channel: string) =>
+      Promise.resolve(
+        channel === IPC.MergeTask ? { lines_added: 10, lines_removed: 2 } : undefined,
+      ),
+    );
+  });
+
+  it('arms a merged completion on merge with cleanup and fires it on removal', async () => {
+    mockTasks['task-1'] = worktreeTask();
+    await mergeTask('task-1', { cleanup: true });
+    expect(armSpCompletion).toHaveBeenCalledWith('task-1', {
+      kind: 'merged',
+      linesAdded: 10,
+      linesRemoved: 2,
+    });
+    expect(fireSpCompletion).toHaveBeenCalledWith('task-1');
+  });
+
+  it('does not complete anything for a merge that keeps the task', async () => {
+    mockTasks['task-1'] = worktreeTask();
+    await mergeTask('task-1', { cleanup: false });
+    expect(armSpCompletion).not.toHaveBeenCalled();
+    expect(fireSpCompletion).not.toHaveBeenCalled();
+  });
+
+  it('closeTask fires on removal but never arms by itself (project removal relies on this)', async () => {
+    mockTasks['task-1'] = worktreeTask();
+    await closeTask('task-1');
+    expect(armSpCompletion).not.toHaveBeenCalled();
+    expect(fireSpCompletion).toHaveBeenCalledWith('task-1');
+  });
+
+  it('a subtask the coordinator closes or lands is completed', () => {
+    const closedHandler = expectDefined(ipcHandlers.get(IPC.MCP_TaskClosed), 'closed handler');
+    // The removal also clears the task's git status entry.
+    Object.assign(expectDefined(core.harness, 'mock store harness').store, { taskGitStatus: {} });
+    mockTasks['child-1'] = { ...worktreeTask(), coordinatedBy: 'coord-1' };
+    mockTasks['child-2'] = { ...worktreeTask(), coordinatedBy: 'coord-1' };
+    closedHandler({ taskId: 'child-1' });
+    // What the coordinator sends after land_self or merge_task with cleanup.
+    closedHandler({ taskId: 'child-2', merged: { linesAdded: 4, linesRemoved: 1 } });
+    expect(armSpCompletion).toHaveBeenCalledWith('child-1', { kind: 'closed' });
+    expect(armSpCompletion).toHaveBeenCalledWith('child-2', {
+      kind: 'merged',
+      linesAdded: 4,
+      linesRemoved: 1,
+    });
+    expect(fireSpCompletion).toHaveBeenCalledWith('child-1');
+    expect(fireSpCompletion).toHaveBeenCalledWith('child-2');
+  });
+
+  it('a subtask that merged earlier and is closed later still counts as merged', () => {
+    const closedHandler = expectDefined(ipcHandlers.get(IPC.MCP_TaskClosed), 'closed handler');
+    Object.assign(expectDefined(core.harness, 'mock store harness').store, { taskGitStatus: {} });
+    // approve-and-merge, or a land whose cleanup failed, then a plain close.
+    mockTasks['child-3'] = {
+      ...worktreeTask(),
+      coordinatedBy: 'coord-1',
+      landingState: 'landed_cleanup_failed',
+    };
+    closedHandler({ taskId: 'child-3' });
+    expect(armSpCompletion).toHaveBeenCalledWith('child-3', { kind: 'merged' });
+  });
+
+  it('a rename is passed on', () => {
+    mockTasks['task-1'] = worktreeTask();
+    updateTaskName('task-1', 'Renamed');
+    expect(onTaskRenamed).toHaveBeenCalledWith('task-1');
+  });
+});
+
 describe('recordTaskMerged counts merges with cleanup, not closures', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1881,6 +2108,47 @@ describe('MCP_TaskStateSync listener', () => {
 
     taskStateSyncHandler({ taskId: 'task-1', verificationRun: null });
     expect(mockTasks['task-1'].verificationRun).toBeUndefined();
+  });
+
+  it('replaces completion packets and clears omitted optional fields without resurrecting reports', () => {
+    const base = {
+      id: '11111111-1111-4111-8111-111111111111',
+      completedAt: '2026-09-26T10:00:00.000Z',
+      reviewRevision: 1,
+      snapshotState: 'clean',
+    };
+    taskStateSyncHandler({
+      taskId: 'task-1',
+      completion: {
+        ...base,
+        sourceCommit: 'a'.repeat(40),
+        result: { summary: 'Old report', artifacts: [{ path: 'old.txt' }] },
+      },
+      reviewRevision: 1,
+    });
+    expect(mockTasks['task-1'].completion).toHaveProperty('result.summary', 'Old report');
+
+    const next = {
+      ...base,
+      id: '22222222-2222-4222-8222-222222222222',
+      reviewRevision: 2,
+      snapshotState: 'unknown',
+    };
+    taskStateSyncHandler({ taskId: 'task-1', completion: next, reviewRevision: 2 });
+    expect(mockTasks['task-1'].completion).toEqual(next);
+    expect(mockTasks['task-1'].reviewRevision).toBe(2);
+    expect(vi.mocked(saveState)).toHaveBeenCalled();
+
+    taskStateSyncHandler({ taskId: 'task-1', completion: null });
+    expect(mockTasks['task-1'].completion).toBeUndefined();
+    taskStateSyncHandler({ taskId: 'task-1', needsReview: false });
+    expect(mockTasks['task-1'].completion).toBeUndefined();
+  });
+
+  it('drops malformed completion packets rather than retaining an older report', () => {
+    mockTasks['task-1'].completion = { result: { summary: 'Old report' } };
+    taskStateSyncHandler({ taskId: 'task-1', completion: { id: 'invalid' } });
+    expect(mockTasks['task-1'].completion).toBeUndefined();
   });
 
   it('stores automation write lock sync fields', () => {

@@ -421,7 +421,13 @@ it('hands off once Claude reports its turn over, though the screen is still redr
   // The TUI keeps repainting its footer after `Stop`; the output heuristic
   // alone reads that as work for another 15 seconds.
   markAgentOutput('agent', new TextEncoder().encode('Worked for 12s\r\n? for shortcuts\r\n'));
-  applyAgentHookEvent({ agentId: 'agent', taskId: 'task', state: 'done', event: 'Stop', at: 1 });
+  applyAgentHookEvent({
+    agentId: 'agent',
+    taskId: 'task',
+    state: 'done',
+    event: 'Stop',
+    at: Date.now(),
+  });
   mount();
   clickChat();
   expect(host.querySelector('[role="alert"]')).toBeNull();
@@ -436,7 +442,7 @@ it('keeps the terminal while Claude reports a turn in flight, though the screen 
     taskId: 'task',
     state: 'working',
     event: 'UserPromptSubmit',
-    at: 1,
+    at: Date.now(),
   });
   mount();
   clickChat();
@@ -617,4 +623,69 @@ it('refreshes the linked session after the user changes conversations in Termina
     last_output: ['To continue this session, run:', `  codex resume ${id}`],
   });
   expect(store.tasks.task.codexChatHandoff).toEqual({ threadId: id });
+});
+
+it('copies the raw Markdown of a file opened in the viewer', async () => {
+  const writeText = vi.fn(async (_text: string) => undefined);
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+  mocks.invoke.mockImplementation(async (channel?: unknown) =>
+    channel === IPC.ReadFileText ? '# Notes\n\n- one' : undefined,
+  );
+  mount();
+  const terminalProps = mocks.terminalMounts.mock.calls[0]?.[0] as {
+    onFileLink?: (filePath: string) => void;
+  };
+  terminalProps.onFileLink?.('/worktree/NOTES.md');
+
+  await vi.waitFor(() => {
+    expect(document.querySelector('[role="dialog"] [title="Copy Markdown"]')).not.toBeNull();
+  });
+  document.querySelector<HTMLButtonElement>('[role="dialog"] [title="Copy Markdown"]')?.click();
+
+  expect(writeText).toHaveBeenCalledWith('# Notes\n\n- one');
+  await vi.waitFor(() => {
+    expect(document.querySelector('[role="dialog"] [title="Copied"]')).not.toBeNull();
+  });
+});
+
+it('logs why copying the Markdown failed', async () => {
+  const writeText = vi.fn(async (_text: string) => {
+    throw new DOMException('Document is not focused.', 'NotAllowedError');
+  });
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+  const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  mocks.invoke.mockImplementation(async (channel?: unknown) =>
+    channel === IPC.ReadFileText ? '# Notes' : undefined,
+  );
+  try {
+    mount();
+    const terminalProps = mocks.terminalMounts.mock.calls[0]?.[0] as {
+      onFileLink?: (filePath: string) => void;
+    };
+    terminalProps.onFileLink?.('/worktree/NOTES.md');
+    await vi.waitFor(() => {
+      expect(document.querySelector('[role="dialog"] [title="Copy Markdown"]')).not.toBeNull();
+    });
+    document.querySelector<HTMLButtonElement>('[role="dialog"] [title="Copy Markdown"]')?.click();
+    await vi.waitFor(() => {
+      expect(JSON.stringify(consoleWarn.mock.calls)).toContain('Document is not focused.');
+    });
+  } finally {
+    consoleWarn.mockRestore();
+  }
+});
+
+it('starts a task in Chat without mounting a terminal and still allows switching', async () => {
+  setStore('tasks', 'task', 'mainAgentView', 'chat');
+  mount();
+  await vi.waitFor(() =>
+    expect(mocks.invoke).toHaveBeenCalledWith(
+      IPC.AgentChat,
+      expect.objectContaining({ action: 'start', agentId: 'agent' }),
+    ),
+  );
+  expect(mocks.terminalMounts).not.toHaveBeenCalled();
+  clickTerminal();
+  await vi.waitFor(() => expect(mocks.terminalMounts).toHaveBeenCalled());
+  expect(store.tasks.task.mainAgentView).toBe('terminal');
 });

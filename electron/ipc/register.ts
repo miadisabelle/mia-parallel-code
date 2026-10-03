@@ -4,11 +4,18 @@ import fs from 'fs';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { IPC } from './channels.js';
-import { DelegationService } from '../mcp/delegation.js';
-import type { TaskAuthorityInput } from '../shared/delegation-types.js';
-import { startAgentChat, getAgentChat, stopAgentChat, releaseChat } from '../chat/sessions.js';
-import { getChatConnection } from '../chat/protocol.js';
-import { isChatDecision, isChatPermissionMode } from '../shared/agent-chat-types.js';
+import { getAgentActivitySnapshot } from '../agent-hooks/observations.js';
+import {
+  startAgentChat,
+  getAgentChat,
+  stopAgentChat,
+  releaseChat,
+  listTaskChats,
+  findAgentChat,
+  onAgentChatsChanged,
+} from '../chat/sessions.js';
+import { runChatAction } from '../chat/actions.js';
+import { isChatPermissionMode } from '../shared/agent-chat-types.js';
 import {
   buildPtySpawnEnv,
   validateCommand,
@@ -16,6 +23,7 @@ import {
   handoffClaudeTerminal,
 } from './pty.js';
 import { loadEnvFile } from './env-file.js';
+import { editorGotoArgs, spawnDetached, validateEditorCommand } from './open-file.js';
 import { appendGitInfoExcludeBlock } from './git-exclude.js';
 import {
   spawnAgent,
@@ -34,7 +42,6 @@ import {
   buildDockerImage,
   resolveProjectDockerfile,
   projectImageTag,
-  onPtyEvent,
 } from './pty.js';
 import {
   ensurePlansDirectory,
@@ -108,6 +115,10 @@ import {
   getUncommittedFileDiffs,
 } from './git.js';
 import { createTask, deleteTask } from './tasks.js';
+import { settleWorktreeIntents } from './worktree-intents.js';
+import { windowNotifier } from './window-notifier.js';
+import { createMcpRuntime } from './mcp-runtime.js';
+import { getDockerMcpServerDestPath, hostMcpServerPath } from './mcp-paths.js';
 import { listAgents } from './agents.js';
 import {
   saveAppState,
@@ -124,7 +135,6 @@ import {
   downloadUpdate,
   quitAndInstallUpdate,
 } from './updater.js';
-import { spawn } from 'child_process';
 import { askAboutCode, cancelAskAboutCode } from './ask-code.js';
 import { setMinimaxApiKey } from './ask-code-minimax.js';
 import { isStructuredPurpose } from './ask-code-purpose.js';
@@ -144,6 +154,7 @@ import {
   validatePath,
 } from './validate.js';
 import { registerDocumentHandlers } from '../documents/register.js';
+import { registerSuperProductivityHandlers } from '../super-productivity/register.js';
 import { listSessionsForCwd } from '../sessions/scan.js';
 import { validateBranchName as sharedValidateBranchName, validateUUID } from '../mcp/validation.js';
 import { debug as logDebug, warn as logWarn, errMessage } from '../log.js';
@@ -152,14 +163,6 @@ import { redactServerUrl } from '../remote/server.js';
 
 export function selectMcpJsonDir(worktreePath: string | undefined, projectRoot: string): string {
   return worktreePath ?? projectRoot;
-}
-
-/** Path where `mcp-server.cjs` is copied inside the Docker-mounted worktree. */
-export function getDockerMcpServerDestPath(
-  worktreePath: string | undefined,
-  projectRoot: string,
-): string {
-  return path.join(worktreePath ?? projectRoot, '.parallel-code', 'mcp-server.cjs');
 }
 
 export interface CoordinatorMCPConfigOpts {
@@ -199,22 +202,6 @@ export function buildCoordinatorMCPConfig(opts: CoordinatorMCPConfigOpts): {
       },
     },
   };
-}
-
-async function startRemoteServerOnFreePort(
-  start: number,
-  end: number,
-  opts: Omit<Parameters<typeof startRemoteServer>[0], 'port'>,
-): Promise<Awaited<ReturnType<typeof startRemoteServer>>> {
-  for (let port = start; port <= end; port++) {
-    try {
-      return await startRemoteServer({ ...opts, port });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE' && port < end) continue;
-      throw err;
-    }
-  }
-  throw new Error(`No free port found in range ${start}–${end}`);
 }
 
 function isMissingCommandError(err: unknown, command: string): boolean {
@@ -454,6 +441,8 @@ function createThrottledForwarder(
  * git-exclude a generated file must not block coordinator startup.
  */
 export function registerAllHandlers(win: BrowserWindow): void {
+  const notify = windowNotifier(win);
+  ipcMain.handle(IPC.AgentHookSnapshot, () => getAgentActivitySnapshot());
   ipcMain.handle(IPC.AgentChat, async (_event, args: Record<string, unknown>) => {
     assertString(args.agentId, 'agentId');
     assertString(args.action, 'action');
@@ -497,6 +486,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         {
           provider: args.provider,
           agentId: args.agentId,
+          taskId,
           command: args.command,
           cwd: args.cwd as string,
           threadId: args.threadId,
@@ -521,17 +511,17 @@ export function registerAllHandlers(win: BrowserWindow): void {
             } catch (error) {
               console.warn('Could not remove chat canvas credentials:', error);
             }
-            void stopIdleMcpTransport().catch((error) =>
-              console.warn('[MCP] Could not stop the idle chat transport:', error),
-            );
+            void transport
+              .stopIfIdle()
+              .catch((error) =>
+                console.warn('[MCP] Could not stop the idle chat transport:', error),
+              );
           };
           try {
-            const server = await ensureMcpTransport(false);
+            const server = await transport.ensureForMcp(false);
             const token = server.registerCanvasAgent(taskId, canvasId, () => active);
             unregister = () => server.unregisterCanvasAgent(canvasId);
-            const serverPath = path
-              .join(path.dirname(fileURLToPath(import.meta.url)), '..', 'mcp-server.cjs')
-              .replace('/app.asar/', '/app.asar.unpacked/');
+            const serverPath = hostMcpServerPath();
             const launchArgs = prepareCanvasMcpArgs({
               command,
               taskId,
@@ -551,8 +541,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
       );
       try {
         ensurePlansDirectory(args.cwd as string);
-        startPlanWatcher(win, args.taskId, args.cwd as string);
-        if (args.stepsEnabled) startStepsWatcher(win, args.taskId, args.cwd as string);
+        startPlanWatcher(notify, args.taskId, args.cwd as string);
+        if (args.stepsEnabled) startStepsWatcher(notify, args.taskId, args.cwd as string);
       } catch (err) {
         console.warn('Failed to start chat plan/steps watchers:', err);
       }
@@ -565,47 +555,24 @@ export function registerAllHandlers(win: BrowserWindow): void {
       return;
     }
     const chat = getAgentChat(args.agentId);
-    if (args.action === 'connection') return getChatConnection(chat);
     if (args.action === 'setPermissionMode') {
       if (!isChatPermissionMode(args.permissionMode)) throw new Error('Invalid permission mode.');
       if (!chat.setPermissionMode) throw new Error('This agent cannot change its permission mode.');
       return chat.setPermissionMode(args.permissionMode);
     }
-    if (args.action === 'models') return chat.loadModels();
-    if (args.action === 'selectModel') {
-      assertString(args.model, 'model');
-      assertOptionalString(args.reasoningEffort, 'reasoningEffort');
-      return chat.selectModel(args.model, args.reasoningEffort);
-    }
-    if (args.action === 'send') {
-      assertString(args.text, 'text');
-      if (!args.text.trim() || args.text.length > 100_000)
-        throw new Error('Enter a message of at most 100,000 characters.');
-      return chat.send(args.text);
-    }
-    if (args.action === 'interrupt') return chat.interrupt();
-    if (args.action === 'respond') {
-      if (typeof args.requestId !== 'string' && typeof args.requestId !== 'number')
-        throw new Error('Invalid request ID.');
-      if (!isChatDecision(args.decision)) throw new Error('Invalid approval decision.');
-      let answers: Record<string, string> | undefined;
-      if (args.answers !== undefined) {
-        if (!args.answers || typeof args.answers !== 'object' || Array.isArray(args.answers))
-          throw new Error('Invalid answers.');
-        answers = {};
-        for (const [key, value] of Object.entries(args.answers)) {
-          assertString(value, 'answer');
-          answers[key] = value;
-        }
-      }
-      return chat.respond(args.requestId, args.decision, answers);
-    }
-    throw new Error('Unknown agent chat action.');
+    return runChatAction(chat, args);
   });
   // --- Remote access state ---
   // Keep development phone access and coordinator ports separate from the installed app.
   const defaultRemotePort = app.isPackaged ? 7777 : 8777;
-  let remoteServer: Awaited<ReturnType<typeof startRemoteServer>> | null = null;
+  const mcp = createMcpRuntime({
+    notify,
+    defaultPort: defaultRemotePort,
+    serverOptions: () => remoteServerOptions(),
+    rememberedDevicesPath: () => path.join(getUserDataDir(), 'paired-phones.json'),
+    onCoordinatorLoaded: () => registerCoordinatorHandlers(),
+  });
+  const { transport, delegation, pendingSpawns, canvasOwners, wideBindAgents, needsWideBind } = mcp;
   const taskNames = new Map<string, string>();
   // Renderer-derived per-task attention (needs input, working, ready, …), pushed
   // from the renderer via Remote_UpdateTaskStatus so the mobile overview can show
@@ -614,127 +581,13 @@ export function registerAllHandlers(win: BrowserWindow): void {
   const taskAttention = new Map<string, RemoteAttentionState>();
   const taskContext = new Map<
     string,
-    Pick<RemoteAgent, 'projectName' | 'agentName' | 'lastLine'>
+    Pick<RemoteAgent, 'projectName' | 'projectColor' | 'agentName' | 'lastLine'>
   >();
 
   // --- MCP coordinator (lazy — only loaded when coordinator mode is enabled) ---
-  type CoordinatorType = import('../mcp/coordinator.js').Coordinator;
-  let coordinator: CoordinatorType | null = null;
   let coordinatorHandlersRegistered = false;
   let lastMcpConfigPath: string | null = null;
-  // True when the remote server was started by StartMCPServer (not the manual StartRemoteServer).
-  // Used to stop the server automatically when the last MCP coordinator deregisters.
-  let remoteServerStartedForMcp = false;
-  // True when the user has explicitly requested remote access via StartRemoteServer.
-  // Prevents auto-stop when coordinator deregisters even if MCP started the server first.
-  let remoteServerRequestedManually = false;
-  // True when StopRemoteServer was called while a coordinator was active.
-  // The server will be stopped when the last coordinator deregisters.
-  let remoteServerPendingStop = false;
-
-  // A kill must also cancel startup while optional MCP transport is awaiting I/O.
-  const pendingSpawns = new Map<string, { sessionInstanceId: string }>();
-  /** Which spawn minted the agent's live canvas token. `pendingSpawns` cannot answer this: a
-   *  kill clears the entry to cancel the spawn, and a finished restart clears its own, so an
-   *  absent entry means both "nobody owns this" and "the owner already left". */
-  const canvasOwners = new Map<string, { sessionInstanceId: string }>();
-  let orchestrationEnabled = true;
-  try {
-    const saved = loadAppState();
-    if (saved) orchestrationEnabled = JSON.parse(saved).mcpOrchestrationEnabled !== false;
-  } catch (error) {
-    orchestrationEnabled = false;
-    logWarn('mcp', 'Could not restore orchestration setting; keeping orchestration disabled', {
-      err: errMessage(error),
-    });
-  }
-  const delegation = new DelegationService({
-    orchestrationEnabled,
-    coordinator: async () => {
-      await ensureCoordinator();
-      if (!coordinator) throw new Error('Delegation unavailable.');
-      return coordinator;
-    },
-    currentCoordinator: () => coordinator,
-    prepareParent: prepareDelegationParent,
-    sessions: () => remoteServer?.getSessionAgents() ?? [],
-    changed: (event) => {
-      if (!win.isDestroyed()) win.webContents.send(IPC.DelegationChanged, event);
-    },
-    persist: () => {
-      const json = loadAppState();
-      if (json) saveAppState(delegation.normalizeState(json));
-    },
-    parentCreated: (taskId) => {
-      if (!win.isDestroyed())
-        win.webContents.send(IPC.MCP_TaskStateSync, { taskId, delegationParent: true });
-    },
-  });
   ipcMain.handle(IPC.DelegationRequest, (_event, request) => delegation.request(request));
-
-  async function prepareDelegationParent(task: TaskAuthorityInput): Promise<void> {
-    await ensureCoordinator();
-    if (!coordinator) throw new Error('Delegation unavailable.');
-    const server = await ensureMcpTransport(task.dockerMode === true);
-    const hostServerPath = path
-      .join(path.dirname(fileURLToPath(import.meta.url)), '..', 'mcp-server.cjs')
-      .replace('/app.asar/', '/app.asar.unpacked/');
-    const serverPath = task.dockerMode
-      ? getDockerMcpServerDestPath(task.worktreePath, task.projectRoot)
-      : hostServerPath;
-    if (task.dockerMode) {
-      fs.mkdirSync(path.dirname(serverPath), { recursive: true });
-      fs.copyFileSync(hostServerPath, serverPath);
-      appendGitInfoExcludeBlock(
-        task.worktreePath,
-        '.parallel-code/',
-        '# Parallel Code MCP runtime\n.parallel-code/\n',
-        (error) =>
-          logWarn('mcp', 'Could not exclude MCP runtime directory', { err: errMessage(error) }),
-      );
-    }
-    coordinator.registerCoordinator(task.taskId, task.projectId, {
-      projectRoot: task.projectRoot,
-      worktreePath: task.worktreePath,
-      branchName: task.branchName,
-      spawnDefaults: { command: task.agentCommand, args: task.agentArgs },
-      agentEnvFile: task.agentEnvFile,
-      automaticNotifications: task.autoSendChildUpdates ?? task.coordinatorMode ?? false,
-      paused: task.delegationPaused,
-      skipPermissions: task.propagateSkipPermissions,
-      maxConcurrentTasks: task.maxConcurrentTasks,
-      verifyCommand: task.verifyCommand,
-    });
-    coordinator.setDockerContainerName(task.taskId, task.dockerMode ? 'delegation' : null);
-    coordinator.setDockerImage(task.taskId, task.dockerImage ?? null);
-    coordinator.setMCPServerInfo(
-      task.taskId,
-      getMCPRemoteServerUrl(server.port, task.dockerMode ? 'delegation' : undefined),
-      server.token,
-      server.subtaskToken,
-      serverPath,
-    );
-  }
-  /** Container agents on macOS reach the host only through a wide bind; track who needs it. */
-  const wideBindAgents = new Set<string>();
-  const needsWideBind = (dockerMode: boolean) => dockerMode && process.platform !== 'linux';
-  // The canvas token is revoked on exit; the config file holding it must go too.
-  onPtyEvent('exit', (agentId) => {
-    try {
-      removeCanvasConfig(agentId);
-    } catch (error) {
-      console.warn('Could not remove canvas MCP credentials:', error);
-    }
-    wideBindAgents.delete(agentId);
-    canvasOwners.delete(agentId);
-    // The server's own exit listener runs after this one; drop the agent here so the
-    // idle check below already sees it gone.
-    remoteServer?.unregisterCanvasAgent(agentId);
-    delegation.expireMessages();
-    stopIdleMcpTransport().catch((error) =>
-      console.warn('[MCP] Could not stop the idle transport:', error),
-    );
-  });
 
   // --- PTY commands ---
   ipcMain.handle(IPC.SpawnAgent, async (_e, args) => {
@@ -756,7 +609,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
     if (args.cwd) validatePath(args.cwd, 'cwd');
     const attaching = args.attachExisting && getAgentMeta(args.agentId);
     const releaseAdmission =
-      attaching || args.isShell ? undefined : coordinator?.reserveChildRestart(args.taskId);
+      attaching || args.isShell ? undefined : mcp.coordinator()?.reserveChildRestart(args.taskId);
     const pending = { sessionInstanceId: crypto.randomUUID() };
     pendingSpawns.set(args.agentId, pending);
     const assertPendingSpawn = () => {
@@ -776,13 +629,19 @@ export function registerAllHandlers(win: BrowserWindow): void {
       if (!existing) {
         wideBindAgents.delete(args.agentId);
         canvasOwners.delete(args.agentId);
-        remoteServer?.unregisterCanvasAgent(args.agentId);
+        transport.current()?.unregisterCanvasAgent(args.agentId);
         removeCanvasConfig(args.agentId);
         delegation.expireMessages();
       }
       let canvasTools = existing?.canvasTools === true;
+      const coordinator = mcp.coordinator();
       let releaseCanvas: (() => void) | undefined;
-      if (!existing && !args.isShell && remoteServer && canConfigureCanvasMcp(args.command, [])) {
+      if (
+        !existing &&
+        !args.isShell &&
+        transport.current() &&
+        canConfigureCanvasMcp(args.command, [])
+      ) {
         canvasTools = !!(
           coordinator?.isRegisteredCoordinator(args.taskId) || coordinator?.getTask(args.taskId)
         );
@@ -793,7 +652,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         coordinator?.getTask(args.taskId) &&
         delegation.getTask(args.taskId)
       ) {
-        const server = await ensureMcpTransport(args.dockerMode === true);
+        const server = await transport.ensureForMcp(args.dockerMode === true);
         assertPendingSpawn();
         canvasOwners.set(args.agentId, pending);
         const child = coordinator.getTask(args.taskId);
@@ -811,9 +670,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
           });
           launchArgs = prepareCanvasMcpArgs({
             ...args,
-            serverPath: path
-              .join(path.dirname(fileURLToPath(import.meta.url)), '..', 'mcp-server.cjs')
-              .replace('/app.asar/', '/app.asar.unpacked/'),
+            serverPath: hostMcpServerPath(),
             port: server.port,
             token,
             sessionCapabilities: capabilities,
@@ -851,12 +708,9 @@ export function registerAllHandlers(win: BrowserWindow): void {
         canConfigureCanvasMcp(args.command, args.args)
       ) {
         try {
-          const server = await ensureMcpTransport(args.dockerMode === true);
+          const server = await transport.ensureForMcp(args.dockerMode === true);
           assertPendingSpawn();
-          const thisDir = path.dirname(fileURLToPath(import.meta.url));
-          const serverPath = path
-            .join(thisDir, '..', 'mcp-server.cjs')
-            .replace('/app.asar/', '/app.asar.unpacked/');
+          const serverPath = hostMcpServerPath();
           const capabilities = delegation.capabilities(args.taskId);
           const token = server.registerCanvasAgent(
             args.taskId,
@@ -898,7 +752,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
             assertPendingSpawn();
           } catch (cancelled) {
             // The kill arrived while the transport was starting; nothing will register on it.
-            await stopIdleMcpTransport();
+            await transport.stopIfIdle();
             throw cancelled;
           }
           console.warn('Canvas MCP unavailable; starting the agent without canvas tools:', error);
@@ -907,7 +761,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
       assertPendingSpawn();
       releaseAdmission?.assertAllowed();
       try {
-        await spawnAgent(win, canvasTools ? { ...args, canvasTools: true } : args, () => {
+        await spawnAgent(notify, canvasTools ? { ...args, canvasTools: true } : args, () => {
           assertPendingSpawn();
           releaseAdmission?.assertAllowed();
         });
@@ -924,19 +778,20 @@ export function registerAllHandlers(win: BrowserWindow): void {
       }
       if (!args.isShell && args.cwd) {
         try {
-          startPlanWatcher(win, args.taskId, args.cwd);
+          startPlanWatcher(notify, args.taskId, args.cwd);
         } catch (err) {
           console.warn('Failed to start plan watcher:', err);
         }
         if (args.stepsEnabled) {
           try {
-            startStepsWatcher(win, args.taskId, args.cwd);
+            startStepsWatcher(notify, args.taskId, args.cwd);
           } catch (err) {
             console.warn('Failed to start steps watcher:', err);
           }
         }
       }
-      const session = remoteServer
+      const session = transport
+        .current()
         ?.getSessionAgents()
         .find((item) => item.agentId === args.agentId);
       return {
@@ -947,7 +802,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
     } catch (error) {
       if (canvasOwners.get(args.agentId) === pending) {
         canvasOwners.delete(args.agentId);
-        remoteServer?.unregisterCanvasAgent(args.agentId);
+        transport.current()?.unregisterCanvasAgent(args.agentId);
         wideBindAgents.delete(args.agentId);
         removeCanvasConfig(args.agentId);
         delegation.expireMessages();
@@ -966,7 +821,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
     }
     if (args.taskId !== undefined) {
       assertString(args.taskId, 'taskId');
-      if (coordinator?.isAutomationWriteInFlight(args.taskId)) return false;
+      if (mcp.coordinator()?.isAutomationWriteInFlight(args.taskId)) return false;
     }
     return writeToAgent(args.agentId, args.data);
   });
@@ -1014,7 +869,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
     const buildContext = getOptionalBuildContext(args.buildContext);
     const imageTag = getOptionalImageTag(args.imageTag);
     return buildDockerImage(
-      win,
+      notify,
       args.onOutputChannel,
       dockerfilePath || buildContext || imageTag
         ? { dockerfilePath, buildContext, imageTag }
@@ -1195,7 +1050,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
     const projectRoot = projectRootArg(args);
     const branchName = branchNameArg(args);
     assertString(args.onOutput?.__CHANNEL_ID__, 'channelId');
-    return pushTask(win, projectRoot, branchName, args.onOutput.__CHANNEL_ID__);
+    return pushTask(notify, projectRoot, branchName, args.onOutput.__CHANNEL_ID__);
   });
   ipcMain.handle(IPC.RebaseTask, (_e, args) => {
     const worktreePath = worktreePathArg(args);
@@ -1236,7 +1091,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
       }
       const delay = state.coordinatorNotificationDelayMs;
       if (typeof delay === 'number' && Number.isFinite(delay)) {
-        coordinator?.setNotificationDelayMs(delay);
+        mcp.coordinator()?.setNotificationDelayMs(delay);
       }
     } catch (e) {
       console.warn('Ignoring malformed saved state:', e);
@@ -1246,7 +1101,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
     assertString(args.json, 'json');
     const json = delegation.normalizeState(args.json);
     syncTaskNamesFromJson(json);
-    return saveAppState(json);
+    saveAppState(json);
+    settleWorktreeIntents(json);
   });
   ipcMain.handle(IPC.LoadAppState, () => {
     const json = loadAppState();
@@ -1490,6 +1346,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
   ipcMain.handle(IPC.ListCodexModels, () => listCodexModels());
 
   registerDocumentHandlers(win);
+  registerSuperProductivityHandlers();
 
   // --- File links ---
   ipcMain.handle(IPC.OpenPath, (_e, args) => {
@@ -1720,10 +1577,27 @@ export function registerAllHandlers(win: BrowserWindow): void {
     shell.showItemInFolder(args.filePath);
   });
 
-  ipcMain.handle(IPC.ShellOpenFile, (_e, args) => {
+  ipcMain.handle(IPC.ShellOpenFile, async (_e, args) => {
     validatePath(args.worktreePath, 'worktreePath');
     validateRelativePath(args.filePath, 'filePath');
-    return shell.openPath(path.join(args.worktreePath, args.filePath));
+    const absolute = path.join(args.worktreePath, args.filePath);
+    // Only the configured editor can jump to a line; the OS default app cannot.
+    const line = args.line;
+    if (Number.isInteger(line) && line > 0 && args.editorCommand) {
+      const cmd = validateEditorCommand(args.editorCommand);
+      const gotoArgs = editorGotoArgs(cmd, absolute, line);
+      if (gotoArgs) {
+        try {
+          await spawnDetached(cmd, gotoArgs);
+          return '';
+        } catch (err) {
+          logWarn('shell', 'Editor launch failed; opening with the default app', {
+            error: errMessage(err),
+          });
+        }
+      }
+    }
+    return shell.openPath(absolute);
   });
 
   ipcMain.handle(IPC.ShellOpenExternal, async (_e, args) => {
@@ -1732,33 +1606,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
 
   ipcMain.handle(IPC.ShellOpenInEditor, (_e, args) => {
     validatePath(args.worktreePath, 'worktreePath');
-    if (typeof args.editorCommand !== 'string' || !args.editorCommand.trim()) {
-      throw new Error('editorCommand must be a non-empty string');
-    }
-    const cmd = args.editorCommand.trim();
-    if (/[;&|`$(){}[\]<>\\'"*?!#~]/.test(cmd)) {
-      throw new Error('editorCommand must not contain shell metacharacters');
-    }
-    return new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const child = spawn(cmd, [args.worktreePath], {
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.on('error', (err) => {
-        if (!settled) {
-          settled = true;
-          reject(new Error(`Failed to launch "${cmd}": ${err.message}`));
-        }
-      });
-      child.on('spawn', () => {
-        if (!settled) {
-          settled = true;
-          child.unref();
-          resolve();
-        }
-      });
-    });
+    return spawnDetached(validateEditorCommand(args.editorCommand), [args.worktreePath]);
   });
 
   // --- Mobile task-creation bridge (paired phones) ---
@@ -1828,7 +1676,6 @@ export function registerAllHandlers(win: BrowserWindow): void {
     getTaskContext: (taskId: string) => taskContext.get(taskId),
   };
 
-  type RemoteServerHandle = Awaited<ReturnType<typeof startRemoteServer>>;
   const remoteServerOptions = (): Omit<
     Parameters<typeof startRemoteServer>[0],
     'port' | 'host'
@@ -1842,98 +1689,13 @@ export function registerAllHandlers(win: BrowserWindow): void {
         exitCode: null,
         lastLine: '',
       }),
-      getCoordinator: () => coordinator,
+      getCoordinator: () => mcp.coordinator(),
       callSessionTool: (caller, name, params) => delegation.callTool(caller, name, params),
       isOrchestrationEnabled: () => delegation.isOrchestrationEnabled(),
+      chats: { list: listTaskChats, find: findAgentChat, onChange: onAgentChatsChanged },
       ...mobileTaskBridge,
     };
   };
-  // One in-flight start for manual and MCP callers alike: a spawn during a manual start
-  // (or the reverse) waits for that listener instead of opening a second, orphaned one.
-  // Callers loop on it inline so an idle path reaches startTransport without yielding;
-  // a failed start reports to its own caller, waiters simply see no server.
-  let mcpTransportStarting: Promise<RemoteServerHandle> | undefined;
-  function startTransport(
-    start: () => Promise<RemoteServerHandle>,
-    forMcp: boolean,
-  ): Promise<RemoteServerHandle> {
-    const starting = (async () => {
-      try {
-        const server = await start();
-        remoteServer = server;
-        remoteServerStartedForMcp = forMcp;
-        return server;
-      } finally {
-        mcpTransportStarting = undefined;
-      }
-    })();
-    mcpTransportStarting = starting;
-    return starting;
-  }
-  // Stopping the server while its listener is being re-bound would orphan the new listener
-  // and hand callers a stopped handle; an exit during that window defers to the rebind.
-  let transportRebinding: Promise<void> | undefined;
-  /** A rebind that leaves nothing listening hands back a dead handle; drop it. */
-  async function rebindTransport(server: RemoteServerHandle, host: string): Promise<void> {
-    transportRebinding = server.rebind(host);
-    try {
-      await transportRebinding;
-    } catch (error) {
-      if (!server.listening && remoteServer === server) {
-        remoteServer = null;
-        remoteServerStartedForMcp = false;
-        remoteServerRequestedManually = false;
-        remoteServerPendingStop = false;
-      }
-      throw error;
-    } finally {
-      transportRebinding = undefined;
-      // The last agent may have exited meanwhile; its deferred idle check runs once now.
-      await stopIdleMcpTransport();
-    }
-  }
-  /** An MCP-only server has no reason to run once neither a coordinator nor a canvas agent needs it. */
-  async function stopIdleMcpTransport(): Promise<void> {
-    const server = remoteServer;
-    if (transportRebinding || !server) return;
-    if (coordinator?.hasActiveCoordinator() || server.hasCanvasAgents()) return;
-    if (!remoteServerPendingStop && !(remoteServerStartedForMcp && !remoteServerRequestedManually))
-      return;
-    const forgetDevices = remoteServerPendingStop;
-    remoteServer = null;
-    remoteServerStartedForMcp = false;
-    remoteServerRequestedManually = false;
-    remoteServerPendingStop = false;
-    await server.stop(forgetDevices);
-  }
-  const warnDockerBind = () =>
-    console.warn(
-      '[MCP] Docker mode (macOS): MCP server bound to 0.0.0.0 — reachable from local network ' +
-        'interfaces. Traffic from containers uses Docker Desktop internal routing; the bearer ' +
-        'token still gates every request.',
-    );
-  async function ensureMcpTransport(dockerMode: boolean): Promise<RemoteServerHandle> {
-    while (mcpTransportStarting) await mcpTransportStarting.catch(() => undefined);
-    // Docker mode on macOS requires 0.0.0.0: containers reach the host through
-    // host.docker.internal, which routes through Docker Desktop's virtual adapter.
-    const wideOpen = needsWideBind(dockerMode);
-    if (remoteServer && wideOpen && remoteServer.bindHost === '127.0.0.1') {
-      warnDockerBind();
-      await rebindTransport(remoteServer, '0.0.0.0');
-    }
-    // The idle check after a rebind may have released a transport nobody used any more.
-    if (remoteServer) return remoteServer;
-    if (wideOpen) warnDockerBind();
-    return startTransport(
-      () =>
-        startRemoteServerOnFreePort(defaultRemotePort, defaultRemotePort + 23, {
-          host: wideOpen ? '0.0.0.0' : '127.0.0.1',
-          ...remoteServerOptions(),
-        }),
-      true,
-    );
-  }
-
   const VALID_ATTENTION: ReadonlySet<RemoteAttentionState> = new Set([
     'idle',
     'active',
@@ -1955,7 +1717,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         statuses?: Record<string, string>;
         contexts?: Record<
           string,
-          { projectName?: unknown; agentName?: unknown; lastLine?: unknown }
+          { projectName?: unknown; projectColor?: unknown; agentName?: unknown; lastLine?: unknown }
         >;
       },
     ) => {
@@ -1969,6 +1731,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
           taskContext.set(taskId, {
             projectName:
               typeof context.projectName === 'string' ? context.projectName.slice(0, 200) : '',
+            projectColor:
+              typeof context.projectColor === 'string' ? context.projectColor.slice(0, 200) : '',
             agentName: typeof context.agentName === 'string' ? context.agentName.slice(0, 200) : '',
             lastLine: typeof context.lastLine === 'string' ? context.lastLine.slice(0, 300) : '',
           });
@@ -1980,115 +1744,35 @@ export function registerAllHandlers(win: BrowserWindow): void {
         }
       }
       // Only bother rebroadcasting when a phone could be listening.
-      if (remoteServer) notifyAgentListChanged();
+      if (transport.current()) notifyAgentListChanged();
     },
   );
 
   ipcMain.handle(IPC.GeneratePairingPin, () => {
-    if (!remoteServer) throw new Error('Remote server is not running');
-    return remoteServer.generatePairingPin();
+    const server = transport.current();
+    if (!server) throw new Error('Remote server is not running');
+    return server.generatePairingPin();
   });
 
   // --- Remote access ---
-  ipcMain.handle(IPC.StartRemoteServer, async (_e, args: { port?: number }) => {
-    while (mcpTransportStarting) await mcpTransportStarting.catch(() => undefined);
-    // If server was started for MCP-only (loopback), rebind to 0.0.0.0 so WiFi/Tailscale
-    // clients can reach it. Skip rebind while a coordinator is active — restarting the
-    // server would break ongoing MCP connections.
-    if (remoteServer && remoteServerStartedForMcp && !coordinator?.hasActiveLegacyCoordinator()) {
-      await rebindTransport(remoteServer, '0.0.0.0');
-    }
-    // The idle check after a rebind may have released a transport nobody used any more.
-    if (remoteServer) {
-      // Loopback-only means the server is MCP-only and inaccessible from other devices.
-      // Return unavailableReason without marking this as a successful manual start.
-      if (remoteServer.bindHost === '127.0.0.1') {
-        return {
-          url: remoteServer.url,
-          wifiUrl: null,
-          tailscaleUrl: null,
-          port: remoteServer.port,
-          unavailableReason: 'coordinator_active' as const,
-        };
-      }
-      remoteServer.enableRememberedDevices(path.join(getUserDataDir(), 'paired-phones.json'));
-      remoteServerRequestedManually = true;
-      remoteServerPendingStop = false;
-      return {
-        url: remoteServer.url,
-        wifiUrl: remoteServer.wifiUrl,
-        tailscaleUrl: remoteServer.tailscaleUrl,
-        port: remoteServer.port,
-      };
-    }
+  ipcMain.handle(IPC.StartRemoteServer, (_e, args: { port?: number }) =>
+    transport.startRemoteAccess(args.port),
+  );
 
-    // Remote access is an explicit user action — bind to all interfaces so WiFi/Tailscale clients
-    // can reach the SPA. Coordinator MCP-only mode uses 127.0.0.1 by default.
-    const server = await startTransport(
-      () =>
-        startRemoteServer({
-          port: args.port ?? defaultRemotePort,
-          host: '0.0.0.0',
-          ...remoteServerOptions(),
-        }),
-      false,
-    );
-    server.enableRememberedDevices(path.join(getUserDataDir(), 'paired-phones.json'));
-    remoteServerRequestedManually = true;
-    remoteServerPendingStop = false;
-    return {
-      url: server.url,
-      wifiUrl: server.wifiUrl,
-      tailscaleUrl: server.tailscaleUrl,
-      port: server.port,
-    };
-  });
-
-  ipcMain.handle(IPC.StopRemoteServer, async (): Promise<{ stopped: boolean; reason?: string }> => {
-    if (!remoteServer) return { stopped: true };
-    if (coordinator?.hasActiveLegacyCoordinator()) {
-      // The coordinator MCP transport shares this HTTP server. Stopping it while
-      // a coordinator is active would break all in-flight MCP tool calls.
-      // Record the pending stop so the last coordinator deregistration will auto-stop.
-      remoteServerPendingStop = true;
-      console.warn(
-        '[Remote] Stop requested but coordinator MCP is active — will stop on last coordinator exit',
-      );
-      return { stopped: false, reason: 'coordinator_active' };
-    }
-    if (remoteServer.hasCanvasAgents() || coordinator?.hasActiveCoordinator()) {
-      // Running agents keep their canvas transport; only the phone-facing access ends.
-      // Loopback is unreachable from other devices, so the shared URL stops working.
-      if (
-        wideBindAgents.size > 0 ||
-        (process.platform !== 'linux' && delegation.requiresWideTransport())
-      )
-        return { stopped: false, reason: 'docker_active' };
-      remoteServer.forgetRememberedDevices();
-      // Mark it MCP-only before narrowing so the idle check after the rebind may release it.
-      remoteServerStartedForMcp = true;
-      remoteServerRequestedManually = false;
-      remoteServerPendingStop = false;
-      await rebindTransport(remoteServer, '127.0.0.1');
-      return { stopped: true };
-    }
-    await remoteServer.stop(true);
-    remoteServer = null;
-    remoteServerRequestedManually = false;
-    return { stopped: true };
-  });
+  ipcMain.handle(IPC.StopRemoteServer, () => transport.stopRemoteAccess());
 
   ipcMain.handle(IPC.GetRemoteStatus, () => {
-    if (!remoteServer || remoteServer.bindHost === '127.0.0.1') {
+    const server = transport.current();
+    if (!server || server.bindHost === '127.0.0.1') {
       return { enabled: false, connectedClients: 0 };
     }
     return {
       enabled: true,
-      connectedClients: remoteServer.connectedClients(),
-      url: remoteServer.url,
-      wifiUrl: remoteServer.wifiUrl,
-      tailscaleUrl: remoteServer.tailscaleUrl,
-      port: remoteServer.port,
+      connectedClients: server.connectedClients(),
+      url: server.url,
+      wifiUrl: server.wifiUrl,
+      tailscaleUrl: server.tailscaleUrl,
+      port: server.port,
     };
   });
 
@@ -2109,6 +1793,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         if (args.controlledBy !== 'coordinator' && args.controlledBy !== 'human') {
           throw new Error(`Invalid controlledBy: ${String(args.controlledBy)}`);
         }
+        const coordinator = mcp.coordinator();
         if (!coordinator) throw new Error('Task coordination is not initialized');
 
         coordinator.setTaskControl(args.taskId, args.controlledBy);
@@ -2133,7 +1818,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
           validateBranchName(args.coordinatorBranch, 'coordinatorBranch');
         }
         validateOptionalVerifyCommand(args.verifyCommand);
-        coordinator?.registerCoordinator(args.coordinatorTaskId, args.projectId, {
+        mcp.coordinator()?.registerCoordinator(args.coordinatorTaskId, args.projectId, {
           branchName: args.coordinatorBranch,
           worktreePath: args.worktreePath,
           verifyCommand: args.verifyCommand,
@@ -2145,7 +1830,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
       IPC.MCP_CoordinatorDeregistered,
       async (_e, args: { coordinatorTaskId: string }) => {
         assertString(args.coordinatorTaskId, 'coordinatorTaskId');
-        coordinator?.deregisterCoordinator(args.coordinatorTaskId);
+        mcp.coordinator()?.deregisterCoordinator(args.coordinatorTaskId);
         // Clean up the host-temp MCP config file written by StartMCPServer (non-Docker only).
         const tempConfigPath = path.join(
           app.getPath('temp'),
@@ -2159,7 +1844,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         // Stop the remote server when the last coordinator exits if:
         // - MCP started the server and user hasn't separately requested manual access, OR
         // - the user explicitly requested stop while coordinator was active (pendingStop)
-        await stopIdleMcpTransport();
+        await transport.stopIfIdle();
       },
     );
 
@@ -2170,13 +1855,13 @@ export function registerAllHandlers(win: BrowserWindow): void {
       (_e, args: { coordinatorTaskId: string; batchId: string }) => {
         assertString(args.coordinatorTaskId, 'coordinatorTaskId');
         assertString(args.batchId, 'batchId');
-        coordinator?.dropNotification(args.coordinatorTaskId, args.batchId);
+        mcp.coordinator()?.dropNotification(args.coordinatorTaskId, args.batchId);
       },
     );
 
     ipcMain.handle(IPC.MCP_CoordinatedTaskPromptDelivered, (_e, args: { taskId: string }) => {
       assertString(args.taskId, 'taskId');
-      coordinator?.markPromptDelivered(args.taskId);
+      mcp.coordinator()?.markPromptDelivered(args.taskId);
     });
 
     ipcMain.handle(
@@ -2184,7 +1869,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
       (_e, args: { coordinatorTaskId: string; batchId: string }) => {
         assertString(args.coordinatorTaskId, 'coordinatorTaskId');
         assertString(args.batchId, 'batchId');
-        coordinator?.ackNotification(args.coordinatorTaskId, args.batchId);
+        mcp.coordinator()?.ackNotification(args.coordinatorTaskId, args.batchId);
       },
     );
 
@@ -2192,13 +1877,13 @@ export function registerAllHandlers(win: BrowserWindow): void {
       IPC.MCP_CoordinatorRestageAfterUserSend,
       (_e, args: { coordinatorTaskId: string }) => {
         assertString(args.coordinatorTaskId, 'coordinatorTaskId');
-        coordinator?.rescheduleRestageTimer(args.coordinatorTaskId);
+        mcp.coordinator()?.rescheduleRestageTimer(args.coordinatorTaskId);
       },
     );
 
     ipcMain.handle(IPC.MCP_TaskLandingReviewCleared, (_e, args: { taskId: string }) => {
       assertString(args.taskId, 'taskId');
-      coordinator?.markTaskReviewed(args.taskId);
+      mcp.coordinator()?.markTaskReviewed(args.taskId);
     });
 
     ipcMain.handle(
@@ -2206,7 +1891,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
       (_e, args: { taskId: string; coordinatorTaskId: string }) => {
         assertString(args.taskId, 'taskId');
         assertString(args.coordinatorTaskId, 'coordinatorTaskId');
-        coordinator?.removeCoordinatedTask(args.taskId);
+        mcp.coordinator()?.removeCoordinatedTask(args.taskId);
       },
     );
 
@@ -2226,6 +1911,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
           coordinatorTaskId: string;
           controlledBy?: 'coordinator' | 'human';
           agentId?: string;
+          completion?: import('../shared/completion-report.js').CompletionRecord;
+          reviewRevision?: number;
           signalDoneAt?: string;
           signalDoneConsumed?: boolean;
           verification?: import('../mcp/types.js').SubtaskVerification;
@@ -2250,6 +1937,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         validatePath(args.worktreePath, 'worktreePath');
         assertString(args.coordinatorTaskId, 'coordinatorTaskId');
         validateUUID(args.coordinatorTaskId, 'coordinatorTaskId');
+        const coordinator = mcp.coordinator();
         if (!coordinator) throw new Error('Task coordination is not initialized');
         const authority = delegation.getTask(args.id);
         if (
@@ -2277,6 +1965,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
           agentId: args.agentId ?? crypto.randomUUID(),
           coordinatorTaskId: args.coordinatorTaskId,
           controlledBy: args.controlledBy,
+          completion: args.completion,
+          reviewRevision: args.reviewRevision,
           signalDoneAt: args.signalDoneAt,
           signalDoneConsumed: args.signalDoneConsumed,
           verification: args.verification,
@@ -2296,47 +1986,6 @@ export function registerAllHandlers(win: BrowserWindow): void {
         return result;
       },
     );
-  }
-
-  // Lazily initialize the shared coordination backend and register its handlers.
-  // Safe to call multiple times — only initializes once.
-  let coordinatorStarting: Promise<void> | undefined;
-  async function ensureCoordinator(): Promise<void> {
-    if (coordinator) return;
-    if (coordinatorStarting) return coordinatorStarting;
-    coordinatorStarting = (async () => {
-      const { Coordinator } = await import('../mcp/coordinator.js');
-      coordinator = new Coordinator();
-      coordinator.setOrchestrationEnabled(delegation.isOrchestrationEnabled());
-      coordinator.setWindow(win);
-      coordinator.setSessionMcpProvider((task) => {
-        if (!delegation.getTask(task.coordinatorTaskId) || !remoteServer) return undefined;
-        if (!delegation.getTask(task.id)) {
-          if (task.status !== 'creating')
-            throw new Error('Task authority was not validated before restoring its MCP session.');
-          delegation.registerChild(task);
-        }
-        const sessionCapabilities = delegation.capabilities(task.id);
-        if (!sessionCapabilities) throw new Error('Task authority is unavailable.');
-        let owner = canvasOwners.get(task.agentId);
-        if (!owner) {
-          owner = { sessionInstanceId: crypto.randomUUID() };
-          canvasOwners.set(task.agentId, owner);
-        }
-        if (needsWideBind(!!task.dockerContainerName)) wideBindAgents.add(task.agentId);
-        const token = remoteServer.registerCanvasAgent(task.id, task.agentId, undefined, {
-          sessionInstanceId: owner.sessionInstanceId,
-          capabilities: sessionCapabilities,
-        });
-        return { token, sessionCapabilities };
-      });
-      registerCoordinatorHandlers();
-    })();
-    try {
-      await coordinatorStarting;
-    } finally {
-      coordinatorStarting = undefined;
-    }
   }
 
   // StartMCPServer registered eagerly (not inside registerCoordinatorHandlers) so the
@@ -2390,7 +2039,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
         }
       }
 
-      await ensureCoordinator();
+      await mcp.ensureCoordinator();
+      const coordinator = mcp.coordinator();
       if (!coordinator) return;
 
       // Set coordinator's default project + coordinator task ID, and register this coordinator
@@ -2404,15 +2054,11 @@ export function registerAllHandlers(win: BrowserWindow): void {
         verifyCommand: args.verifyCommand,
       });
 
-      await ensureMcpTransport(!!args.dockerContainerName);
-      if (!remoteServer) throw new Error('MCP transport unavailable.');
+      await transport.ensureForMcp(!!args.dockerContainerName);
+      const server = transport.current();
+      if (!server) throw new Error('MCP transport unavailable.');
 
-      // Resolve the source MCP server binary path.
-      const thisDir = path.dirname(fileURLToPath(import.meta.url));
-      let hostMcpServerPath = path.join(thisDir, '..', 'mcp-server.cjs');
-      if (hostMcpServerPath.includes('/app.asar/')) {
-        hostMcpServerPath = hostMcpServerPath.replace('/app.asar/', '/app.asar.unpacked/');
-      }
+      const hostServerPath = hostMcpServerPath();
 
       // In Docker mode the server is copied into the worktree so the container can reach it.
       // Compute the destination path now (pure, no side effects) so we can build mcpConfig
@@ -2420,9 +2066,9 @@ export function registerAllHandlers(win: BrowserWindow): void {
       const dockerMcpServerPath = args.dockerContainerName
         ? getDockerMcpServerDestPath(args.worktreePath, args.projectRoot)
         : undefined;
-      const mcpServerPath = dockerMcpServerPath ?? hostMcpServerPath;
+      const mcpServerPath = dockerMcpServerPath ?? hostServerPath;
 
-      const serverUrl = getMCPRemoteServerUrl(remoteServer.port, args.dockerContainerName);
+      const serverUrl = getMCPRemoteServerUrl(server.port, args.dockerContainerName);
 
       // Build mcpConfig and mergedMcpJson (pure computation — no filesystem or state side effects).
       // Doing this before any Docker copy or coordinator mutation ensures that if .mcp.json
@@ -2430,7 +2076,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
       const mcpConfig = buildCoordinatorMCPConfig({
         mcpServerPath,
         serverUrl,
-        token: remoteServer.token,
+        token: server.coordinatorTokenFor(args.coordinatorTaskId),
         coordinatorTaskId: args.coordinatorTaskId,
         skipPermissions: args.skipPermissions,
         propagateSkipPermissions: args.propagateSkipPermissions,
@@ -2455,7 +2101,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
       // Docker filesystem writes, MCP config file writes.
       if (dockerMcpServerPath) {
         fs.mkdirSync(path.dirname(dockerMcpServerPath), { recursive: true });
-        fs.copyFileSync(hostMcpServerPath, dockerMcpServerPath); // nosemgrep: semgrep.copyfilesync-side-effect -- all pure computation (mcpConfig, mergedMcpJson) is done above; this is correctly ordered
+        fs.copyFileSync(hostServerPath, dockerMcpServerPath); // nosemgrep: semgrep.copyfilesync-side-effect -- all pure computation (mcpConfig, mergedMcpJson) is done above; this is correctly ordered
         coordinator.setDockerContainerName(args.coordinatorTaskId, args.dockerContainerName ?? '');
         coordinator.setDockerImage(args.coordinatorTaskId, args.dockerImage ?? null);
         console.warn('[MCP] Docker mode: copied MCP server to', dockerMcpServerPath);
@@ -2475,8 +2121,8 @@ export function registerAllHandlers(win: BrowserWindow): void {
       coordinator.setMCPServerInfo(
         args.coordinatorTaskId,
         serverUrl,
-        remoteServer.token,
-        remoteServer.subtaskToken,
+        server.coordinatorTokenFor(args.coordinatorTaskId),
+        server.subtaskToken,
         mcpServerPath,
       );
       coordinator.setCoordinatorSpawnDefaults(
@@ -2546,7 +2192,7 @@ export function registerAllHandlers(win: BrowserWindow): void {
         configPath,
         mcpLaunchArgs,
         serverUrl,
-        port: remoteServer.port,
+        port: server.port,
       };
     },
   );
@@ -2560,9 +2206,10 @@ export function registerAllHandlers(win: BrowserWindow): void {
     // The MCP server process is spawned by the agent CLI via launch args,
     // not by us. We report whether the remote HTTP server that the MCP
     // server connects to is running — if it's up, MCP tools should work.
+    const server = transport.current();
     return {
-      running: remoteServer !== null,
-      port: remoteServer?.port ?? null,
+      running: server !== null,
+      port: server?.port ?? null,
       // TODO: Surface this from the coordinator map if the UI needs it.
       coordinatorTaskId: null,
       mcpConfigPath: lastMcpConfigPath ?? null,
@@ -2581,6 +2228,15 @@ export function registerAllHandlers(win: BrowserWindow): void {
   win.on('blur', () => {
     if (!win.isDestroyed()) win.webContents.send(IPC.WindowBlur);
   });
+  // backgroundThrottling is off (see main.ts), which per Electron's docs also
+  // affects the renderer's Page Visibility API — so forward the real signal.
+  const forwardVisibility = (visible: boolean) => () => {
+    if (!win.isDestroyed()) win.webContents.send(IPC.WindowVisibilityChanged, visible);
+  };
+  win.on('hide', forwardVisibility(false));
+  win.on('minimize', forwardVisibility(false));
+  win.on('show', forwardVisibility(true));
+  win.on('restore', forwardVisibility(true));
   win.on('resize', createThrottledForwarder(win, IPC.WindowResized, 100));
   win.on('move', createThrottledForwarder(win, IPC.WindowMoved, 100));
   // Fallback timer that force-destroys the window if the renderer never

@@ -43,6 +43,7 @@ import {
   setMcpOrchestrationEnabled,
   setDocumentWorkspacesEnabled,
   setCoordinatorNotificationDelayMs,
+  setPreferUiMode,
   setDefaultStepsEnabled,
   setAutoResumeSessions,
   setDefaultSkipPermissions,
@@ -53,6 +54,7 @@ import {
 } from '../store/store';
 import { CustomAgentEditor } from './CustomAgentEditor';
 import { AgentEnvFileEditor } from './AgentEnvFileEditor';
+import { SuperProductivitySettings } from './SuperProductivitySettings';
 import { mod } from '../lib/platform';
 import { DEFAULT_COORDINATOR_CONCURRENT_TASKS } from '../lib/coordinator-limits';
 import { DEFAULT_DOCKER_IMAGE, PROJECT_DOCKERFILE_RELATIVE_PATH } from '../lib/docker';
@@ -510,10 +512,10 @@ export function SettingsDialog(props: SettingsDialogProps) {
               description="When hidden, the terminal occupies the full panel and auto-focuses on activation"
             />
             <SettingsCheckboxRow
-              label="Pin tasks that need input to the top of the sidebar"
+              label="Pin actions that need attention to the top of the sidebar"
               checked={store.sidebarNeedsInputFirst}
               onChange={setSidebarNeedsInputFirst}
-              description="Tasks waiting on an answer appear directly under New Task, most recent question first"
+              description="Questions, reviews, and coordination failures appear directly under New Task"
             />
             <SettingsCheckboxRow
               label="Show progress section in sidebar"
@@ -544,6 +546,12 @@ export function SettingsDialog(props: SettingsDialogProps) {
           </SettingsSection>
 
           <SettingsSection title="New Task Defaults">
+            <SettingsCheckboxRow
+              label="Always prefer UI mode"
+              checked={store.preferUiMode}
+              onChange={setPreferUiMode}
+              description="Start new Claude and Codex tasks in Chat when supported. You can still switch each task to Terminal. Existing tasks keep their current view."
+            />
             <SettingsCheckboxRow
               label="Steps tracking"
               checked={store.defaultStepsEnabled}
@@ -862,7 +870,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
               </div>
               <input
                 type="range"
-                min="30"
+                min="10"
                 max="100"
                 step="5"
                 value={store.inactiveColumnOpacity * 100}
@@ -901,6 +909,10 @@ export function SettingsDialog(props: SettingsDialogProps) {
 
           <SettingsSection title="Agent Environment">
             <AgentEnvFileEditor />
+          </SettingsSection>
+
+          <SettingsSection title="Super Productivity">
+            <SuperProductivitySettings />
           </SettingsSection>
 
           <div style={{ display: 'flex', 'flex-direction': 'column', gap: '10px' }}>

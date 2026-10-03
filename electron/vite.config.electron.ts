@@ -1,7 +1,6 @@
 import path from 'path';
 import { defineConfig, type Plugin } from 'vite';
 import solid from 'vite-plugin-solid';
-import react from '@vitejs/plugin-react';
 
 const rootDir = path.resolve(process.cwd());
 const parentDir = path.resolve(rootDir, '..');
@@ -14,9 +13,8 @@ const parentDir = path.resolve(rootDir, '..');
  * - script-src: the bundle plus 'wasm-unsafe-eval' for shiki's oniguruma
  *   engine (WebAssembly instantiation is blocked without it).
  * - style-src 'unsafe-inline': Solid `style={{}}` attributes plus the style
- *   elements xterm, Monaco, and mermaid inject.
+ *   elements xterm and mermaid inject.
  * - img-src http(s): images linked from rendered markdown (notes, plans).
- * - worker-src blob:: Monaco language workers.
  *
  * Applied at build time only: the dev server injects its own client and HMR
  * socket, which this policy would block.
@@ -27,8 +25,8 @@ export const RENDERER_CSP = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob: http: https:",
   "font-src 'self' data:",
-  "connect-src 'self' parallel-chat:",
-  "worker-src 'self' blob:",
+  "connect-src 'self'",
+  "worker-src 'self'",
   "media-src 'self' blob:",
   "object-src 'none'",
   "base-uri 'none'",
@@ -53,11 +51,7 @@ function rendererCspPlugin(): Plugin {
 
 export default defineConfig({
   base: './',
-  plugins: [
-    solid({ exclude: /\.react\.tsx$/ }),
-    react({ include: /\.react\.tsx$/ }),
-    rendererCspPlugin(),
-  ],
+  plugins: [solid(), rendererCspPlugin()],
   clearScreen: false,
   server: {
     port: 1421,

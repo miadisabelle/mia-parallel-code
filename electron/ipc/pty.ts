@@ -1,12 +1,13 @@
 import * as pty from 'node-pty';
 import { codexResumeId, isCodexUnsavedSessionExit } from '../shared/codex-resume.js';
+import { hasTerminalUserActivity, nextTerminalInputPending } from '../shared/terminal-input.js';
 import { stopAgentChat, stopAllAgentChats, runningAgentChatIds } from '../chat/sessions.js';
 import { execFileSync, execFile, spawn as cpSpawn } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type { BrowserWindow } from 'electron';
+import type { Notify } from './notify.js';
 import { RingBuffer } from '../remote/ring-buffer.js';
 import { resolveUserShell } from '../user-shell.js';
 import {
@@ -17,15 +18,25 @@ import {
   refreshWorktreeNodeModules,
 } from './git.js';
 import { loadEnvFile } from './env-file.js';
+import {
+  createTerminalQueryResponder,
+  type TerminalQueryResponder,
+} from './terminal-query-responder.js';
+import {
+  registerAgentLaunch,
+  retireAgentLaunch,
+  invalidateAgentActivity,
+} from '../agent-hooks/observations.js';
 import { HOOK_PTY_ENV_KEYS } from '../agent-hooks/hook-script.js';
 import { isClaudeCommand, withClaudeHookSettings } from '../agent-hooks/launch-args.js';
-import { debug as logDebug } from '../log.js';
+import { debug as logDebug, warn as logWarn } from '../log.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 interface PtySession {
   proc: pty.IPty;
+  launchId: string;
   command: string;
   channelId: string;
   taskId: string;
@@ -35,6 +46,11 @@ interface PtySession {
   flushTimer: ReturnType<typeof setTimeout> | null;
   subscribers: Set<(encoded: string) => void>;
   scrollback: RingBuffer;
+  queries: TerminalQueryResponder;
+  lastInputAt: number;
+  inputPending: boolean;
+  /** Present while a peer prompt and any competing input are being written. */
+  peerInputQueue?: { data: string; at: number }[];
   /** Assigned container name when running in Docker mode, null otherwise. */
   containerName: string | null;
 }
@@ -184,15 +200,22 @@ export async function handoffClaudeTerminal(agentId: string): Promise<void> {
   }
 }
 
-function sendToChannel(win: BrowserWindow, channelId: string, msg: unknown): void {
-  if (!win.isDestroyed()) {
-    win.webContents.send(`channel:${channelId}`, msg);
-  }
+/**
+ * Copy terminal bytes into an exact-sized array for IPC. Small Buffers are
+ * slices of Node's shared allocation pool; a copy guarantees only this view's
+ * bytes cross the process boundary, never the rest of that pool.
+ */
+function toIpcBytes(buf: Buffer): Uint8Array {
+  return new Uint8Array(buf);
+}
+
+function sendToChannel(notify: Notify, channelId: string, msg: unknown): void {
+  notify(`channel:${channelId}`, msg);
 }
 
 // --- PTY event bus for spawn/exit/interrupt notifications ---
 
-type PtyEventType = 'spawn' | 'exit' | 'list-changed' | 'interrupt';
+type PtyEventType = 'spawn' | 'exit' | 'list-changed' | 'interrupt' | 'prompt-submitted';
 type PtyEventListener = (agentId: string, data?: unknown) => void;
 const eventListeners = new Map<PtyEventType, Set<PtyEventListener>>();
 
@@ -385,7 +408,8 @@ export function validateCommand(command: string): void {
 function copyProcessEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined) env[k] = v;
+    // Hook ownership belongs to this PTY launch, never the app's parent process.
+    if (v !== undefined && !HOOK_PTY_ENV_KEYS.some((key) => key === k)) env[k] = v;
   }
   return env;
 }
@@ -530,7 +554,7 @@ function buildPtySpawnSpec(
  * the relaunch is visible rather than looking like one continuous run. Written
  * to the new session's buffer too, so a renderer reload keeps it.
  */
-function replayCarriedScrollback(win: BrowserWindow, session: PtySession): void {
+function replayCarriedScrollback(notify: Notify, session: PtySession): void {
   const carried = carriedScrollback.get(session.agentId);
   if (!carried) return;
   carriedScrollback.delete(session.agentId);
@@ -541,19 +565,21 @@ function replayCarriedScrollback(win: BrowserWindow, session: PtySession): void 
   const divider = Buffer.from('\x1b\\\x1b[0m\r\n\x1b[2m── resumed ──\x1b[0m\r\n', 'utf8');
   const replay = Buffer.concat([Buffer.from(carried, 'base64'), divider]);
   session.scrollback.write(replay);
-  sendToChannel(win, session.channelId, { type: 'Data', data: replay.toString('base64') });
+  session.queries.feedDisplayOnly(replay.toString('utf8'));
+  sendToChannel(notify, session.channelId, { type: 'Data', data: toIpcBytes(replay) });
 }
 
 function cleanupExistingSession(agentId: string, existing: PtySession | undefined): void {
   if (!existing) return;
   if (existing.flushTimer) clearTimeout(existing.flushTimer);
   existing.subscribers.clear();
+  retireAgentLaunch(agentId, existing.launchId);
   existing.proc.kill();
   sessions.delete(agentId);
 }
 
 function attachPtyOutputHandlers(
-  win: BrowserWindow,
+  notify: Notify,
   session: PtySession,
   args: SpawnAgentArgs,
   command: string,
@@ -565,7 +591,7 @@ function attachPtyOutputHandlers(
   const containerName = session.containerName;
 
   const send = (msg: unknown) => {
-    sendToChannel(win, session.channelId, msg);
+    sendToChannel(notify, session.channelId, msg);
   };
 
   if (args.dockerMode) {
@@ -577,17 +603,25 @@ function attachPtyOutputHandlers(
       `[docker] command: ${innerCmd}\r\n` +
       `[docker] waiting for container to start…\x1b[0m\r\n\r\n`;
     console.warn(`[docker] spawning container ${containerName} — image=${image} cmd=${innerCmd}`);
-    send({ type: 'Data', data: Buffer.from(banner, 'utf8').toString('base64') });
+    session.queries.feedDisplayOnly(banner);
+    send({ type: 'Data', data: toIpcBytes(Buffer.from(banner, 'utf8')) });
   }
+
+  let lastFlushAt = 0;
 
   const flush = () => {
     if (batchSize === 0) return;
+    lastFlushAt = Date.now();
     const batch = Buffer.concat(batchChunks);
-    const encoded = batch.toString('base64');
-    send({ type: 'Data', data: encoded });
+    // The renderer takes raw bytes; only the remote and coordinator
+    // subscribers still consume base64, so encode just when one is listening.
+    send({ type: 'Data', data: toIpcBytes(batch) });
     session.scrollback.write(batch);
-    for (const sub of session.subscribers) {
-      sub(encoded);
+    if (session.subscribers.size > 0) {
+      const encoded = batch.toString('base64');
+      for (const sub of session.subscribers) {
+        sub(encoded);
+      }
     }
     batchChunks = [];
     batchSize = 0;
@@ -598,6 +632,7 @@ function attachPtyOutputHandlers(
   };
 
   session.proc.onData((data: string) => {
+    session.queries.feed(data);
     const chunk = Buffer.from(data, 'utf8');
 
     tailChunks.push(chunk);
@@ -612,7 +647,14 @@ function attachPtyOutputHandlers(
     batchChunks.push(chunk);
     batchSize += chunk.length;
 
-    if (batchSize >= BATCH_MAX || chunk.length < 1024) {
+    // Leading edge: output after a quiet spell (keystroke echo, a prompt) goes
+    // out at once. Anything arriving within BATCH_INTERVAL of the last send is
+    // coalesced — agent TUIs stream many tiny chunks, and one IPC message per
+    // chunk costs far more than the few ms of delay.
+    if (
+      batchSize >= BATCH_MAX ||
+      (!session.flushTimer && Date.now() - lastFlushAt >= BATCH_INTERVAL)
+    ) {
       flush();
       return;
     }
@@ -623,6 +665,8 @@ function attachPtyOutputHandlers(
   });
 
   session.proc.onExit(({ exitCode, signal }) => {
+    session.queries.dispose();
+    retireAgentLaunch(args.agentId, session.launchId);
     if (sessions.get(args.agentId) !== session) return;
 
     if (containerName) {
@@ -663,7 +707,7 @@ function attachPtyOutputHandlers(
 /** What a Claude launch needs to self-report status; null until the hook server is up. */
 export interface AgentHookRuntime {
   claudeSettingsPath: string;
-  buildPtyEnv(agentId: string, taskId: string): Record<string, string>;
+  buildPtyEnv(agentId: string, taskId: string, launchId: string): Record<string, string>;
 }
 
 let agentHookRuntime: AgentHookRuntime | null = null;
@@ -682,16 +726,17 @@ export function applyAgentHookLaunch(
   args: Pick<SpawnAgentArgs, 'agentId' | 'taskId' | 'args' | 'isShell' | 'dockerMode'>,
   command: string,
   spawnEnv: Record<string, string>,
+  launchId: string,
 ): string[] {
   if (!agentHookRuntime || args.isShell || args.dockerMode || !isClaudeCommand(command)) {
     return args.args;
   }
-  Object.assign(spawnEnv, agentHookRuntime.buildPtyEnv(args.agentId, args.taskId));
+  Object.assign(spawnEnv, agentHookRuntime.buildPtyEnv(args.agentId, args.taskId, launchId));
   return withClaudeHookSettings(command, args.args, agentHookRuntime.claudeSettingsPath);
 }
 
 export async function spawnAgent(
-  win: BrowserWindow,
+  notify: Notify,
   args: SpawnAgentArgs,
   beforeSpawn?: () => void,
 ): Promise<void> {
@@ -711,12 +756,15 @@ export async function spawnAgent(
     existing.proc.resume();
     if (args.cols > 0 && args.rows > 0) {
       existing.proc.resize(args.cols, args.rows);
+      existing.queries.resize(args.cols, args.rows);
     }
-    const scrollback = existing.scrollback.toBase64();
-    if (scrollback) {
-      sendToChannel(win, channelId, { type: 'Data', data: scrollback });
+    if (existing.scrollback.length > 0) {
+      sendToChannel(notify, channelId, {
+        type: 'Data',
+        data: toIpcBytes(existing.scrollback.read()),
+      });
     }
-    emitPtyEvent('spawn', args.agentId);
+    emitPtyEvent('spawn', args.agentId, { reattached: true });
     return;
   }
 
@@ -743,7 +791,8 @@ export async function spawnAgent(
   codexExitIds.delete(args.agentId);
 
   const spawnEnv = buildPtySpawnEnv(args.env, fileEnv);
-  const launchArgs = applyAgentHookLaunch(args, command, spawnEnv);
+  const launchId = crypto.randomUUID();
+  const launchArgs = applyAgentHookLaunch(args, command, spawnEnv, launchId);
 
   // Backfill sandbox placeholders for pre-existing worktrees (and anywhere
   // Claude Code may launch). See ensureClaudeSandboxFiles for the why.
@@ -780,16 +829,24 @@ export async function spawnAgent(
 
   // Trusted main-process admission runs after asynchronous setup, immediately before launch.
   beforeSpawn?.();
-  const proc = pty.spawn(spawnSpec.spawnCommand, spawnSpec.spawnArgs, {
-    name: 'xterm-256color',
-    cols: args.cols,
-    rows: args.rows,
-    cwd: spawnSpec.cwd,
-    env: spawnSpec.env,
-  });
+  registerAgentLaunch(args.agentId, args.taskId, launchId);
+  let proc: pty.IPty;
+  try {
+    proc = pty.spawn(spawnSpec.spawnCommand, spawnSpec.spawnArgs, {
+      name: 'xterm-256color',
+      cols: args.cols,
+      rows: args.rows,
+      cwd: spawnSpec.cwd,
+      env: spawnSpec.env,
+    });
+  } catch (err) {
+    retireAgentLaunch(args.agentId, launchId);
+    throw err;
+  }
 
   const session: PtySession = {
     proc,
+    launchId,
     command,
     channelId,
     taskId: args.taskId,
@@ -799,11 +856,18 @@ export async function spawnAgent(
     flushTimer: null,
     subscribers: new Set(),
     scrollback: new RingBuffer(),
+    lastInputAt: -Infinity,
+    inputPending: false,
+    queries: createTerminalQueryResponder({
+      cols: args.cols,
+      rows: args.rows,
+      reply: (data) => proc.write(data),
+    }),
     containerName: spawnSpec.containerName,
   };
   sessions.set(args.agentId, session);
-  replayCarriedScrollback(win, session);
-  attachPtyOutputHandlers(win, session, args, command);
+  replayCarriedScrollback(notify, session);
+  attachPtyOutputHandlers(notify, session, args, command);
 
   emitPtyEvent('spawn', args.agentId);
 }
@@ -816,16 +880,143 @@ export function writeToAgent(agentId: string, data: string): void {
   if (handingOff.has(agentId)) throw new Error('Wait for the view switch to finish.');
   const session = sessions.get(agentId);
   if (!session) throw new Error(`Agent not found: ${agentId}`);
+  const at = Date.now();
+  if (hasTerminalUserActivity(data)) session.lastInputAt = at;
+  if (session.peerInputQueue) {
+    session.peerInputQueue.push({ data, at });
+    return;
+  }
+  writeSessionInput(session, data);
+}
+
+function writeSessionInput(session: PtySession, data: string): void {
+  const userActivity = hasTerminalUserActivity(data);
+  if (userActivity) session.lastInputAt = Date.now();
   session.proc.write(data);
+  if (
+    session.inputPending &&
+    (data === '\r' ||
+      data === '\n' ||
+      data === '\r\n' ||
+      data === '\x1b[13u' ||
+      data === '\x1b[13;1u')
+  ) {
+    invalidateAgentActivity(session.agentId, session.launchId);
+    if (!session.isShell) emitPtyEvent('prompt-submitted', session.agentId);
+  }
+  // History recall/navigation can populate a draft without printable input.
+  // Escape/Backspace alone preserve a draft but cannot create one on an empty line.
+  const draftActivity = userActivity && [...data].some((ch) => ch !== '\x1b' && ch !== '\x7f');
+  session.inputPending = nextTerminalInputPending(session.inputPending || draftActivity, data);
   // Claude Code fires no Stop hook for a user interrupt, so consumers that
   // trust hook state (the coordinator) need to hear about the keystroke.
-  if (!session.isShell && INTERRUPT_KEYSTROKES.has(data)) emitPtyEvent('interrupt', agentId);
+  if (!session.isShell && INTERRUPT_KEYSTROKES.has(data))
+    emitPtyEvent('interrupt', session.agentId);
+}
+
+export function getAgentPromptSnapshot(
+  agentId: string,
+): { text: string; bracketedPaste: boolean } | null {
+  return sessions.get(agentId)?.queries.snapshot() ?? null;
+}
+
+/**
+ * Paste and submit one peer prompt without interleaving other terminal input.
+ * `onSubmitted` runs immediately after Enter, before queued raw input is replayed.
+ */
+export async function writeAgentPrompt(
+  agentId: string,
+  prompt: string,
+  assertCurrent: () => void,
+  onSubmitted?: () => void,
+): Promise<boolean> {
+  const session = sessions.get(agentId);
+  if (
+    !session ||
+    handingOff.has(agentId) ||
+    session.peerInputQueue ||
+    session.inputPending ||
+    Date.now() - session.lastInputAt < 5_000
+  )
+    return false;
+  const snapshot = session.queries.snapshot();
+  if (!snapshot) return false;
+
+  const queue: { data: string; at: number }[] = [];
+  session.peerInputQueue = queue;
+  const isCurrentSession = () => sessions.get(agentId) === session && !handingOff.has(agentId);
+  const assertSession = () => {
+    if (!isCurrentSession()) throw new Error('Agent terminal changed during prompt delivery');
+  };
+  try {
+    try {
+      assertCurrent();
+      assertSession();
+      writeSessionInput(session, '\x1b[I');
+      assertCurrent();
+      assertSession();
+      // Without bracketed paste, newlines submit and tabs invoke completion.
+      // Keep the fallback on one line until the authorized Enter below.
+      const body = snapshot.bracketedPaste
+        ? `\x1b[200~${prompt}\x1b[201~`
+        : prompt.replace(/\r\n?|\n|\t/g, ' ');
+      writeSessionInput(session, body);
+      const delay = Math.min(500, Math.max(50, prompt.split('\n').length * 15));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      assertCurrent();
+      assertSession();
+      writeSessionInput(session, '\r');
+    } catch (err) {
+      // Queued Enter or escape sequences could submit a canceled pasted body.
+      // No queued input is safe to replay after a failed peer delivery.
+      if (queue.length > 0) {
+        const detail = err instanceof Error ? err.message : String(err);
+        throw Object.assign(
+          new Error(`${detail}. Queued terminal input was discarded after failed prompt delivery.`),
+          { cause: err },
+        );
+      }
+      throw err;
+    }
+
+    try {
+      onSubmitted?.();
+    } catch {
+      logWarn('pty', 'peer prompt submission callback failed after Enter', { agentId });
+    }
+
+    // Shift the original arrival timeline after submission, preserving the gap
+    // between a competing writer's paste and Enter even if both were queued.
+    const firstArrivalAt = queue[0]?.at ?? 0;
+    const replayStartedAt = Date.now();
+    try {
+      while (queue.length > 0 && isCurrentSession()) {
+        const input = queue[0];
+        const delay = replayStartedAt + input.at - firstArrivalAt - Date.now();
+        if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+        if (!isCurrentSession()) break;
+        writeSessionInput(session, input.data);
+        queue.shift();
+      }
+    } catch {
+      // The peer was submitted successfully: a later raw-input error must not
+      // turn its receipt into a failed delivery that could be retried.
+      logWarn('pty', 'queued terminal input discarded after submitted peer prompt', {
+        agentId,
+        queuedWrites: queue.length,
+      });
+    }
+    return true;
+  } finally {
+    delete session.peerInputQueue;
+  }
 }
 
 export function resizeAgent(agentId: string, cols: number, rows: number): void {
   const session = sessions.get(agentId);
   if (!session) throw new Error(`Agent not found: ${agentId}`);
   session.proc.resize(cols, rows);
+  session.queries.resize(cols, rows);
 }
 
 export function pauseAgent(agentId: string): void {
@@ -1313,7 +1504,7 @@ let activeBuild: Promise<{ ok: boolean; error?: string }> | null = null;
  * in-flight promise; custom builds are never deduplicated.
  */
 export function buildDockerImage(
-  win: BrowserWindow,
+  notify: Notify,
   onOutputChannel: string,
   opts?: { dockerfilePath?: string; buildContext?: string; imageTag?: string },
 ): Promise<{ ok: boolean; error?: string }> {
@@ -1341,11 +1532,7 @@ export function buildDockerImage(
     const hash = hashDockerfile(resolvedDockerfilePath) ?? 'unknown';
     const imageTag = opts?.imageTag ?? DOCKER_DEFAULT_IMAGE;
 
-    const send = (text: string) => {
-      if (!win.isDestroyed()) {
-        win.webContents.send(onOutputChannel, text);
-      }
-    };
+    const send = (text: string) => notify(onOutputChannel, text);
 
     const proc = cpSpawn(
       'docker',

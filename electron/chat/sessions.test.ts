@@ -1,7 +1,10 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import type { AgentChatState } from '../shared/agent-chat-types.js';
 import {
+  findAgentChat,
   getAgentChat,
+  listTaskChats,
+  onAgentChatsChanged,
   releaseChat,
   startAgentChat,
   stopAgentChat,
@@ -152,4 +155,51 @@ it('releases credentials on an unexpected process exit', async () => {
   );
   getAgentChat('agent').stop();
   expect(dispose).toHaveBeenCalledOnce();
+});
+
+it('lists task chats, keeps one that crashed as exited, and reports each change', async () => {
+  const changed = vi.fn();
+  const stopListening = onAgentChatsChanged(changed);
+  try {
+    await startAgentChat({ ...opts, taskId: 'task' }, () => {});
+    expect(changed).toHaveBeenCalledOnce();
+    expect(listTaskChats()).toEqual([{ agentId: 'agent', taskId: 'task', status: 'running' }]);
+    expect(findAgentChat('agent')).toBe(getAgentChat('agent'));
+
+    // The process ended on its own; the desktop still shows the transcript.
+    getAgentChat('agent').stop();
+    expect(changed).toHaveBeenCalledTimes(2);
+    expect(listTaskChats()).toEqual([{ agentId: 'agent', taskId: 'task', status: 'exited' }]);
+
+    stopAgentChat('agent');
+    expect(changed).toHaveBeenCalledTimes(3);
+    expect(listTaskChats()).toEqual([]);
+    expect(findAgentChat('agent')).toBeUndefined();
+  } finally {
+    stopListening();
+  }
+});
+
+it('reports the list without a chat that failed to start or was released', async () => {
+  // What a listener last saw, as a phone would show it.
+  let reported: ReturnType<typeof listTaskChats> | undefined;
+  const stopListening = onAgentChatsChanged(() => (reported = listTaskChats()));
+  try {
+    mocks.start.mockRejectedValueOnce(new Error('Startup failed'));
+    await expect(startAgentChat({ ...opts, taskId: 'task' }, () => {})).rejects.toThrow();
+    expect(reported).toEqual([]);
+
+    await startAgentChat({ ...opts, taskId: 'task' }, () => {});
+    expect(reported).toEqual([{ agentId: 'agent', taskId: 'task', status: 'running' }]);
+    await releaseChat('agent');
+    expect(reported).toEqual([]);
+  } finally {
+    stopListening();
+  }
+});
+
+it('keeps chats without a task off the list', async () => {
+  await startAgentChat(opts, () => {});
+  expect(listTaskChats()).toEqual([]);
+  expect(findAgentChat('agent')).toBeDefined();
 });

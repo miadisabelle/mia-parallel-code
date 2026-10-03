@@ -32,6 +32,7 @@
     "test:client": "vitest run --config vitest.client.config.ts",
     "test:coordinator-pty": "RUN_COORDINATOR_PTY_TEST=1 vitest run electron/mcp/coordinator-real-pty.integration.test.ts",
     "test:coverage": "vitest run --coverage",
+    "showcase:capture": "npm run compile && npm run build:mcp && npm run build:frontend && npm run build:remote && playwright test --config scripts/showcase/playwright.config.ts",
     "test:ci": "vitest run --coverage && npm run test:client",
     "check:coordinator-log": "node scripts/check-coordinator-run.mjs",
     "check": "npm run compile && npm run typecheck && npm run lint && npm run format:check",
@@ -46,16 +47,12 @@
     "enabled": false
   },
   "dependencies": {
-    "@ag-ui/client": "^0.0.59",
-    "@ag-ui/core": "^0.0.59",
     "@anthropic-ai/claude-agent-sdk": "0.3.274",
     "@codemirror/commands": "^6.11.0",
     "@codemirror/lang-markdown": "^6.5.2",
     "@codemirror/language": "^6.12.4",
     "@codemirror/state": "^6.7.4",
     "@codemirror/view": "^6.43.11",
-    "@copilotkit/react-core": "1.72.0",
-    "@copilotkit/runtime": "1.72.0",
     "@fontsource/inter": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@fontsource/sora": "^5.2.8",
@@ -65,6 +62,7 @@
     "@xterm/addon-search": "^0.17.0-beta.195",
     "@xterm/addon-web-links": "^0.13.0-beta.195",
     "@xterm/addon-webgl": "^0.20.0-beta.194",
+    "@xterm/headless": "^6.1.0-beta.195",
     "@xterm/xterm": "^6.1.0-beta.195",
     "colord": "^2.9.3",
     "d3-hierarchy": "^3.1.2",
@@ -74,29 +72,23 @@
     "electron-updater": "^6.8.3",
     "marked": "^17.0.3",
     "mermaid": "^11.15.0",
-    "monaco-editor": "^0.55.1",
     "node-pty": "^1.1.0",
     "parse5": "^7.3.0",
     "qrcode": "^1.5.4",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
-    "rxjs": "7.8.1",
     "shiki": "^4.0.2",
     "solid-js": "^1.9.11",
     "ws": "^8.21.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.3",
+    "@playwright/test": "^1.63.0",
     "@types/d3-hierarchy": "^3.1.7",
     "@types/d3-selection": "^3.0.11",
     "@types/d3-zoom": "^3.0.8",
     "@types/node": "^25.3.0",
     "@types/qrcode": "^1.5.6",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/parser": "^8.56.0",
-    "@vitejs/plugin-react": "^5.2.0",
     "@vitest/coverage-v8": "^4.0.18",
     "concurrently": "^10.0.3",
     "dependency-cruiser": "^17.4.0",
@@ -131,7 +123,7 @@
   "build": {
     "appId": "com.parallel-code.app",
     "productName": "Parallel Code",
-    "afterPack": "scripts/after-pack.cjs",
+    "afterPack": "./scripts/after-pack.cjs",
     "directories": {
       "buildResources": "build",
       "output": "release"
@@ -163,6 +155,14 @@
       {
         "from": "docker/",
         "to": "docker/"
+      }
+    ],
+    "protocols": [
+      {
+        "name": "Parallel Code",
+        "schemes": [
+          "parallelcode"
+        ]
       }
     ],
     "linux": {

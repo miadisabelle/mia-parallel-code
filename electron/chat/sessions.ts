@@ -8,9 +8,25 @@ import type { AgentChat, ChatStartOptions } from './types.js';
 
 const chats = new Map<
   string,
-  { provider: ChatStartOptions['provider']; chat: AgentChat; canvasTools: boolean }
+  {
+    provider: ChatStartOptions['provider'];
+    chat: AgentChat;
+    canvasTools: boolean;
+    taskId?: string;
+  }
 >();
 const starts = new Map<string, { cancelled: boolean; promise: Promise<void> }>();
+const listListeners = new Set<() => void>();
+
+function notifyListChanged(): void {
+  for (const listener of listListeners) {
+    try {
+      listener();
+    } catch (error) {
+      console.error('Agent chat list listener failed:', error);
+    }
+  }
+}
 
 /** Use the user's unmodified executable and its own authentication flow. */
 async function resolveExecutable(opts: ChatStartOptions): Promise<string> {
@@ -88,17 +104,25 @@ export async function startAgentChat(
         chat = codex;
         start = () => codex.start(opts.cwd, opts.threadId, opts.skipPermissions);
       }
-      chats.set(opts.agentId, { provider: opts.provider, chat, canvasTools: !!resources });
+      chats.set(opts.agentId, {
+        provider: opts.provider,
+        chat,
+        canvasTools: !!resources,
+        taskId: opts.taskId,
+      });
       unobserve = chat.observe((state) => {
-        if (state.status === 'closed') release();
+        if (state.status !== 'closed') return;
+        release();
+        notifyListChanged();
       });
       chat.subscribe(publish);
       await start();
       assertStarting();
+      notifyListChanged();
     } catch (error) {
       chat?.stop();
       release();
-      if (chats.get(opts.agentId)?.chat === chat) chats.delete(opts.agentId);
+      if (chats.get(opts.agentId)?.chat === chat && chats.delete(opts.agentId)) notifyListChanged();
       throw error;
     } finally {
       starts.delete(opts.agentId);
@@ -121,7 +145,7 @@ export function stopAgentChat(agentId: string, immediate = false): void {
   } finally {
     // Deregister even when the provider throws. The caller already treats the chat as gone, and
     // a stuck entry would keep answering `runningAgentChatIds` and block the next start.
-    chats.delete(agentId);
+    if (chats.delete(agentId)) notifyListChanged();
   }
 }
 /** Called on app shutdown, where a chat's own grace timer would never get to run. */
@@ -141,6 +165,34 @@ export function runningAgentChatIds(): string[] {
   return [...chats].filter(([, entry]) => entry.chat.state.status !== 'closed').map(([id]) => id);
 }
 
+/**
+ * Chats that belong to a task, for surfaces outside the desktop window. A chat
+ * whose process ended on its own stays listed, as `exited`, while the desktop
+ * still shows its transcript: stopping, releasing or closing the task removes it.
+ */
+export function listTaskChats(): {
+  agentId: string;
+  taskId: string;
+  status: 'running' | 'exited';
+}[] {
+  return [...chats].flatMap(([agentId, { taskId, chat }]) =>
+    taskId
+      ? [{ agentId, taskId, status: chat.state.status === 'closed' ? 'exited' : 'running' }]
+      : [],
+  );
+}
+
+/** The agent's chat, ended or not, or undefined — unlike getAgentChat, absence is not an error. */
+export function findAgentChat(agentId: string): AgentChat | undefined {
+  return chats.get(agentId)?.chat;
+}
+
+/** Called when a chat starts or ends. Returns the unsubscribe function. */
+export function onAgentChatsChanged(listener: () => void): () => void {
+  listListeners.add(listener);
+  return () => listListeners.delete(listener);
+}
+
 /** Stop the chat's own process before the native CLI can resume its conversation. */
 export async function releaseChat(agentId: string) {
   if (starts.has(agentId))
@@ -152,6 +204,9 @@ export async function releaseChat(agentId: string) {
   } finally {
     // A timed-out release has already stopped the app-server. Only a refusal to
     // release at all (a running turn, a pending request) leaves a usable chat.
-    if (chats.get(agentId) === entry && entry.chat.state.status === 'closed') chats.delete(agentId);
+    if (chats.get(agentId) === entry && entry.chat.state.status === 'closed') {
+      chats.delete(agentId);
+      notifyListChanged();
+    }
   }
 }

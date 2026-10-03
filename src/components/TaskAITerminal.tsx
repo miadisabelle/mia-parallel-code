@@ -23,7 +23,7 @@ import {
 } from '../store/store';
 import { markDirty } from '../lib/terminalFitManager';
 import { isAgentAskingQuestion, isAgentSettled } from '../store/taskStatus';
-import { warn as logWarn } from '../lib/log';
+import { errMessage, warn as logWarn } from '../lib/log';
 import { InfoBar } from './InfoBar';
 import { PromptHistory } from './PromptHistory';
 import { TerminalView } from './TerminalView';
@@ -35,7 +35,7 @@ import { setStore } from '../store/core';
 import { saveState } from '../store/persistence';
 import { Dialog } from './Dialog';
 import { ConfirmDialog } from './ConfirmDialog';
-import { CloseIcon, CommentIcon, TerminalIcon } from './icons';
+import { CheckIcon, CloseIcon, CommentIcon, CopyIcon, TerminalIcon } from './icons';
 import { theme } from '../lib/theme';
 import { sf } from '../lib/fontScale';
 import { invoke } from '../lib/ipc';
@@ -758,6 +758,8 @@ function AgentTerminalPane(props: {
               position: 'absolute',
               inset: '0',
               visibility: props.visible ? 'visible' : 'hidden',
+              // Pauses xterm rendering for hidden tabs; see TilingLayout.
+              'content-visibility': props.visible ? 'visible' : 'hidden',
               'pointer-events': props.visible ? 'auto' : 'none',
             }
           : {
@@ -999,6 +1001,22 @@ function MarkdownViewerDialog(props: {
   filePath: string;
 }) {
   const html = createHighlightedMarkdown(() => props.content);
+  const [copied, setCopied] = createSignal(false);
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(copiedTimer));
+
+  function copyMarkdown() {
+    navigator.clipboard
+      .writeText(props.content)
+      .then(() => {
+        setCopied(true);
+        clearTimeout(copiedTimer);
+        copiedTimer = setTimeout(() => setCopied(false), 1500);
+      })
+      .catch((err: unknown) => {
+        logWarn('clipboard', 'Could not copy Markdown', { err: errMessage(err) });
+      });
+  }
 
   return (
     <Dialog
@@ -1036,6 +1054,22 @@ function MarkdownViewerDialog(props: {
           {props.fileName}
         </span>
         <span style={{ flex: '1' }} />
+        <button
+          onClick={copyMarkdown}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: copied() ? theme.success : theme.fgMuted,
+            cursor: 'pointer',
+            padding: '4px',
+            display: 'flex',
+            'align-items': 'center',
+            'border-radius': 'var(--radius-xs)',
+          }}
+          title={copied() ? 'Copied' : 'Copy Markdown'}
+        >
+          {copied() ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
+        </button>
         <Show when={props.filePath}>
           <button
             onClick={() => {

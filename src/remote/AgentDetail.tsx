@@ -5,9 +5,8 @@ import { createTerminalHttpLinkHandler } from '../lib/terminalLinks';
 import { fetchNotes, saveNotes, ApiError } from './api';
 import { clearPairedToken } from './auth';
 import { readLocal, writeLocal } from './storage';
-import { agentStatusDisplay } from './attention';
 import { messageForTerminal } from './terminalText';
-import { ConnectionBanner } from './ConnectionBanner';
+import { TaskHeader } from './TaskHeader';
 import {
   subscribeAgent,
   unsubscribeAgent,
@@ -68,7 +67,6 @@ export function AgentDetail(props: AgentDetailProps) {
   const [notesSaved, setNotesSaved] = createSignal(false);
   const agent = () => agents().find((a) => a.agentId === props.agentId);
   const taskId = () => agent()?.taskId;
-  const display = () => agentStatusDisplay(agent() ?? { status: 'exited', attention: 'idle' });
   const nextTask = () =>
     agents().find(
       (a) =>
@@ -421,36 +419,12 @@ export function AgentDetail(props: AgentDetailProps) {
 
   return (
     <div class="mobile-screen">
-      <header class="mobile-header mobile-task-header">
-        <button
-          class="mobile-button quiet"
-          onClick={() => props.onBack()}
-          aria-label="Back to tasks"
-        >
-          ←
-        </button>
-        <div class="heading">
-          <h1 title={props.taskName}>{props.taskName}</h1>
-          <div class="mobile-task-meta">
-            <p class="mobile-task-context">
-              {[agent()?.projectName, agent()?.agentName].filter(Boolean).join(' · ')}
-            </p>
-            <span class="agent-status" style={{ color: display().color }}>
-              <span class="status-dot" aria-hidden="true" />
-              {display().label}
-            </span>
-          </div>
-        </div>
-      </header>
-      <ConnectionBanner />
-      <Show when={status() === 'connected' && !canControl()}>
-        <div class="mobile-banner info">
-          <span>View only</span>
-          <button class="mobile-button quiet" onClick={() => props.onNeedsPairing()}>
-            Enable replies
-          </button>
-        </div>
-      </Show>
+      <TaskHeader
+        agentId={props.agentId}
+        taskName={props.taskName}
+        onBack={props.onBack}
+        onNeedsPairing={props.onNeedsPairing}
+      />
       <div class="mobile-tabs">
         <nav class="mobile-view-tabs" aria-label="Task views">
           <For
@@ -529,10 +503,25 @@ export function AgentDetail(props: AgentDetailProps) {
             />
           </div>
         </Show>
-        <Show when={view() === 'terminal' && !terminalBottom()}>
-          <button class="mobile-button mobile-latest" onClick={jumpToLatest}>
-            ↓ Latest output
-          </button>
+        <Show when={view() === 'terminal'}>
+          <div class="mobile-output-actions">
+            <Show when={!terminalBottom()}>
+              <button class="mobile-button" onClick={jumpToLatest}>
+                ↓ Latest output
+              </button>
+            </Show>
+            <Show when={nextTask()}>
+              {(next) => (
+                <button
+                  class="mobile-button mobile-next-task"
+                  aria-label={`Next task needing you: ${next().taskName}`}
+                  onClick={() => props.onNextTask(next().taskId)}
+                >
+                  Next task →
+                </button>
+              )}
+            </Show>
+          </div>
         </Show>
       </div>
       <Show
@@ -548,6 +537,20 @@ export function AgentDetail(props: AgentDetailProps) {
               </p>
             </Show>
             <div class="mobile-composer-row">
+              <Show when={bashMode()}>
+                <button
+                  class="mobile-button mobile-bash"
+                  aria-label="Shell command mode"
+                  aria-pressed="true"
+                  disabled={sending()}
+                  onClick={() => {
+                    setBashMode(false);
+                    inputRef?.focus();
+                  }}
+                >
+                  !
+                </button>
+              </Show>
               <textarea
                 ref={(element) => {
                   inputRef = element;
@@ -578,17 +581,6 @@ export function AgentDetail(props: AgentDetailProps) {
                 {sending() ? 'Sending…' : canControl() ? 'Send' : 'Authorize'}
               </button>
             </div>
-            <Show when={nextTask()}>
-              {(next) => (
-                <button
-                  class="mobile-button quiet mobile-next-task"
-                  aria-label={`Next task needing you: ${next().taskName}`}
-                  onClick={() => props.onNextTask(next().taskId)}
-                >
-                  Next task →
-                </button>
-              )}
-            </Show>
             <Show when={inputText().length >= 3600}>
               <p class="muted" role="status">
                 {4000 - inputText().length} characters remaining
@@ -600,21 +592,10 @@ export function AgentDetail(props: AgentDetailProps) {
               </p>
             </Show>
             <div id="terminal-keys" class="mobile-keys" role="group" aria-label="Terminal keys">
-              <button
-                class="mobile-button mobile-bash"
-                aria-label="Shell command mode"
-                aria-pressed={bashMode()}
-                disabled={sending()}
-                onClick={() => {
-                  setBashMode((on) => !on);
-                  inputRef?.focus();
-                }}
-              >
-                !
-              </button>
               <For
                 each={[
                   { label: 'Enter', name: 'Enter', data: '\r' },
+                  { label: '/', name: 'Slash', data: '/' },
                   { label: 'Tab', name: 'Tab', data: '\t' },
                   { label: '↑', name: 'Arrow up', data: '\x1b[A' },
                   { label: '↓', name: 'Arrow down', data: '\x1b[B' },

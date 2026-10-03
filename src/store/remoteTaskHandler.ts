@@ -109,11 +109,7 @@ async function handleCreateTask(req: CreateTaskRequest): Promise<void> {
       // Without this the flag was simply never passed, so every task created
       // from a phone launched bare regardless of the setting.
       skipPermissions: remoteSkipPermissions(store.defaultSkipPermissions, agentDef),
-      // A task created from a phone must not move the desktop's selection: the
-      // person at the desktop may be mid-sentence in another column, and the
-      // jump would scroll the strip and re-target keyboard focus under them.
-      // With no task active there is nothing to protect, so the store still
-      // adopts it (see initTaskInStore).
+      // Someone at the desktop may be mid-task; only they decide what gets focus.
       activate: false,
     });
     reply(req.reqId, true, { taskId });
